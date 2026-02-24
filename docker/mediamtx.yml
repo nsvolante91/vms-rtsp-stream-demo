@@ -1,0 +1,28 @@
+###############################################
+# MediaMTX configuration for VMS prototype
+###############################################
+
+# Log level (debug, info, warn, error)
+logLevel: info
+logDestinations: [stdout]
+
+# RTSP server
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp]
+
+# RTMP (disabled)
+rtmp: no
+
+# HLS (disabled)
+hls: no
+
+# WebRTC (disabled)
+webrtc: no
+
+# SRT (disabled)
+srt: no
+
+# Paths - accept any path
+paths:
+  all_others:

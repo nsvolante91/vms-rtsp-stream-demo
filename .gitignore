@@ -1,0 +1,9 @@
+node_modules/
+dist/
+test-videos/
+.stream-pids
+*.log
+.DS_Store
+.ralph/
+.ralphrc
+.claude/

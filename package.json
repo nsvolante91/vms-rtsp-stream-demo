@@ -1,0 +1,19 @@
+{
+  "name": "vms-prototype",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-based Video Management System prototype using WebCodecs + WebGPU",
+  "workspaces": [
+    "bridge-server",
+    "client"
+  ],
+  "scripts": {
+    "bridge": "npm run start -w bridge-server",
+    "dev": "npm run dev -w client",
+    "build": "npm run build -w client",
+    "test": "npm run test:bridge && npm run test:client",
+    "test:bridge": "npm test -w bridge-server",
+    "test:client": "npm test -w client",
+    "typecheck": "npm run typecheck -w bridge-server && npm run typecheck -w client"
+  }
+}

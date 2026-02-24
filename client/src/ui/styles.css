@@ -1,0 +1,184 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #0a0a0a;
+  color: #e0e0e0;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+#video-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: 1fr;
+  gap: 2px;
+  background: #111;
+  overflow: hidden;
+}
+
+.stream-tile {
+  position: relative;
+  overflow: hidden;
+  background: #000;
+  cursor: pointer;
+}
+
+.stream-tile canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.stream-tile.focused {
+  /* When focused, tile fills the single-column grid */
+}
+
+.stream-label {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #e0e0e0;
+  font-size: 12px;
+  font-family: 'Consolas', 'Monaco', monospace;
+  pointer-events: none;
+}
+
+#controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: #1a1a1a;
+  border-top: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.control-group label {
+  font-size: 13px;
+  color: #999;
+}
+
+button {
+  background: #2a2a2a;
+  color: #e0e0e0;
+  border: 1px solid #444;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+button:hover {
+  background: #3a3a3a;
+}
+
+button.active {
+  background: #0066cc;
+  border-color: #0088ff;
+}
+
+.dashboard {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  background: rgba(0, 0, 0, 0.85);
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 12px;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  min-width: 280px;
+  max-height: calc(100vh - 60px);
+  overflow-y: auto;
+  z-index: 100;
+}
+
+.dashboard.hidden {
+  display: none;
+}
+
+.dashboard h3 {
+  font-size: 13px;
+  color: #0088ff;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #333;
+  padding-bottom: 4px;
+}
+
+.dashboard .metric-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 1px 0;
+}
+
+.dashboard .metric-label {
+  color: #999;
+}
+
+.dashboard .metric-value {
+  color: #e0e0e0;
+  font-weight: bold;
+}
+
+.dashboard .metric-value.green { color: #4caf50; }
+.dashboard .metric-value.yellow { color: #ff9800; }
+.dashboard .metric-value.red { color: #f44336; }
+
+.dashboard .stream-section {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid #222;
+}
+
+.error-overlay {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(20, 0, 0, 0.95);
+  border: 2px solid #f44336;
+  border-radius: 8px;
+  padding: 32px;
+  max-width: 500px;
+  text-align: center;
+  z-index: 200;
+}
+
+.error-overlay.hidden {
+  display: none;
+}
+
+.error-overlay h2 {
+  color: #f44336;
+  margin-bottom: 12px;
+}
+
+.error-overlay p {
+  color: #ccc;
+  line-height: 1.6;
+}
