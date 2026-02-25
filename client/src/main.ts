@@ -54,7 +54,7 @@ class VMSApp {
   private controls: Controls | null = null;
   private benchmarkRunner: BenchmarkRunner | null = null;
   private gridContainer: HTMLDivElement | null = null;
-  private columns = 2;
+  private columns = 4;
   private focusId: number | null = null;
   private nextStreamId = 1;
   private metricsInterval = 0;
