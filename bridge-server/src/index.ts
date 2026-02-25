@@ -22,6 +22,7 @@ import { Http3Server } from '@fails-components/webtransport';
 import { StreamManager } from './stream-manager.js';
 import { probeRTSPStream } from './rtsp-client.js';
 import { generateCertificate, type CertMaterial } from './cert-utils.js';
+import { attachWebSocketServer } from './ws-handler.js';
 
 const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
 const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
@@ -268,6 +269,9 @@ async function main(): Promise<void> {
 
   // Register the /streams path for WebTransport sessions
   const sessionStream = wtServer.sessionStream('/streams');
+
+  // Attach WebSocket fallback server on the HTTP server at /ws
+  attachWebSocketServer(httpServer, streamManager);
 
   // Start servers
   httpServer.listen(HTTP_PORT, () => {

@@ -1,18 +1,22 @@
 /**
- * Stream Manager — WebTransport Edition
+ * Stream Manager — WebTransport + WebSocket Edition
  *
- * Manages multiple RTSP-to-WebTransport bridges. Each managed stream
- * maintains an RTSPClient connection and forwards H.264 NAL units to
- * subscribed WebTransport clients using per-stream unidirectional QUIC
- * streams with the compact binary protocol.
+ * Manages multiple RTSP stream bridges. Each managed stream maintains
+ * an RTSPClient connection and forwards H.264 NAL units to subscribed
+ * clients using a compact binary protocol.
  *
- * Architecture:
- * - One WebTransport session per client
- * - One bidirectional stream for control (subscribe/unsubscribe JSON)
- * - One server→client unidirectional stream per video subscription
- *   (eliminates cross-stream head-of-line blocking)
+ * Supports two transport layers:
+ * - **WebTransport** (primary): Per-stream QUIC unidirectional streams,
+ *   no head-of-line blocking, ideal for Chrome 114+.
+ * - **WebSocket** (fallback): Single TCP connection with binary frames,
+ *   compatible with Safari, Firefox, and older browsers.
+ *
+ * Both transports use the same 12-byte binary frame header. WebTransport
+ * frames are length-prefixed (byte-oriented QUIC streams), while
+ * WebSocket frames are sent raw (native message boundaries).
  */
 
+import type { WebSocket as WSSocket } from 'ws';
 import { RTSPClient, type NALUEvent } from './rtsp-client.js';
 import { frameLengthPrefixed, readLengthPrefixed, writeLengthPrefixed } from './framing.js';
 import {
@@ -58,16 +62,20 @@ interface PendingAccessUnit {
   isKeyframe: boolean;
 }
 
-/** A WebTransport subscriber for a specific video stream */
+/** A transport-agnostic subscriber for a specific video stream */
 interface VideoSubscription {
   /** Client identifier */
   clientId: number;
-  /** Reference to the client's shared video writer */
-  writer: WritableStreamDefaultWriter<Uint8Array>;
+  /** Send a binary protocol frame to this subscriber (fire-and-forget) */
+  send: (frame: Buffer) => void;
+  /** Whether this subscriber is currently backpressured */
+  isBackpressured: () => boolean;
 }
 
 /** State for a connected WebTransport client */
 interface WTClient {
+  /** Transport type discriminant */
+  type: 'webtransport';
   /** Unique client identifier */
   id: number;
   /** The WebTransport session */
@@ -89,6 +97,23 @@ interface WTClient {
   /** Whether the client is still connected */
   connected: boolean;
 }
+
+/** State for a connected WebSocket fallback client */
+interface WSClient {
+  /** Transport type discriminant */
+  type: 'websocket';
+  /** Unique client identifier */
+  id: number;
+  /** The WebSocket connection */
+  ws: WSSocket;
+  /** Set of subscribed stream IDs */
+  subscribedStreams: Set<number>;
+  /** Whether the client is still connected */
+  connected: boolean;
+}
+
+/** Union of all supported transport client types */
+type BridgeClient = WTClient | WSClient;
 
 /** Internal state for a managed stream */
 interface ManagedStream {
@@ -168,7 +193,7 @@ let nextClientId = 1;
  */
 export class StreamManager {
   private readonly streams: Map<number, ManagedStream> = new Map();
-  private readonly clients: Map<number, WTClient> = new Map();
+  private readonly clients: Map<number, BridgeClient> = new Map();
 
   /**
    * Add and connect a new RTSP stream.
@@ -249,8 +274,12 @@ export class StreamManager {
       const client = this.clients.get(clientId);
       if (client) {
         client.subscribedStreams.delete(id);
-        // Close the shared video stream when no subscriptions remain
-        if (client.subscribedStreams.size === 0 && client.videoWriter) {
+        // For WT: close the shared video stream when no subscriptions remain
+        if (
+          client.type === 'webtransport' &&
+          client.subscribedStreams.size === 0 &&
+          client.videoWriter
+        ) {
           try {
             client.videoWriter.close().catch(() => {});
           } catch {
@@ -279,6 +308,7 @@ export class StreamManager {
     const clientId = nextClientId++;
 
     const client: WTClient = {
+      type: 'webtransport',
       id: clientId,
       session,
       controlWriter: null,
@@ -370,7 +400,11 @@ export class StreamManager {
     }
     for (const [, client] of this.clients) {
       try {
-        client.session.close({ closeCode: 0, reason: 'Server shutting down' });
+        if (client.type === 'webtransport') {
+          client.session.close({ closeCode: 0, reason: 'Server shutting down' });
+        } else {
+          client.ws.close(1001, 'Server shutting down');
+        }
       } catch {
         // Ignore close errors during shutdown
       }
@@ -379,7 +413,63 @@ export class StreamManager {
   }
 
   /**
-   * Read length-prefixed JSON control messages from the client.
+   * Handle a new WebSocket client connection.
+   *
+   * Provides the same subscribe/unsubscribe semantics as WebTransport
+   * sessions but over a single WebSocket connection. Binary frames are
+   * sent directly without length-prefix framing since WebSocket provides
+   * native message boundaries.
+   *
+   * @param ws - WebSocket connection from the ws library
+   */
+  handleWebSocketClient(ws: WSSocket): void {
+    const clientId = nextClientId++;
+
+    const client: WSClient = {
+      type: 'websocket',
+      id: clientId,
+      ws,
+      subscribedStreams: new Set(),
+      connected: true,
+    };
+
+    this.clients.set(clientId, client);
+    console.log(`[WS] Client ${clientId} connected`);
+
+    // Send available streams list
+    this.sendControlMessage(client, {
+      type: 'streams',
+      streams: this.getStreams(),
+    }).catch(() => {});
+
+    ws.on('message', (data: Buffer | string) => {
+      try {
+        const text = typeof data === 'string' ? data : data.toString('utf-8');
+        const parsed = JSON.parse(text) as ClientMessage;
+
+        if (parsed.type === 'subscribe') {
+          this.subscribeClient(client, parsed.streamId).catch((err) => {
+            console.error(`[WS] Client ${clientId} subscribe error:`, err);
+          });
+        } else if (parsed.type === 'unsubscribe') {
+          this.unsubscribeClient(client, parsed.streamId);
+        }
+      } catch (err) {
+        console.warn(`[WS] Client ${clientId} invalid message:`, err);
+      }
+    });
+
+    ws.on('close', () => {
+      this.handleClientDisconnect(clientId);
+    });
+
+    ws.on('error', (err: Error) => {
+      console.error(`[WS] Client ${clientId} error:`, err.message);
+    });
+  }
+
+  /**
+   * Read length-prefixed JSON control messages from a WebTransport client.
    *
    * @param client - Client state
    * @param readable - Readable side of the control bidirectional stream
@@ -409,17 +499,27 @@ export class StreamManager {
   }
 
   /**
-   * Send a JSON message over the control bidirectional stream.
+   * Send a JSON control message to a client (transport-agnostic).
+   *
+   * For WebTransport: length-prefixed write on the control bidirectional stream.
+   * For WebSocket: JSON text message.
    *
    * @param client - Target client
    * @param message - JSON-serializable message
    */
-  private async sendControlMessage(client: WTClient, message: unknown): Promise<void> {
-    if (!client.controlWriter || !client.connected) return;
+  private async sendControlMessage(client: BridgeClient, message: unknown): Promise<void> {
+    if (!client.connected) return;
 
     try {
-      const bytes = new TextEncoder().encode(JSON.stringify(message));
-      await writeLengthPrefixed(client.controlWriter, bytes);
+      if (client.type === 'webtransport') {
+        if (!client.controlWriter) return;
+        const bytes = new TextEncoder().encode(JSON.stringify(message));
+        await writeLengthPrefixed(client.controlWriter, bytes);
+      } else {
+        if (client.ws.readyState === 1 /* OPEN */) {
+          client.ws.send(JSON.stringify(message));
+        }
+      }
     } catch {
       // Client may have disconnected
     }
@@ -428,13 +528,16 @@ export class StreamManager {
   /**
    * Subscribe a client to a stream.
    *
-   * Opens a dedicated server→client unidirectional stream for the video
-   * feed, sends cached SPS/PPS, and begins forwarding H.264 access units.
+   * Creates a transport-appropriate video subscription, sends cached
+   * SPS/PPS, and begins forwarding H.264 access units.
    *
-   * @param client - WebTransport client
+   * For WebTransport: opens a dedicated unidirectional QUIC stream.
+   * For WebSocket: sends binary frames directly on the WS connection.
+   *
+   * @param client - Connected client (WT or WS)
    * @param streamId - Stream to subscribe to
    */
-  private async subscribeClient(client: WTClient, streamId: number): Promise<void> {
+  private async subscribeClient(client: BridgeClient, streamId: number): Promise<void> {
     const managed = this.streams.get(streamId);
     if (!managed) {
       await this.sendControlMessage(client, {
@@ -449,24 +552,48 @@ export class StreamManager {
     }
 
     try {
-      // Create the shared video uni stream on first subscription
-      if (!client.videoWriter) {
-        const sendStream = await client.session.createUnidirectionalStream();
-        client.videoWriter = sendStream.getWriter();
-        console.log(`[WT] Client ${client.id} video stream opened`);
+      let subscription: VideoSubscription;
+
+      if (client.type === 'webtransport') {
+        // Create the shared video uni stream on first subscription
+        if (!client.videoWriter) {
+          const sendStream = await client.session.createUnidirectionalStream();
+          client.videoWriter = sendStream.getWriter();
+          console.log(`[WT] Client ${client.id} video stream opened`);
+        }
+
+        const writer = client.videoWriter!;
+        subscription = {
+          clientId: client.id,
+          send: (frame: Buffer) => {
+            const prefixed = frameLengthPrefixed(frame);
+            writer.write(prefixed).catch(() => {
+              managed.subscribers.delete(client.id);
+            });
+          },
+          isBackpressured: () =>
+            writer.desiredSize !== null && writer.desiredSize <= 0,
+        };
+      } else {
+        // WebSocket: send raw binary frames (WS has message boundaries)
+        const ws = client.ws;
+        subscription = {
+          clientId: client.id,
+          send: (frame: Buffer) => {
+            if (ws.readyState === 1 /* OPEN */) {
+              ws.send(frame);
+            }
+          },
+          isBackpressured: () => ws.bufferedAmount > 1024 * 1024,
+        };
       }
 
-      // Safe: guaranteed non-null by the guard above
-      const writer = client.videoWriter!;
-
       client.subscribedStreams.add(streamId);
-      managed.subscribers.set(client.id, {
-        clientId: client.id,
-        writer,
-      });
+      managed.subscribers.set(client.id, subscription);
 
+      const tag = client.type === 'webtransport' ? 'WT' : 'WS';
       console.log(
-        `[WT] Client ${client.id} subscribed to stream ${streamId} ` +
+        `[${tag}] Client ${client.id} subscribed to stream ${streamId} ` +
           `(${managed.subscribers.size} subscribers)`
       );
 
@@ -475,25 +602,29 @@ export class StreamManager {
         stream: this.getStreamInfo(managed),
       });
 
-      await this.sendConfig(writer, managed);
+      this.sendConfigToSubscriber(subscription, managed);
     } catch (err) {
+      const tag = client.type === 'webtransport' ? 'WT' : 'WS';
       console.error(
-        `[WT] Failed to subscribe client ${client.id} to stream ${streamId}:`,
+        `[${tag}] Failed to subscribe client ${client.id} to stream ${streamId}:`,
         err
       );
     }
   }
 
   /**
-   * Send cached SPS and PPS NAL units to a client's video stream.
+   * Send cached SPS and PPS NAL units to a subscriber.
    *
-   * @param writer - Unidirectional stream writer
+   * Uses the subscriber's transport-agnostic `send` callback so
+   * it works for both WebTransport and WebSocket clients.
+   *
+   * @param sub - Target video subscription
    * @param managed - Stream with cached config data
    */
-  private async sendConfig(
-    writer: WritableStreamDefaultWriter<Uint8Array>,
+  private sendConfigToSubscriber(
+    sub: VideoSubscription,
     managed: ManagedStream
-  ): Promise<void> {
+  ): void {
     if (!managed.spsNALU || !managed.ppsNALU) return;
 
     const startCode = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
@@ -505,35 +636,34 @@ export class StreamManager {
     ]);
 
     const frame = buildFrame(managed.id, 0n, FLAG_CONFIG, payload);
-
-    try {
-      const prefixed = frameLengthPrefixed(frame);
-      await writer.write(prefixed);
-    } catch {
-      // Client may have disconnected
-    }
+    sub.send(frame);
   }
 
   /**
    * Unsubscribe a client from a stream.
    *
-   * @param client - WebTransport client
+   * @param client - Connected client (WT or WS)
    * @param streamId - Stream to unsubscribe from
    */
-  private unsubscribeClient(client: WTClient, streamId: number): void {
+  private unsubscribeClient(client: BridgeClient, streamId: number): void {
     const managed = this.streams.get(streamId);
     if (managed) {
       managed.subscribers.delete(client.id);
+      const tag = client.type === 'webtransport' ? 'WT' : 'WS';
       console.log(
-        `[WT] Client ${client.id} unsubscribed from stream ${streamId} ` +
+        `[${tag}] Client ${client.id} unsubscribed from stream ${streamId} ` +
           `(${managed.subscribers.size} subscribers)`
       );
     }
 
     client.subscribedStreams.delete(streamId);
 
-    // Close the shared video stream when no subscriptions remain
-    if (client.subscribedStreams.size === 0 && client.videoWriter) {
+    // For WT: close the shared video stream when no subscriptions remain
+    if (
+      client.type === 'webtransport' &&
+      client.subscribedStreams.size === 0 &&
+      client.videoWriter
+    ) {
       try {
         client.videoWriter.close().catch(() => {});
       } catch {
@@ -562,25 +692,29 @@ export class StreamManager {
     }
     client.subscribedStreams.clear();
 
-    if (client.videoWriter) {
-      try {
-        client.videoWriter.close().catch(() => {});
-      } catch {
-        // Already closed
+    if (client.type === 'webtransport') {
+      if (client.videoWriter) {
+        try {
+          client.videoWriter.close().catch(() => {});
+        } catch {
+          // Already closed
+        }
+        client.videoWriter = null;
       }
-      client.videoWriter = null;
-    }
 
-    if (client.controlWriter) {
-      try {
-        client.controlWriter.close().catch(() => {});
-      } catch {
-        // Already closed
+      if (client.controlWriter) {
+        try {
+          client.controlWriter.close().catch(() => {});
+        } catch {
+          // Already closed
+        }
       }
     }
+    // WS clients: socket cleanup is handled by ws 'close' event
 
     this.clients.delete(clientId);
-    console.log(`[WT] Client ${clientId} disconnected`);
+    const tag = client.type === 'webtransport' ? 'WT' : 'WS';
+    console.log(`[${tag}] Client ${clientId} disconnected`);
   }
 
   /**
@@ -659,8 +793,6 @@ export class StreamManager {
     frame: Buffer,
     isKeyframe: boolean
   ): void {
-    const prefixed = frameLengthPrefixed(frame);
-
     for (const [clientId, sub] of managed.subscribers) {
       const client = this.clients.get(clientId);
       if (!client || !client.connected) {
@@ -668,18 +800,12 @@ export class StreamManager {
         continue;
       }
 
-      // Backpressure: skip non-keyframes when writer queue is full
-      if (
-        !isKeyframe &&
-        sub.writer.desiredSize !== null &&
-        sub.writer.desiredSize <= 0
-      ) {
+      // Backpressure: skip non-keyframes when subscriber is saturated
+      if (!isKeyframe && sub.isBackpressured()) {
         continue;
       }
 
-      sub.writer.write(prefixed).catch(() => {
-        managed.subscribers.delete(clientId);
-      });
+      sub.send(frame);
     }
   }
 

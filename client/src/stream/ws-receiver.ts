@@ -99,6 +99,14 @@ export class WSReceiver {
     this.ws.onmessage = (event: MessageEvent) => {
       if (event.data instanceof ArrayBuffer) {
         this.handleBinaryMessage(event.data);
+      } else if (typeof event.data === 'string') {
+        // Server sends JSON control messages (streams list, subscription confirmations)
+        try {
+          const msg = JSON.parse(event.data);
+          this.log.info(`Control: ${msg.type ?? 'unknown'}`);
+        } catch {
+          // Ignore malformed control messages
+        }
       }
     };
 
