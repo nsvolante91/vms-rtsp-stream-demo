@@ -7,7 +7,7 @@
  */
 
 import { Logger } from '../utils/logger';
-import type { ReceivedFrame } from './ws-receiver';
+import type { ReceivedFrame } from './wt-receiver';
 
 /**
  * Exp-Golomb bit-level reader for parsing H.264 SPS fields.

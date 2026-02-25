@@ -9,7 +9,13 @@
 import { Logger } from '../utils/logger';
 import { H264Demuxer } from './h264-demuxer';
 import { VideoStreamDecoder } from './decoder';
-import type { WSReceiver, ReceivedFrame } from './ws-receiver';
+import type { ReceivedFrame } from './wt-receiver';
+
+/** Transport-agnostic receiver interface for stream subscription */
+export interface StreamReceiver {
+  subscribe(streamId: number, callback: (frame: ReceivedFrame) => void): void;
+  unsubscribe(streamId: number): void;
+}
 
 /**
  * Full decode pipeline for a single video stream.
@@ -31,13 +37,13 @@ export class StreamPipeline {
   /**
    * Create a new StreamPipeline.
    * @param streamId - Numeric stream identifier
-   * @param wsReceiver - Shared WebSocket receiver instance
+   * @param receiver - Shared stream receiver instance (WebTransport or WebSocket)
    * @param onFrame - Callback invoked with each decoded frame. MUST call frame.close().
    * @param onError - Optional error callback for this stream
    */
   constructor(
     private readonly streamId: number,
-    private readonly wsReceiver: WSReceiver,
+    private readonly receiver: StreamReceiver,
     private readonly onFrame: (frame: VideoFrame) => void,
     private readonly onError?: (streamId: number, error: Error) => void
   ) {
@@ -71,7 +77,7 @@ export class StreamPipeline {
       }
     );
 
-    this.wsReceiver.subscribe(this.streamId, (frame: ReceivedFrame) => {
+    this.receiver.subscribe(this.streamId, (frame: ReceivedFrame) => {
       this.handleReceivedFrame(frame);
     });
 
@@ -89,7 +95,7 @@ export class StreamPipeline {
     }
 
     this._started = false;
-    this.wsReceiver.unsubscribe(this.streamId);
+    this.receiver.unsubscribe(this.streamId);
 
     if (this.decoder) {
       this.decoder.close();

@@ -7,7 +7,7 @@
  */
 
 import { Logger } from './utils/logger';
-import { WSReceiver } from './stream/ws-receiver';
+import { WTReceiver } from './stream/wt-receiver';
 import { StreamPipeline } from './stream/stream-pipeline';
 import { StreamTile } from './render/stream-tile';
 import { MetricsCollector } from './perf/metrics-collector';
@@ -16,14 +16,20 @@ import { BenchmarkRunner } from './perf/benchmark-runner';
 import type { BenchmarkReport } from './perf/benchmark-runner';
 import { Controls } from './ui/controls';
 
-/** WebSocket bridge server URL */
-const WS_URL = 'ws://localhost:9000';
+/** REST API base URL */
+const API_URL = 'http://localhost:9000';
+
+/** WebTransport bridge server URL */
+const WT_URL = 'https://localhost:9001/streams';
+
+/** REST endpoint for certificate hash (for WebTransport pinning) */
+const CERT_HASH_URL = `${API_URL}/cert-hash`;
 
 /** HTTP endpoint for available streams */
-const STREAMS_URL = 'http://localhost:9000/streams';
+const STREAMS_URL = `${API_URL}/streams`;
 
 /** Maximum number of streams to auto-add on startup */
-const AUTO_ADD_MAX = 4;
+const AUTO_ADD_MAX = 16;
 
 const log = new Logger('VMSApp');
 
@@ -41,7 +47,7 @@ interface StreamEntry {
  * draws directly to its canvas when a frame is decoded.
  */
 class VMSApp {
-  private wsReceiver: WSReceiver | null = null;
+  private wtReceiver: WTReceiver | null = null;
   private readonly streams: Map<number, StreamEntry> = new Map();
   private readonly metrics: MetricsCollector;
   private readonly dashboard: Dashboard;
@@ -78,6 +84,11 @@ class VMSApp {
       return;
     }
 
+    if (typeof WebTransport === 'undefined') {
+      this.showError('Missing WebTransport API. Please use Chrome 114+.');
+      return;
+    }
+
     this.gridContainer = document.getElementById('video-grid') as HTMLDivElement | null;
     if (!this.gridContainer) {
       this.showError('Grid container element not found');
@@ -85,9 +96,9 @@ class VMSApp {
     }
     this.updateGridCSS();
 
-    // Connect WebSocket
-    this.wsReceiver = new WSReceiver(WS_URL);
-    this.wsReceiver.connect();
+    // Connect WebTransport
+    this.wtReceiver = new WTReceiver(WT_URL, CERT_HASH_URL);
+    await this.wtReceiver.connect();
 
     // Set up UI controls
     this.controls = new Controls(
@@ -119,7 +130,7 @@ class VMSApp {
    * and starts a StreamPipeline that draws directly to the tile's canvas.
    */
   async addStream(): Promise<void> {
-    if (!this.wsReceiver || !this.gridContainer) {
+    if (!this.wtReceiver || !this.gridContainer) {
       log.warn('Not ready to add stream');
       return;
     }
@@ -135,7 +146,7 @@ class VMSApp {
 
     const pipeline = new StreamPipeline(
       streamId,
-      this.wsReceiver,
+      this.wtReceiver,
       (frame: VideoFrame) => {
         tile.drawFrame(frame);
         this.metrics.recordFrame(streamId);
