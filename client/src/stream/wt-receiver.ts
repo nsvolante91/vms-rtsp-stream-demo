@@ -241,7 +241,15 @@ export class WTReceiver {
         }
       });
     } catch (err) {
-      this.log.error('Connection failed', err);
+      // Log detailed WebTransportError info for debugging handshake failures
+      if (err instanceof Error) {
+        const details: string[] = [`message=${err.message}`];
+        if ('source' in err) details.push(`source=${(err as any).source}`);
+        if ('streamErrorCode' in err) details.push(`streamErrorCode=${(err as any).streamErrorCode}`);
+        this.log.error(`Connection failed [${details.join(', ')}]`);
+      } else {
+        this.log.error('Connection failed', err);
+      }
       this.transport = null;
       this.controlWriter = null;
       if (!this.closing) {

@@ -5,6 +5,7 @@
  * WebTransport's serverCertificateHashes option. Chrome requires:
  * - ECDSA key (P-256 curve)
  * - Certificate validity ≤ 14 days
+ * - basicConstraints CA:FALSE (must NOT be a CA certificate)
  * - SHA-256 fingerprint for pinning
  */
 
@@ -30,9 +31,14 @@ const CERT_DIR = join(process.cwd(), '.certs');
 /**
  * Generate a self-signed ECDSA P-256 certificate for WebTransport.
  *
- * Uses OpenSSL to create a short-lived (14-day) certificate with
+ * Uses OpenSSL to create a short-lived (13-day) certificate with
  * SAN entries for localhost and 127.0.0.1. The certificate is written
  * to disk in `.certs/` and regenerated on every startup.
+ *
+ * Chrome's WebTransport certificate hash pinning requires:
+ * - Validity period ≤ 14 days (we use 13 for margin)
+ * - basicConstraints CA:FALSE (NOT a CA cert)
+ * - ECDSA with P-256 curve
  *
  * @returns Certificate material including PEM cert, key, and SHA-256 hash
  */
@@ -44,13 +50,17 @@ export function generateCertificate(): CertMaterial {
   const certPath = join(CERT_DIR, 'cert.pem');
   const keyPath = join(CERT_DIR, 'key.pem');
 
-  // Generate ECDSA P-256 self-signed cert valid for 14 days
+  // Generate ECDSA P-256 self-signed cert valid for 13 days
+  // CRITICAL: basicConstraints=CA:FALSE is required for Chrome's WebTransport
+  // certificate hash validation. OpenSSL's `req -x509` defaults to CA:TRUE
+  // which Chrome rejects per the WebTransport spec.
   execSync(
     `openssl req -new -x509 -nodes ` +
       `-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
       `-keyout "${keyPath}" -out "${certPath}" ` +
-      `-days 14 -subj "/CN=localhost" ` +
-      `-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"`,
+      `-days 13 -subj "/CN=localhost" ` +
+      `-addext "subjectAltName=DNS:localhost,IP:127.0.0.1" ` +
+      `-addext "basicConstraints=critical,CA:FALSE"`,
     { stdio: 'pipe' }
   );
 

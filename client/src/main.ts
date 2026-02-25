@@ -16,11 +16,20 @@ import { BenchmarkRunner } from './perf/benchmark-runner';
 import type { BenchmarkReport } from './perf/benchmark-runner';
 import { Controls } from './ui/controls';
 
-/** REST API base URL */
-const API_URL = 'http://localhost:9000';
+/**
+ * REST API base URL.
+ * Uses 127.0.0.1 instead of 'localhost' because macOS resolves localhost
+ * to IPv6 (::1) first, but the QUIC/UDP server binds to IPv4 (0.0.0.0).
+ * Chrome's Happy Eyeballs prefers IPv6 and fails when no UDP listener exists on ::1.
+ */
+const API_URL = 'http://127.0.0.1:9000';
 
-/** WebTransport bridge server URL */
-const WT_URL = 'https://localhost:9001/streams';
+/**
+ * WebTransport bridge server URL.
+ * Must use 127.0.0.1 to match the server's IPv4 UDP socket binding.
+ * The server's TLS certificate includes IP:127.0.0.1 in its SAN.
+ */
+const WT_URL = 'https://127.0.0.1:9001/streams';
 
 /** REST endpoint for certificate hash (for WebTransport pinning) */
 const CERT_HASH_URL = `${API_URL}/cert-hash`;
