@@ -9,7 +9,7 @@
 import { Logger } from './utils/logger';
 import { WTReceiver } from './stream/wt-receiver';
 import { StreamPipeline } from './stream/stream-pipeline';
-import { StreamTile } from './render/stream-tile';
+import { StreamTile, initSharedGPU, type SharedGPU } from './render/stream-tile';
 import { MetricsCollector } from './perf/metrics-collector';
 import { Dashboard } from './perf/dashboard';
 import { BenchmarkRunner } from './perf/benchmark-runner';
@@ -54,6 +54,7 @@ class VMSApp {
   private controls: Controls | null = null;
   private benchmarkRunner: BenchmarkRunner | null = null;
   private gridContainer: HTMLDivElement | null = null;
+  private sharedGPU: SharedGPU | null = null;
   private columns = 4;
   private focusId: number | null = null;
   private nextStreamId = 1;
@@ -87,6 +88,14 @@ class VMSApp {
     if (typeof WebTransport === 'undefined') {
       this.showError('Missing WebTransport API. Please use Chrome 114+.');
       return;
+    }
+
+    // Initialize shared WebGPU resources (shared device, pipeline, sampler)
+    this.sharedGPU = await initSharedGPU();
+    if (this.sharedGPU) {
+      log.info('WebGPU initialized — using zero-copy importExternalTexture rendering');
+    } else {
+      log.warn('WebGPU unavailable — falling back to Canvas2D rendering');
     }
 
     this.gridContainer = document.getElementById('video-grid') as HTMLDivElement | null;
@@ -140,6 +149,11 @@ class VMSApp {
 
     const tile = new StreamTile(streamId);
     this.gridContainer.appendChild(tile.element);
+
+    // Initialize per-tile WebGPU rendering (falls back to Canvas2D)
+    if (this.sharedGPU) {
+      tile.initGPU(this.sharedGPU);
+    }
 
     // Click to toggle focus
     tile.element.addEventListener('click', () => this.toggleFocus(streamId));
@@ -238,7 +252,7 @@ class VMSApp {
       () => this.addStream(),
       () => this.removeAllStreams(),
       this.metrics,
-      'Canvas2D (per-tile)'
+      this.sharedGPU ? 'WebGPU (importExternalTexture)' : 'Canvas2D (per-tile)'
     );
 
     log.info('Starting benchmark...');

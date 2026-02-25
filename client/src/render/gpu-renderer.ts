@@ -4,9 +4,13 @@
  * Uses importExternalTexture for zero-copy GPU rendering of VideoFrames.
  * Renders multiple video streams in a configurable grid layout within
  * a single render pass per animation frame.
+ *
+ * Delegates texture lifecycle management to TextureManager, ensuring
+ * that every VideoFrame is closed after rendering even if errors occur.
  */
 
 import { Logger } from '../utils/logger';
+import { TextureManager } from './texture-manager';
 import shaderCode from './shaders.wgsl?raw';
 
 /** A viewport definition mapping a stream to a normalized canvas region */
@@ -43,6 +47,7 @@ export class GPURenderer {
   private context!: GPUCanvasContext;
   private pipeline!: GPURenderPipeline;
   private sampler!: GPUSampler;
+  private textureManager!: TextureManager;
   private viewportBuffers: Map<number, GPUBuffer> = new Map();
   private currentViewports: Viewport[] = [];
   private canvasFormat!: GPUTextureFormat;
@@ -125,6 +130,9 @@ export class GPURenderer {
       minFilter: 'linear',
     });
 
+    // Create texture manager for VideoFrame → GPUExternalTexture lifecycle
+    this.textureManager = new TextureManager(this.device);
+
     this.canvas = canvas;
     this.log.info(`Initialized with format ${this.canvasFormat}, canvas ${canvas.width}x${canvas.height}`);
   }
@@ -162,12 +170,27 @@ export class GPURenderer {
 
     renderPass.setPipeline(this.pipeline);
 
-    let rendered = 0;
+    // Import all frames via TextureManager (must happen in same microtask as draw)
+    const managedTextures: Array<{ streamId: number; managed: import('./texture-manager').ManagedTexture }> = [];
+
     for (const viewport of this.currentViewports) {
       const frame = frames.get(viewport.streamId);
-      if (!frame) {
-        continue;
+      if (!frame) continue;
+
+      try {
+        const managed = this.textureManager.importFrame(frame);
+        managedTextures.push({ streamId: viewport.streamId, managed });
+        // Remove from frames map so we don't double-close
+        frames.delete(viewport.streamId);
+      } catch (e) {
+        this.log.warn(`Failed to import texture for stream ${viewport.streamId}:`, e);
       }
+    }
+
+    let rendered = 0;
+    for (const viewport of this.currentViewports) {
+      const entry = managedTextures.find(t => t.streamId === viewport.streamId);
+      if (!entry) continue;
 
       const viewportBuffer = this.viewportBuffers.get(viewport.streamId);
       if (!viewportBuffer) {
@@ -178,17 +201,11 @@ export class GPURenderer {
       }
 
       try {
-        // importExternalTexture provides zero-copy GPU access to the VideoFrame.
-        // The resulting GPUExternalTexture is only valid until the current microtask ends.
-        const externalTexture = this.device.importExternalTexture({
-          source: frame,
-        });
-
         const bindGroup = this.device.createBindGroup({
           layout: this.pipeline.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: this.sampler },
-            { binding: 1, resource: externalTexture },
+            { binding: 1, resource: entry.managed.texture },
             { binding: 2, resource: { buffer: viewportBuffer } },
           ],
         });
@@ -205,10 +222,15 @@ export class GPURenderer {
     this.device.queue.submit([commandEncoder.finish()]);
 
     if (this.renderCount <= 3 || this.renderCount % 60 === 0) {
-      this.log.info(`renderAll #${this.renderCount}: rendered ${rendered}/${frames.size} streams`);
+      this.log.info(`renderAll #${this.renderCount}: rendered ${rendered}/${managedTextures.length} streams`);
     }
 
-    // Close ALL VideoFrames after submission
+    // Release all managed textures (closes the source VideoFrames)
+    for (const entry of managedTextures) {
+      entry.managed.release();
+    }
+
+    // Close any remaining frames that weren't imported (streams not in viewports)
     for (const frame of frames.values()) {
       frame.close();
     }
@@ -278,8 +300,24 @@ export class GPURenderer {
     if (!this.device) {
       return 'Not initialized';
     }
-    // GPU info is limited in WebGPU for privacy; return what we can
     return `WebGPU (${this.canvasFormat})`;
+  }
+
+  /**
+   * Get texture manager statistics for monitoring.
+   *
+   * @returns Import/release/error counts and pending frame count
+   */
+  getTextureStats(): { imported: number; released: number; errors: number; pending: number } {
+    if (!this.textureManager) {
+      return { imported: 0, released: 0, errors: 0, pending: 0 };
+    }
+    return {
+      imported: this.textureManager.importCount,
+      released: this.textureManager.releaseCount,
+      errors: this.textureManager.errorCount,
+      pending: this.textureManager.pendingCount,
+    };
   }
 
   /**
