@@ -66,5 +66,5 @@ npm run typecheck        # TypeScript type checking
 - No runtime dependencies in the browser client (all native APIs)
 - Prefer `performance.now()` for timing, not `Date.now()`
 - All WebTransport control messages are length-prefixed JSON on a bidirectional stream
-- All video data is sent on per-stream unidirectional QUIC streams with the binary protocol
+- All video data is currently multiplexed over a single unidirectional QUIC stream per client using the binary protocol (per-stream unidirectional QUIC streams remain a future optimization target)
 - Use `const` by default, `let` only when reassignment is needed
