@@ -109,7 +109,7 @@ export class TextureManager {
     }
   }
 
-  /** Total number of frames successfully imported */
+  /** Total number of frame import attempts (including failed imports) */
   get importCount(): number {
     return this._importCount;
   }
