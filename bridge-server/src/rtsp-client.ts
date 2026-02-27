@@ -288,20 +288,15 @@ export class RTSPClient extends EventEmitter {
 
   /**
    * Get the start code length at a given offset.
-   * @param data - Buffer to inspect
-   * @param offset - Offset of the start code
-   * @returns 3 or 4 (the start code length)
+   *
+   * Always returns 3 to match the 3-byte-only detection used by
+   * findNALUnits. This preserves trailing zero bytes as part of the
+   * preceding NAL unit rather than consuming them into a 4-byte start code.
+   *
+   * @returns 3 (always uses 3-byte start code detection)
    */
-  private getStartCodeLength(data: Uint8Array, offset: number): number {
-    if (
-      offset >= 1 &&
-      data[offset] === 0x00 &&
-      data[offset + 1] === 0x00 &&
-      data[offset + 2] === 0x00 &&
-      data[offset + 3] === 0x01
-    ) {
-      return 4;
-    }
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  private getStartCodeLength(_data: Uint8Array, _offset: number): number {
     return 3;
   }
 

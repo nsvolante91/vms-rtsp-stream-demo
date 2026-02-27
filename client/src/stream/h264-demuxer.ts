@@ -116,14 +116,13 @@ function findNALUnits(data: Uint8Array): Array<{ type: number; data: Uint8Array 
   const units: Array<{ type: number; data: Uint8Array }> = [];
   const startPositions: { offset: number; len: number }[] = [];
 
+  // Use 3-byte start codes only (0x000001). Never promote to 4-byte
+  // (0x00000001) because that steals a trailing 0x00 from the preceding
+  // NAL unit. This is critical for PPS: the trailing alignment byte
+  // must be preserved for correct avcC description construction.
   for (let i = 0; i < data.length - 2; i++) {
     if (data[i] === 0x00 && data[i + 1] === 0x00 && data[i + 2] === 0x01) {
-      const is4Byte = i > 0 && data[i - 1] === 0x00;
-      if (is4Byte) {
-        startPositions.push({ offset: i - 1, len: 4 });
-      } else {
-        startPositions.push({ offset: i, len: 3 });
-      }
+      startPositions.push({ offset: i, len: 3 });
       i += 2;
     }
   }
@@ -145,6 +144,111 @@ function findNALUnits(data: Uint8Array): Array<{ type: number; data: Uint8Array 
 const NAL_SPS = 7;
 /** PPS NAL unit type */
 const NAL_PPS = 8;
+
+/**
+ * Build an avcC (AVC Decoder Configuration Record) box from SPS and PPS.
+ *
+ * This is required as the `description` field in VideoDecoderConfig for
+ * hardware-accelerated H.264 decoding (e.g., macOS VideoToolbox). Without
+ * it, Chrome's hardware decoder rejects Annex B formatted data.
+ *
+ * Format:
+ * ```
+ * configurationVersion    = 1
+ * AVCProfileIndication     = SPS[1]
+ * profile_compatibility    = SPS[2]
+ * AVCLevelIndication       = SPS[3]
+ * lengthSizeMinusOne       = 3 (0xFF = 4-byte NALU lengths)
+ * numSPS                   = 1 (0xE1)
+ * spsLength                = uint16BE
+ * spsData                  = raw SPS bytes
+ * numPPS                   = 1
+ * ppsLength                = uint16BE
+ * ppsData                  = raw PPS bytes
+ * ```
+ *
+ * @param sps - Raw SPS NAL unit data (including NAL header byte, no start code)
+ * @param pps - Raw PPS NAL unit data (including NAL header byte, no start code)
+ * @param chromaFormat - chroma_format_idc from SPS (default 1 = 4:2:0)
+ * @param bitDepthLuma - bit_depth_luma_minus8 from SPS (default 0 = 8-bit)
+ * @param bitDepthChroma - bit_depth_chroma_minus8 from SPS (default 0 = 8-bit)
+ * @returns avcC box as Uint8Array
+ */
+function buildAvcC(
+  sps: Uint8Array,
+  pps: Uint8Array,
+  chromaFormat = 1,
+  bitDepthLuma = 0,
+  bitDepthChroma = 0
+): Uint8Array {
+  const profileIdc = sps[1];
+
+  // ISO/IEC 14496-15: High Profile and above require extension bytes
+  const needsExtension =
+    profileIdc === 100 || profileIdc === 110 ||
+    profileIdc === 122 || profileIdc === 144;
+  const extSize = needsExtension ? 4 : 0;
+
+  const size = 6 + 2 + sps.length + 1 + 2 + pps.length + extSize;
+  const buf = new Uint8Array(size);
+  const view = new DataView(buf.buffer);
+  let offset = 0;
+
+  buf[offset++] = 1;            // configurationVersion
+  buf[offset++] = sps[1];       // AVCProfileIndication
+  buf[offset++] = sps[2];       // profile_compatibility
+  buf[offset++] = sps[3];       // AVCLevelIndication
+  buf[offset++] = 0xff;         // lengthSizeMinusOne = 3 (4-byte lengths) | reserved 6 bits
+  buf[offset++] = 0xe1;         // numOfSequenceParameterSets = 1 | reserved 3 bits
+  view.setUint16(offset, sps.length, false); offset += 2;
+  buf.set(sps, offset); offset += sps.length;
+  buf[offset++] = 1;            // numOfPictureParameterSets
+  view.setUint16(offset, pps.length, false); offset += 2;
+  buf.set(pps, offset); offset += pps.length;
+
+  if (needsExtension) {
+    buf[offset++] = 0xfc | (chromaFormat & 0x03);      // reserved 6 bits + chroma_format
+    buf[offset++] = 0xf8 | (bitDepthLuma & 0x07);      // reserved 5 bits + bit_depth_luma_minus8
+    buf[offset++] = 0xf8 | (bitDepthChroma & 0x07);    // reserved 5 bits + bit_depth_chroma_minus8
+    buf[offset++] = 0;                                  // numOfSequenceParameterSetExt
+  }
+
+  return buf;
+}
+
+/**
+ * Convert H.264 Annex B data to AVCC format.
+ *
+ * Replaces 3- or 4-byte Annex B start codes (0x000001 or 0x00000001)
+ * with 4-byte big-endian NALU length prefixes. This format is required
+ * when the VideoDecoder is configured with an avcC description.
+ *
+ * @param annexB - H.264 data with Annex B start codes
+ * @returns H.264 data with 4-byte length-prefixed NALUs (AVCC format)
+ */
+function annexBToAvcc(annexB: Uint8Array): Uint8Array {
+  const nalus = findNALUnits(annexB);
+  if (nalus.length === 0) return annexB;
+
+  // Calculate total size: 4 bytes length prefix + data for each NALU
+  let totalSize = 0;
+  for (const nalu of nalus) {
+    totalSize += 4 + nalu.data.length;
+  }
+
+  const result = new Uint8Array(totalSize);
+  const view = new DataView(result.buffer);
+  let offset = 0;
+
+  for (const nalu of nalus) {
+    view.setUint32(offset, nalu.data.length, false);
+    offset += 4;
+    result.set(nalu.data, offset);
+    offset += nalu.data.length;
+  }
+
+  return result;
+}
 
 /**
  * Check if a NAL unit type is a VCL (Video Coding Layer) type.
@@ -182,7 +286,7 @@ function extractNALType(data: Uint8Array): number | null {
  * and above, parses chroma and transform parameters. Correctly handles
  * frame cropping to compute actual video dimensions.
  */
-function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc: number; constraintSetFlags: number; levelIdc: number } {
+function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc: number; constraintSetFlags: number; levelIdc: number; chromaFormatIdc: number; bitDepthLumaMinus8: number; bitDepthChromaMinus8: number } {
   const rbsp = removeEmulationPreventionBytes(sps);
   const reader = new BitReader(rbsp.subarray(1)); // skip NAL header
 
@@ -194,6 +298,8 @@ function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc:
   reader.readUE();
 
   let chromaFormatIdc = 1;
+  let bitDepthLumaMinus8 = 0;
+  let bitDepthChromaMinus8 = 0;
   if (
     profileIdc === 100 || profileIdc === 110 || profileIdc === 122 ||
     profileIdc === 244 || profileIdc === 44 || profileIdc === 83 ||
@@ -205,8 +311,8 @@ function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc:
     if (chromaFormatIdc === 3) {
       reader.readBit(); // separate_colour_plane_flag
     }
-    reader.readUE(); // bit_depth_luma_minus8
-    reader.readUE(); // bit_depth_chroma_minus8
+    bitDepthLumaMinus8 = reader.readUE();
+    bitDepthChromaMinus8 = reader.readUE();
     reader.readBit(); // qpprime_y_zero_transform_bypass_flag
 
     const seqScalingMatrixPresentFlag = reader.readBit();
@@ -286,7 +392,7 @@ function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc:
   const width = (picWidthInMbsMinus1 + 1) * 16 - cropUnitX * (cropLeft + cropRight);
   const height = (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1) * 16 - cropUnitY * (cropTop + cropBottom);
 
-  return { width, height, profileIdc, constraintSetFlags, levelIdc };
+  return { width, height, profileIdc, constraintSetFlags, levelIdc, chromaFormatIdc, bitDepthLumaMinus8, bitDepthChromaMinus8 };
 }
 
 /**
@@ -323,7 +429,11 @@ export class H264Demuxer {
   private codec: string | null = null;
   private width = 0;
   private height = 0;
+  private chromaFormatIdc = 1;
+  private bitDepthLumaMinus8 = 0;
+  private bitDepthChromaMinus8 = 0;
   private configured = false;
+  private _keyframeLogCount = 0;
   private readonly log: Logger;
 
   constructor() {
@@ -382,8 +492,11 @@ export class H264Demuxer {
         const info = parseSPS(newSps);
         this.width = info.width;
         this.height = info.height;
+        this.chromaFormatIdc = info.chromaFormatIdc;
+        this.bitDepthLumaMinus8 = info.bitDepthLumaMinus8;
+        this.bitDepthChromaMinus8 = info.bitDepthChromaMinus8;
         this.codec = buildCodecString(newSps);
-        this.log.info(`SPS parsed: ${this.codec}, ${this.width}x${this.height}`);
+        this.log.info(`SPS parsed: ${this.codec}, ${this.width}x${this.height}, chroma=${this.chromaFormatIdc}`);
       } catch (e) {
         this.log.error('Failed to parse SPS', e);
         return null;
@@ -397,10 +510,18 @@ export class H264Demuxer {
 
     if (this.sps && this.pps && this.codec) {
       this.configured = true;
+      const description = buildAvcC(
+        this.sps,
+        this.pps,
+        this.chromaFormatIdc,
+        this.bitDepthLumaMinus8,
+        this.bitDepthChromaMinus8
+      );
       return {
         codec: this.codec,
         codedWidth: this.width,
         codedHeight: this.height,
+        description,
         hardwareAcceleration: 'prefer-hardware',
         optimizeForLatency: true,
       };
@@ -448,24 +569,16 @@ export class H264Demuxer {
     // Use microsecond timestamp directly
     const timestamp = Number(frame.timestamp);
 
-    let data: Uint8Array = frame.data;
+    // Convert Annex B to AVCC (length-prefixed NALUs) since the decoder
+    // is configured with an avcC description for hardware acceleration
+    const data = annexBToAvcc(frame.data);
 
-    // Prepend SPS + PPS with Annex B start codes before keyframes so the
-    // decoder (configured without a description/avcC) can parse them.
-    if (frame.isKeyframe) {
-      const startCode = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
-      const combined = new Uint8Array(
-        startCode.length + this.sps.length +
-        startCode.length + this.pps.length +
-        frame.data.length
-      );
-      let offset = 0;
-      combined.set(startCode, offset); offset += startCode.length;
-      combined.set(this.sps, offset);   offset += this.sps.length;
-      combined.set(startCode, offset); offset += startCode.length;
-      combined.set(this.pps, offset);   offset += this.pps.length;
-      combined.set(frame.data, offset);
-      data = combined;
+    // Log first keyframe details for debugging
+    if (type === 'key' && this._keyframeLogCount < 2) {
+      this._keyframeLogCount++;
+      const nalus = findNALUnits(frame.data);
+      this.log.info(`Keyframe input: ${frame.data.length} bytes, ${nalus.length} NALUs: [${nalus.map(n => `type=${n.type}:${n.data.length}b`).join(', ')}]`);
+      this.log.info(`AVCC output: ${data.length} bytes, first20=${Array.from(data.subarray(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
     }
 
     return new EncodedVideoChunk({

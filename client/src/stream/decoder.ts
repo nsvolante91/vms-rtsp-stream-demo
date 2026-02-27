@@ -34,6 +34,7 @@ export class VideoStreamDecoder {
   private _lastDecodeTime = 0;
   private _waitingForKeyframe = true;
   private _lastRecoveryTime = 0;
+  private _softwareFallback = false;
   private readonly log: Logger;
 
   /**
@@ -62,11 +63,77 @@ export class VideoStreamDecoder {
   configure(config: VideoDecoderConfig): void {
     this.log.info(`Configuring decoder: ${config.codec} ${config.codedWidth}x${config.codedHeight}`);
 
+    // Log description details for debugging
+    if (config.description) {
+      const desc = config.description instanceof ArrayBuffer
+        ? new Uint8Array(config.description)
+        : new Uint8Array((config.description as ArrayBufferView).buffer,
+            (config.description as ArrayBufferView).byteOffset,
+            (config.description as ArrayBufferView).byteLength);
+      this.log.info(`avcC description: ${desc.length} bytes, hex=${Array.from(desc.subarray(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}...`);
+    }
+
+    // Check isConfigSupported asynchronously (non-blocking diagnostic)
+    VideoDecoder.isConfigSupported(config).then(result => {
+      this.log.info(`isConfigSupported: ${result.supported}`);
+    }).catch(err => {
+      this.log.error('isConfigSupported error', err);
+    });
+
     if (this.decoder) {
       try {
         this.decoder.close();
       } catch {
         // Ignore errors when closing a previously errored decoder
+      }
+    }
+
+    this.config = config;
+    this._waitingForKeyframe = true;
+    this._softwareFallback = false;
+
+    this.decoder = new VideoDecoder({
+      output: (frame: VideoFrame) => {
+        this._decodedFrames++;
+        this._lastDecodeTime = performance.now();
+        if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
+          this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
+        }
+        this.onFrame(frame);
+      },
+      error: (error: DOMException) => {
+        this.log.error('Decoder error', error);
+        // On first error, try software decoding before reporting to pipeline
+        if (!this._softwareFallback && this.config) {
+          this._softwareFallback = true;
+          this.log.info('Hardware decode failed, trying software fallback...');
+          try {
+            const swConfig = { ...this.config, hardwareAcceleration: 'prefer-software' as HardwareAcceleration };
+            this.configureDirect(swConfig);
+            return;
+          } catch (e) {
+            this.log.error('Software fallback configure failed', e);
+          }
+        }
+        this.onError(new Error(`Decoder error: ${error.message}`));
+        this.recoverFromError();
+      },
+    });
+
+    this.decoder.configure(config);
+  }
+
+  /**
+   * Direct configure without diagnostics (used by software fallback).
+   */
+  private configureDirect(config: VideoDecoderConfig): void {
+    this.log.info(`Configuring decoder (fallback): ${config.codec} ${config.codedWidth}x${config.codedHeight} hw=${config.hardwareAcceleration}`);
+
+    if (this.decoder) {
+      try {
+        this.decoder.close();
+      } catch {
+        // Ignore
       }
     }
 
@@ -80,12 +147,10 @@ export class VideoStreamDecoder {
         if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
           this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
         }
-        console.log(this._decodedFrames);
-        if (frame) console.log(frame);
         this.onFrame(frame);
       },
       error: (error: DOMException) => {
-        this.log.error('Decoder error', error);
+        this.log.error('Decoder error (fallback)', error);
         this.onError(new Error(`Decoder error: ${error.message}`));
         this.recoverFromError();
       },
@@ -147,7 +212,10 @@ export class VideoStreamDecoder {
         return;
       }
       this._waitingForKeyframe = false;
-      this.log.info('First keyframe received after configure');
+      // Log detailed keyframe info for debugging
+      const chunkBuf = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(chunkBuf);
+      this.log.info(`First keyframe: ${chunk.byteLength} bytes, ts=${chunk.timestamp}, first16=${Array.from(chunkBuf.subarray(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
     }
 
     // Backpressure: drop non-keyframes when queue is congested

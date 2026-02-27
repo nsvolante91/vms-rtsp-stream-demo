@@ -43,7 +43,7 @@ const STREAMS_URL = `${API_URL}/streams`;
 const WS_URL = `ws://127.0.0.1:9000/ws`;
 
 /** Maximum number of streams to auto-add on startup */
-const AUTO_ADD_MAX = 16;
+const AUTO_ADD_MAX = 1;
 
 const log = new Logger('VMSApp');
 

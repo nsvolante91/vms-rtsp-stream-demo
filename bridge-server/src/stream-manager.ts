@@ -627,16 +627,19 @@ export class StreamManager {
   ): void {
     if (!managed.spsNALU || !managed.ppsNALU) return;
 
+    // Send SPS and PPS as separate CONFIG frames (matching handleNALU behavior).
+    // Combining them into one Annex B frame with start codes causes re-parsing
+    // ambiguity: the client's 3-byte start code scanner would absorb a trailing
+    // zero from the SPS into the next start code boundary.
     const startCode = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
-    const payload = Buffer.concat([
-      startCode,
-      managed.spsNALU,
-      startCode,
-      managed.ppsNALU,
-    ]);
 
-    const frame = buildFrame(managed.id, 0n, FLAG_CONFIG, payload);
-    sub.send(frame);
+    const spsPayload = Buffer.concat([startCode, managed.spsNALU]);
+    const spsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, spsPayload);
+    sub.send(spsFrame);
+
+    const ppsPayload = Buffer.concat([startCode, managed.ppsNALU]);
+    const ppsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, ppsPayload);
+    sub.send(ppsFrame);
   }
 
   /**

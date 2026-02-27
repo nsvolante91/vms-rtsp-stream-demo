@@ -159,8 +159,12 @@ function removeEmulationPreventionBytes(data: Uint8Array): Uint8Array {
 /**
  * Find all NAL units in an H.264 Annex B byte stream.
  *
- * Scans for start codes (0x000001 or 0x00000001) and extracts each
- * NAL unit between consecutive start codes.
+ * Scans for 3-byte start codes (0x000001) and extracts each NAL unit
+ * between consecutive start codes. Uses 3-byte detection only so that
+ * trailing zero bytes (e.g., RBSP alignment) are preserved as part of
+ * the preceding NAL unit rather than being consumed into a 4-byte
+ * start code. This matches FFmpeg's NAL extraction behavior and is
+ * critical for correct avcC description construction (PPS length).
  *
  * @param data - Raw Annex B byte stream
  * @returns Array of parsed NAL units
@@ -169,17 +173,14 @@ export function findNALUnits(data: Uint8Array): NALUnit[] {
   const units: NALUnit[] = [];
   const startCodePositions: { offset: number; startCodeLength: number }[] = [];
 
-  // Find all start code positions
+  // Find all 3-byte start code positions (0x000001).
+  // We intentionally do NOT promote to 4-byte (0x00000001) because doing
+  // so would steal a trailing 0x00 byte from the preceding NAL unit.
+  // For example, a PPS ending with 0xC0 0x00 followed by 0x00 0x00 0x01
+  // would lose the 0x00 trailing byte if we detected a 4-byte start code.
   for (let i = 0; i < data.length - 2; i++) {
-    // Check for 3-byte start code: 0x000001
     if (data[i] === 0x00 && data[i + 1] === 0x00 && data[i + 2] === 0x01) {
-      // Check for 4-byte start code: 0x00000001
-      const is4Byte = i > 0 && data[i - 1] === 0x00;
-      if (is4Byte) {
-        startCodePositions.push({ offset: i - 1, startCodeLength: 4 });
-      } else {
-        startCodePositions.push({ offset: i, startCodeLength: 3 });
-      }
+      startCodePositions.push({ offset: i, startCodeLength: 3 });
       i += 2; // skip past the start code
     }
   }
