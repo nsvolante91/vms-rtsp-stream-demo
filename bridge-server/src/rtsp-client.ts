@@ -16,6 +16,11 @@ import {
   parseSPS,
   type SPSInfo,
 } from './h264-parser.js';
+import {
+  createRtspAuthProxy,
+  parseRtspUrl,
+  type RtspAuthProxy,
+} from './rtsp-auth-proxy.js';
 
 /** Event emitted when a complete NAL unit is extracted from the stream */
 export interface NALUEvent {
@@ -64,6 +69,7 @@ export class RTSPClient extends EventEmitter {
   private frameCount = 0;
   private startTime = 0n;
   private spsInfo: SPSInfo | null = null;
+  private authProxy: RtspAuthProxy | null = null;
 
   constructor(private readonly rtspUrl: string) {
     super();
@@ -113,11 +119,17 @@ export class RTSPClient extends EventEmitter {
     this.startTime = process.hrtime.bigint();
     this.buffer = Buffer.alloc(0);
 
+    // Start auth proxy to work around FFmpeg 8.x SHA-256 Digest auth bug
+    const { host, port: rtspPort } = parseRtspUrl(this.rtspUrl);
+    this.authProxy = await createRtspAuthProxy(host, rtspPort);
+    const proxiedUrl = this.authProxy.rewriteUrl(this.rtspUrl);
+    console.log(`[RTSPClient] Using auth proxy: ${proxiedUrl}`);
+
     return new Promise<void>((resolve, reject) => {
       // Spawn FFmpeg: read RTSP via TCP, output raw H.264 Annex B to stdout
       this.ffmpeg = spawn('ffmpeg', [
         '-rtsp_transport', 'tcp',
-        '-i', this.rtspUrl,
+        '-i', proxiedUrl,
         '-c:v', 'copy',
         '-an',
         '-f', 'h264',
@@ -192,6 +204,13 @@ export class RTSPClient extends EventEmitter {
    */
   close(): void {
     this.running = false;
+
+    // Shut down the auth proxy
+    if (this.authProxy) {
+      this.authProxy.close();
+      this.authProxy = null;
+    }
+
     if (this.ffmpeg) {
       const proc = this.ffmpeg;
       this.ffmpeg = null;
@@ -362,12 +381,23 @@ export async function probeRTSPStream(
   rtspUrl: string,
   timeoutMs = 5000
 ): Promise<boolean> {
+  // Start auth proxy to work around FFmpeg 8.x SHA-256 Digest auth bug
+  let proxy: RtspAuthProxy | null = null;
+  let proxiedUrl = rtspUrl;
+  try {
+    const { host, port: rtspPort } = parseRtspUrl(rtspUrl);
+    proxy = await createRtspAuthProxy(host, rtspPort);
+    proxiedUrl = proxy.rewriteUrl(rtspUrl);
+  } catch {
+    // If proxy fails to start, try direct connection
+  }
+
   return new Promise<boolean>((resolve) => {
     const proc = spawn('ffprobe', [
       '-rtsp_transport', 'tcp',
       '-analyzeduration', '1000000',
       '-probesize', '1000000',
-      '-i', rtspUrl,
+      '-i', proxiedUrl,
       '-show_streams',
       '-select_streams', 'v:0',
       '-loglevel', 'error',
@@ -391,12 +421,14 @@ export async function probeRTSPStream(
         } catch {
           // Process may have already exited
         }
+        proxy?.close();
         resolve(false);
       }
     }, timeoutMs);
 
     proc.on('close', (code: number | null) => {
       clearTimeout(timeout);
+      proxy?.close();
       if (!resolved) {
         resolved = true;
         if (code === 0 && stdout.length > 0) {
@@ -416,6 +448,7 @@ export async function probeRTSPStream(
 
     proc.on('error', () => {
       clearTimeout(timeout);
+      proxy?.close();
       if (!resolved) {
         resolved = true;
         resolve(false);

@@ -80,6 +80,8 @@ export class VideoStreamDecoder {
         if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
           this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
         }
+        console.log(this._decodedFrames);
+        if (frame) console.log(frame);
         this.onFrame(frame);
       },
       error: (error: DOMException) => {

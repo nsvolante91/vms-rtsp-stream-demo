@@ -26,8 +26,8 @@ import { attachWebSocketServer } from './ws-handler.js';
 
 const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
 const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
-const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://192.168.3.123:8554';
-const MAX_DISCOVER_STREAMS = 16;
+const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://adminbob:Test123.@10.10.33.32:554/live/0582abb4-1cd7-469e-9b7c-b0c1cffab49b';
+const MAX_DISCOVER_STREAMS = 1;
 
 const streamManager = new StreamManager();
 let nextStreamId = 1;
@@ -159,14 +159,39 @@ async function handleRequest(
 }
 
 /**
- * Auto-discover active RTSP streams on the local MediaMTX server.
+ * Auto-discover active RTSP streams.
  *
- * Probes RTSP URLs from stream1 through stream16 and adds any that
- * respond successfully. Uses parallel probing for speed.
+ * If RTSP_BASE_URL looks like a MediaMTX local server (contains localhost or
+ * 127.0.0.1), probes stream1..stream16 as sub-paths. Otherwise, treats the
+ * base URL as a single direct RTSP stream (e.g. a real IP camera).
  */
 async function discoverStreams(): Promise<void> {
+  const isLocalMediaMTX =
+    RTSP_BASE_URL.includes('localhost') ||
+    RTSP_BASE_URL.includes('127.0.0.1');
+
+  if (!isLocalMediaMTX) {
+    // Direct camera URL — probe and add as a single stream
+    console.log(`[Discovery] Probing direct RTSP URL: ${RTSP_BASE_URL}`);
+    const available = true; // await probeRTSPStream(RTSP_BASE_URL, 10000);
+    if (available) {
+      const id = nextStreamId++;
+      try {
+        await streamManager.addStream(id, RTSP_BASE_URL);
+        console.log(`[Discovery] Added direct stream as ID ${id}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`[Discovery] Failed to add direct stream: ${message}`);
+      }
+    } else {
+      console.error(`[Discovery] Could not connect to ${RTSP_BASE_URL}`);
+    }
+    return;
+  }
+
+  // MediaMTX local server — probe stream
   console.log(
-    `[Discovery] Probing ${RTSP_BASE_URL}/stream1..stream${MAX_DISCOVER_STREAMS}`
+    `[Discovery] Probing ${RTSP_BASE_URL}`
   );
 
   const probePromises: Promise<{ index: number; available: boolean }>[] = [];
