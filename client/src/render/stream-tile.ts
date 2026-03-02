@@ -108,6 +108,11 @@ export class StreamTile {
   private viewportBuffer: GPUBuffer | null = null;
   private useWebGPU = false;
 
+  /** Cached video aspect ratio to avoid rewriting the uniform buffer every frame */
+  private lastVideoAR = 0;
+  /** Cached canvas aspect ratio to detect canvas resizes */
+  private lastCanvasAR = 0;
+
   constructor(readonly streamId: number) {
     this.log = new Logger(`Tile[${streamId}]`);
 
@@ -223,11 +228,39 @@ export class StreamTile {
    *
    * The GPUExternalTexture is only valid until the current microtask
    * completes, so import → bind → draw → submit all happen synchronously.
+   *
+   * Updates the viewport uniform buffer when the video or canvas aspect
+   * ratio changes to maintain square pixel aspect ratio (letterbox/pillarbox).
    */
   private drawFrameGPU(frame: VideoFrame): void {
     const { device, pipeline, sampler } = this.gpu!;
 
     try {
+      // Update viewport uniform for aspect-ratio-correct rendering
+      const videoAR = frame.displayWidth / frame.displayHeight;
+      const canvasAR = this.canvas.width / this.canvas.height;
+
+      if (videoAR !== this.lastVideoAR || canvasAR !== this.lastCanvasAR) {
+        let scaleX = 1.0;
+        let scaleY = 1.0;
+
+        if (videoAR > canvasAR) {
+          // Video is wider than canvas → pillarbox (black bars top/bottom)
+          scaleY = canvasAR / videoAR;
+        } else {
+          // Video is taller than canvas → letterbox (black bars left/right)
+          scaleX = videoAR / canvasAR;
+        }
+
+        device.queue.writeBuffer(
+          this.viewportBuffer!,
+          0,
+          new Float32Array([0.0, 0.0, scaleX, scaleY])
+        );
+        this.lastVideoAR = videoAR;
+        this.lastCanvasAR = canvasAR;
+      }
+
       // Import the VideoFrame as a GPU external texture (zero-copy)
       const externalTexture = device.importExternalTexture({
         source: frame,
@@ -270,6 +303,9 @@ export class StreamTile {
 
   /**
    * Render a VideoFrame via Canvas2D drawImage (fallback).
+   *
+   * Maintains square pixel aspect ratio by letterboxing/pillarboxing
+   * the video within the canvas.
    */
   private drawFrameCanvas2D(frame: VideoFrame): void {
     if (!this.ctx2d) {
@@ -283,7 +319,32 @@ export class StreamTile {
     }
 
     try {
-      this.ctx2d.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+      const cw = this.canvas.width;
+      const ch = this.canvas.height;
+
+      // Compute letterbox/pillarbox to preserve video aspect ratio
+      const videoAR = frame.displayWidth / frame.displayHeight;
+      const canvasAR = cw / ch;
+
+      let dw: number, dh: number, dx: number, dy: number;
+      if (videoAR > canvasAR) {
+        // Video is wider → fit to width, black bars top/bottom
+        dw = cw;
+        dh = cw / videoAR;
+        dx = 0;
+        dy = (ch - dh) / 2;
+      } else {
+        // Video is taller → fit to height, black bars left/right
+        dh = ch;
+        dw = ch * videoAR;
+        dx = (cw - dw) / 2;
+        dy = 0;
+      }
+
+      // Clear background for letterbox/pillarbox bars
+      this.ctx2d.fillStyle = '#000';
+      this.ctx2d.fillRect(0, 0, cw, ch);
+      this.ctx2d.drawImage(frame, dx, dy, dw, dh);
     } catch (e) {
       this.log.warn('Canvas2D render failed', e);
     } finally {

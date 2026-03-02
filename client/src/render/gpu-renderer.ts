@@ -55,6 +55,11 @@ export class GPURenderer {
   private canvas!: HTMLCanvasElement;
   private readonly log: Logger;
 
+  /** Cached per-stream video aspect ratios to avoid rewriting buffers every frame */
+  private lastVideoARs: Map<number, number> = new Map();
+  /** Cached canvas aspect ratio to detect canvas resizes */
+  private lastCanvasAR = 0;
+
   constructor() {
     this.log = new Logger('GPURenderer');
   }
@@ -188,6 +193,12 @@ export class GPURenderer {
     }
 
     let rendered = 0;
+    const canvasAR = this.canvas.width / this.canvas.height;
+    const canvasARChanged = canvasAR !== this.lastCanvasAR;
+    if (canvasARChanged) {
+      this.lastCanvasAR = canvasAR;
+    }
+
     for (const viewport of this.currentViewports) {
       const entry = managedTextures.find(t => t.streamId === viewport.streamId);
       if (!entry) continue;
@@ -198,6 +209,33 @@ export class GPURenderer {
           this.log.warn(`No viewport buffer for stream ${viewport.streamId}`);
         }
         continue;
+      }
+
+      // Update viewport buffer for aspect-ratio-correct rendering
+      const videoAR = entry.managed.width / entry.managed.height;
+      const lastAR = this.lastVideoARs.get(viewport.streamId);
+      if (canvasARChanged || videoAR !== lastAR) {
+        const cellPixelW = viewport.width * this.canvas.width;
+        const cellPixelH = viewport.height * this.canvas.height;
+        const cellAR = cellPixelW / cellPixelH;
+
+        let adjScaleX = viewport.width;
+        let adjScaleY = viewport.height;
+
+        if (videoAR > cellAR) {
+          // Video wider than cell → shrink height
+          adjScaleY = viewport.height * (cellAR / videoAR);
+        } else {
+          // Video taller than cell → shrink width
+          adjScaleX = viewport.width * (videoAR / cellAR);
+        }
+
+        const offsetX = viewport.x * 2 - 1 + viewport.width;
+        const offsetY = 1 - viewport.y * 2 - viewport.height;
+
+        const uniformData = new Float32Array([offsetX, offsetY, adjScaleX, adjScaleY]);
+        this.device.queue.writeBuffer(viewportBuffer, 0, uniformData);
+        this.lastVideoARs.set(viewport.streamId, videoAR);
       }
 
       try {
