@@ -29,37 +29,6 @@ export interface CertMaterial {
 const CERT_DIR = join(process.cwd(), '.certs');
 
 /**
- * Load an existing TLS certificate and private key from disk.
- *
- * Use this when you have a CA-signed or mkcert certificate that
- * is already trusted by the system trust store. Unlike generated
- * self-signed certs, these don't require WebTransport hash pinning.
- *
- * @param certPath - Path to PEM-encoded certificate file
- * @param keyPath - Path to PEM-encoded private key file
- * @returns Certificate material including PEM cert, key, and SHA-256 hash
- */
-export function loadCertificate(certPath: string, keyPath: string): CertMaterial {
-  if (!existsSync(certPath)) {
-    throw new Error(`Certificate file not found: ${certPath}`);
-  }
-  if (!existsSync(keyPath)) {
-    throw new Error(`Key file not found: ${keyPath}`);
-  }
-
-  const cert = readFileSync(certPath, 'utf-8');
-  const key = readFileSync(keyPath, 'utf-8');
-  const hash = computeCertHash(certPath);
-
-  return {
-    cert,
-    key,
-    hash,
-    hashHex: Buffer.from(hash).toString('hex'),
-  };
-}
-
-/**
  * Generate a self-signed ECDSA P-256 certificate for WebTransport.
  *
  * Uses OpenSSL to create a short-lived (13-day) certificate with

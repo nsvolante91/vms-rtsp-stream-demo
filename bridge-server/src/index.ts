@@ -19,10 +19,9 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
 import { Http3Server } from '@fails-components/webtransport';
-import { join } from 'path';
 import { StreamManager } from './stream-manager.js';
 import { probeRTSPStream } from './rtsp-client.js';
-import { loadCertificate, generateCertificate, type CertMaterial } from './cert-utils.js';
+import { generateCertificate, type CertMaterial } from './cert-utils.js';
 import { attachWebSocketServer } from './ws-handler.js';
 
 const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
@@ -269,19 +268,10 @@ async function acceptSessions(
  * its SHA-256 hash via the REST API. Auto-discovers RTSP streams on startup.
  */
 async function main(): Promise<void> {
-  // Load TLS certificate
-  const certPath = process.env.TLS_CERT ?? join(process.cwd(), '..', 'KP7DWX6RDC.local.pem');
-  const keyPath = process.env.TLS_KEY ?? join(process.cwd(), '..', 'KP7DWX6RDC.local-key.pem');
-
-  try {
-    console.log(`[Bridge] Loading TLS certificate from ${certPath}`);
-    certMaterial = loadCertificate(certPath, keyPath);
-    console.log(`[Bridge] Certificate hash: ${certMaterial.hashHex}`);
-  } catch {
-    console.log('[Bridge] External cert not found — generating self-signed TLS certificate...');
-    certMaterial = generateCertificate();
-    console.log(`[Bridge] Certificate hash: ${certMaterial.hashHex}`);
-  }
+  // Generate self-signed ECDSA certificate for WebTransport
+  console.log('[Bridge] Generating self-signed TLS certificate...');
+  certMaterial = generateCertificate();
+  console.log(`[Bridge] Certificate hash: ${certMaterial.hashHex}`);
 
   // Create HTTP/1.1 REST API server
   const httpServer = createServer((req, res) => {

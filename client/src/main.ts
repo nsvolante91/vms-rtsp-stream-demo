@@ -24,22 +24,23 @@ import { Controls } from './ui/controls';
  * to IPv6 (::1) first, but the QUIC/UDP server binds to IPv4 (0.0.0.0).
  * Chrome's Happy Eyeballs prefers IPv6 and fails when no UDP listener exists on ::1.
  */
-const API_URL = 'http://KP7DWX6RDC.local:9000';
+const API_URL = 'http://127.0.0.1:9000';
 
 /**
  * WebTransport bridge server URL.
- * Uses the mkcert hostname matching the TLS certificate SAN.
+ * Must use 127.0.0.1 to match the server's IPv4 UDP socket binding.
+ * The server's TLS certificate includes IP:127.0.0.1 in its SAN.
  */
-const WT_URL = 'https://KP7DWX6RDC.local:9001/streams';
+const WT_URL = 'https://127.0.0.1:9001/streams';
 
-/** REST endpoint for certificate hash (for self-signed cert pinning) */
+/** REST endpoint for certificate hash (for WebTransport pinning) */
 const CERT_HASH_URL = `${API_URL}/cert-hash`;
 
 /** HTTP endpoint for available streams */
 const STREAMS_URL = `${API_URL}/streams`;
 
 /** WebSocket fallback URL (same HTTP server, /ws path) */
-const WS_URL = `ws://KP7DWX6RDC.local:9000/ws`;
+const WS_URL = `ws://127.0.0.1:9000/ws`;
 
 /** Maximum number of streams to auto-add on startup */
 const AUTO_ADD_MAX = 1;
@@ -101,7 +102,7 @@ class VMSApp {
     // Connect transport: prefer WebTransport, fall back to WebSocket
     if (typeof WebTransport !== 'undefined') {
       log.info('WebTransport available — using QUIC transport');
-      const wt = new WTReceiver(WT_URL, null);
+      const wt = new WTReceiver(WT_URL, CERT_HASH_URL);
       await wt.connect();
       this.receiver = wt;
     } else {

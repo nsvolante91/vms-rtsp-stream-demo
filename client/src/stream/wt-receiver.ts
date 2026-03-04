@@ -149,11 +149,11 @@ export class WTReceiver {
    * Create a new WTReceiver.
    *
    * @param wtUrl - WebTransport server URL (e.g., "https://localhost:9001/streams")
-   * @param certHashUrl - REST API URL for fetching the certificate hash (null to skip pinning for CA-trusted certs)
+   * @param certHashUrl - REST API URL for fetching the certificate hash
    */
   constructor(
     private readonly wtUrl: string,
-    private readonly certHashUrl: string | null = null
+    private readonly certHashUrl: string
   ) {
     this.log = new Logger('WTReceiver');
   }
@@ -174,34 +174,28 @@ export class WTReceiver {
     }
 
     try {
-      // For CA-trusted certs (e.g. mkcert), skip hash pinning.
-      // For self-signed certs, fetch the hash from the REST API.
-      const wtOptions: WebTransportOptions = {};
-
-      if (this.certHashUrl) {
-        if (!this.certHash) {
-          this.log.info(`Fetching certificate hash from ${this.certHashUrl}`);
-          const response = await fetch(this.certHashUrl);
-          if (!response.ok) {
-            throw new Error(`Failed to fetch cert hash: ${response.status}`);
-          }
-          const { hash } = (await response.json()) as { hash: string };
-          this.certHash = hexToBytes(hash);
-          this.log.info(`Certificate hash: ${hash.substring(0, 16)}...`);
+      // Fetch the certificate hash from the REST API
+      if (!this.certHash) {
+        this.log.info(`Fetching certificate hash from ${this.certHashUrl}`);
+        const response = await fetch(this.certHashUrl);
+        if (!response.ok) {
+          throw new Error(`Failed to fetch cert hash: ${response.status}`);
         }
-        wtOptions.serverCertificateHashes = [
-          {
-            algorithm: 'sha-256',
-            value: this.certHash.buffer as ArrayBuffer,
-          },
-        ];
-      } else {
-        this.log.info('Using CA-trusted certificate — skipping hash pinning');
+        const { hash } = (await response.json()) as { hash: string };
+        this.certHash = hexToBytes(hash);
+        this.log.info(`Certificate hash: ${hash.substring(0, 16)}...`);
       }
 
       this.log.info(`Connecting to ${this.wtUrl}`);
 
-      this.transport = new WebTransport(this.wtUrl, wtOptions);
+      this.transport = new WebTransport(this.wtUrl, {
+        serverCertificateHashes: [
+          {
+            algorithm: 'sha-256',
+            value: this.certHash.buffer as ArrayBuffer,
+          },
+        ],
+      });
 
       await this.transport.ready;
       this.log.info('WebTransport session established');
