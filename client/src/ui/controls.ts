@@ -18,6 +18,8 @@
  * - Dashboard toggle: "D" key press
  */
 export class Controls {
+  private cpuHogInterval: number | null = null;
+
   /**
    * Create a new Controls instance.
    * @param onLayoutChange - Called with the number of columns when a layout button is clicked
@@ -82,6 +84,12 @@ export class Controls {
       exportBtn.addEventListener('click', () => this.onExport());
     }
 
+    // CPU Hogger button
+    const cpuHogBtn = document.getElementById('btn-cpu-hog');
+    if (cpuHogBtn) {
+      cpuHogBtn.addEventListener('click', () => this.toggleCpuHog(cpuHogBtn));
+    }
+
     // Keyboard shortcut: 'D' toggles dashboard
     document.addEventListener('keydown', (e: KeyboardEvent) => {
       if (e.key === 'd' || e.key === 'D') {
@@ -93,5 +101,33 @@ export class Controls {
         this.onToggleDashboard();
       }
     });
+  }
+
+  /**
+   * Toggle the CPU hogger on or off.
+   *
+   * When active, runs a synchronous busy-loop for ~100ms every 1 second
+   * on the main thread, simulating heavy JS load. Useful for testing
+   * video playback smoothness under thread contention.
+   */
+  private toggleCpuHog(btn: HTMLElement): void {
+    if (this.cpuHogInterval !== null) {
+      clearInterval(this.cpuHogInterval);
+      this.cpuHogInterval = null;
+      btn.classList.remove('active');
+      console.log('[CPU Hog] Stopped');
+      return;
+    }
+
+    btn.classList.add('active');
+    console.log('[CPU Hog] Started — blocking main thread ~100ms every 1s');
+
+    this.cpuHogInterval = window.setInterval(() => {
+      const start = performance.now();
+      // Busy-loop until ~100ms have elapsed
+      while (performance.now() - start < 100) {
+        // burn CPU
+      }
+    }, 1000);
   }
 }

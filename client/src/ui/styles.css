@@ -155,6 +155,19 @@ button.active {
   border-top: 1px solid #222;
 }
 
+#btn-cpu-hog {
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 10px;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+#btn-cpu-hog.active {
+  background: #cc3300;
+  border-color: #ff4400;
+  box-shadow: 0 0 8px rgba(255, 68, 0, 0.5);
+}
+
 .error-overlay {
   position: fixed;
   top: 50%;
