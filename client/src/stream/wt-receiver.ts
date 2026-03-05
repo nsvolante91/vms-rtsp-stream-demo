@@ -145,6 +145,15 @@ export class WTReceiver {
   private readonly log: Logger;
   private certHash: Uint8Array | null = null;
 
+  /** Pooled ReceivedFrame object reused across parseBinaryFrame calls */
+  private readonly _pooledFrame: ReceivedFrame = {
+    streamId: 0,
+    timestamp: 0n,
+    isKeyframe: false,
+    isConfig: false,
+    data: new Uint8Array(0),
+  };
+
   /**
    * Create a new WTReceiver.
    *
@@ -377,29 +386,53 @@ export class WTReceiver {
    *
    * @param buffer - Raw frame bytes (12-byte header + payload)
    */
+  /**
+   * Parse a binary frame and dispatch to the appropriate callback.
+   *
+   * Uses manual byte reads instead of DataView to avoid per-frame
+   * DataView allocation. Reuses a single ReceivedFrame object (pooled)
+   * to eliminate per-frame object creation — safe because callbacks
+   * consume the frame synchronously.
+   *
+   * @param buffer - Raw frame bytes (12-byte header + payload)
+   */
   private parseBinaryFrame(buffer: Uint8Array): void {
     if (buffer.byteLength < HEADER_SIZE) {
       this.log.warn(`Frame too short: ${buffer.byteLength} bytes`);
       return;
     }
 
-    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-    const version = view.getUint8(0);
+    const off = buffer.byteOffset;
+    const b = buffer;
+
+    const version = b[off];
     if (version !== PROTOCOL_VERSION) {
       this.log.warn(`Unknown protocol version: ${version}`);
       return;
     }
 
-    const streamId = view.getUint16(1, false);
-    const timestamp = view.getBigUint64(3, false);
-    const flags = view.getUint8(11);
+    const streamId = (b[off + 1] << 8) | b[off + 2];
+
+    // Read 64-bit timestamp as BigInt via two 32-bit halves (manual bytes)
+    const hi = ((b[off + 3] << 24) | (b[off + 4] << 16) | (b[off + 5] << 8) | b[off + 6]) >>> 0;
+    const lo = ((b[off + 7] << 24) | (b[off + 8] << 16) | (b[off + 9] << 8) | b[off + 10]) >>> 0;
+    const timestamp = (BigInt(hi) << 32n) | BigInt(lo);
+
+    const flags = b[off + 11];
     const isKeyframe = (flags & 0x01) !== 0;
     const isConfig = (flags & 0x02) !== 0;
     const data = buffer.subarray(HEADER_SIZE);
 
     const callback = this.callbacks.get(streamId);
     if (callback) {
-      callback({ streamId, timestamp, isKeyframe, isConfig, data });
+      // Reuse pooled frame object to avoid per-frame allocation.
+      // Safe because callbacks process synchronously.
+      this._pooledFrame.streamId = streamId;
+      this._pooledFrame.timestamp = timestamp;
+      this._pooledFrame.isKeyframe = isKeyframe;
+      this._pooledFrame.isConfig = isConfig;
+      this._pooledFrame.data = data;
+      callback(this._pooledFrame);
     }
   }
 
