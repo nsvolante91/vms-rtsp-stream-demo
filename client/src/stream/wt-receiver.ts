@@ -52,16 +52,6 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 
 /**
- * Concatenate two Uint8Arrays.
- */
-function concat(a: Uint8Array, b: Uint8Array<ArrayBufferLike>): Uint8Array {
-  const result = new Uint8Array(a.length + b.length);
-  result.set(a);
-  result.set(b, a.length);
-  return result;
-}
-
-/**
  * Write a length-prefixed message to a WritableStreamDefaultWriter.
  */
 async function writeLengthPrefixed(
@@ -74,40 +64,120 @@ async function writeLengthPrefixed(
   await writer.write(frame);
 }
 
+/** Accumulation buffer initial size (64 KB) */
+const ACCUM_BUFFER_INITIAL_SIZE = 65_536;
+
+/** BYOB read buffer size (32 KB) — recycled by browser on each read */
+const BYOB_READ_BUFFER_SIZE = 32_768;
+
+/**
+ * Grow a Uint8Array buffer while preserving existing data.
+ */
+function growBuffer(buf: Uint8Array, filled: number, minCapacity: number): Uint8Array {
+  const newSize = Math.max(buf.byteLength * 2, minCapacity);
+  const newBuf = new Uint8Array(newSize);
+  if (filled > 0) {
+    newBuf.set(buf.subarray(0, filled));
+  }
+  return newBuf;
+}
+
 /**
  * Async generator that reads length-prefixed messages from a ReadableStream.
- * Handles chunk boundaries that don't align with message boundaries.
+ *
+ * Tries BYOB reader to eliminate browser-side per-read Uint8Array allocation.
+ * BYOB uses a separate small read buffer (recycled via ownership transfer)
+ * and copies into a stable accumulation buffer. Falls back to default reader
+ * if the stream doesn't support BYOB mode.
+ *
+ * The accumulation buffer uses doubling growth + copyWithin compaction to
+ * avoid the O(N²) concat+slice pattern.
  */
 async function* readLengthPrefixed(
   readable: ReadableStream<Uint8Array>
 ): AsyncGenerator<Uint8Array> {
-  const reader = readable.getReader();
-  let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  // Try BYOB reader; fall back to default reader
+  let byobReader: ReadableStreamBYOBReader | null = null;
+  let defaultReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  try {
+    byobReader = readable.getReader({ mode: 'byob' });
+  } catch {
+    defaultReader = readable.getReader();
+  }
+
+  // Stable accumulation buffer — never transferred to BYOB
+  let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(ACCUM_BUFFER_INITIAL_SIZE);
+  let filled = 0;
+
+  // Separate BYOB read buffer — ownership is transferred to/from the browser
+  // on each read call, eliminating browser-side allocation.
+  let readBuf: ArrayBuffer | null = byobReader ? new ArrayBuffer(BYOB_READ_BUFFER_SIZE) : null;
+
+  /**
+   * Read more data into the accumulation buffer.
+   * Returns false when the stream ends.
+   */
+  async function readMore(): Promise<boolean> {
+    if (byobReader) {
+      // BYOB: read into the separate recycled buffer, then copy to accum
+      const view = new Uint8Array(readBuf!, 0, readBuf!.byteLength);
+      const result = await byobReader.read(view);
+      if (result.done) return false;
+      // The browser transfers the buffer back — recycle it for next read
+      readBuf = result.value.buffer;
+      const bytesRead = result.value.byteLength;
+      if (filled + bytesRead > buf.byteLength) {
+        buf = growBuffer(buf, filled, filled + bytesRead);
+      }
+      buf.set(new Uint8Array(readBuf!, result.value.byteOffset, bytesRead), filled);
+      filled += bytesRead;
+    } else {
+      // Default reader: copy chunk into accum buffer
+      const { value, done } = await defaultReader!.read();
+      if (done || !value) return false;
+      if (filled + value.byteLength > buf.byteLength) {
+        buf = growBuffer(buf, filled, filled + value.byteLength);
+      }
+      buf.set(value, filled);
+      filled += value.byteLength;
+    }
+    return true;
+  }
 
   try {
     while (true) {
-      while (buffer.length < 4) {
-        const { value, done } = await reader.read();
-        if (done) return;
-        buffer = concat(buffer, value);
+      // Accumulate until we have the 4-byte length prefix
+      while (filled < 4) {
+        if (!(await readMore())) return;
       }
 
-      const length = new DataView(
-        buffer.buffer,
-        buffer.byteOffset
-      ).getUint32(0, false);
+      const length =
+        ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0;
+      const totalNeeded = 4 + length;
 
-      while (buffer.length < 4 + length) {
-        const { value, done } = await reader.read();
-        if (done) return;
-        buffer = concat(buffer, value);
+      // Pre-grow if the message exceeds current buffer capacity
+      if (totalNeeded > buf.byteLength) {
+        buf = growBuffer(buf, filled, totalNeeded);
       }
 
-      yield buffer.slice(4, 4 + length);
-      buffer = buffer.slice(4 + length);
+      // Accumulate until we have the complete message
+      while (filled < totalNeeded) {
+        if (!(await readMore())) return;
+      }
+
+      // Yield a copy (data escapes into ReceivedFrame.data)
+      yield buf.slice(4, totalNeeded);
+
+      // Compact remaining data to front of buffer
+      const remaining = filled - totalNeeded;
+      if (remaining > 0) {
+        buf.copyWithin(0, totalNeeded, filled);
+      }
+      filled = remaining;
     }
   } finally {
-    reader.releaseLock();
+    if (byobReader) byobReader.releaseLock();
+    if (defaultReader) defaultReader.releaseLock();
   }
 }
 
