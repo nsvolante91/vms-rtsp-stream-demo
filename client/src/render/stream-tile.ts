@@ -113,6 +113,11 @@ export class StreamTile {
   /** Cached canvas aspect ratio to detect canvas resizes */
   private lastCanvasAR = 0;
 
+  /** True after transferControlToOffscreen() — canvas dimensions are worker-owned */
+  private _transferred = false;
+  /** Callback invoked on resize when canvas is transferred (pixel dimensions) */
+  private _resizeCallback: ((width: number, height: number) => void) | null = null;
+
   constructor(readonly streamId: number) {
     this.log = new Logger(`Tile[${streamId}]`);
 
@@ -138,8 +143,15 @@ export class StreamTile {
         const w = entry.contentRect.width;
         const h = entry.contentRect.height;
         if (w > 0 && h > 0) {
-          this.canvas.width = Math.round(w * dpr);
-          this.canvas.height = Math.round(h * dpr);
+          const pw = Math.round(w * dpr);
+          const ph = Math.round(h * dpr);
+          if (this._transferred) {
+            // Canvas is owned by worker — notify via callback
+            this._resizeCallback?.(pw, ph);
+          } else {
+            this.canvas.width = pw;
+            this.canvas.height = ph;
+          }
         }
       }
     });
@@ -352,9 +364,44 @@ export class StreamTile {
     }
   }
 
+  /**
+   * Transfer the canvas to an OffscreenCanvas for worker-side rendering.
+   *
+   * After this call, the main thread can no longer write to canvas dimensions
+   * or get contexts. The ResizeObserver will fire the resize callback instead.
+   *
+   * @returns The OffscreenCanvas and its current pixel dimensions
+   */
+  transferCanvas(): { canvas: OffscreenCanvas; width: number; height: number } {
+    if (this._transferred) {
+      throw new Error(`Tile ${this.streamId}: canvas already transferred`);
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const rect = this.canvas.getBoundingClientRect();
+    const width = Math.round(rect.width * dpr) || 640;
+    const height = Math.round(rect.height * dpr) || 360;
+
+    // Set initial size before transfer
+    this.canvas.width = width;
+    this.canvas.height = height;
+
+    const offscreen = this.canvas.transferControlToOffscreen();
+    this._transferred = true;
+    this.log.info(`Canvas transferred (${width}x${height})`);
+    return { canvas: offscreen, width, height };
+  }
+
+  /**
+   * Register a callback for resize events when the canvas is worker-owned.
+   * The callback receives pixel dimensions (CSS size × devicePixelRatio).
+   */
+  onResize(callback: (width: number, height: number) => void): void {
+    this._resizeCallback = callback;
+  }
+
   /** Update the label overlay text. */
   updateLabel(resolution: string, fps: number): void {
-    const renderer = this.useWebGPU ? 'WebGPU' : 'Canvas2D';
+    const renderer = this._transferred ? 'WebGPU Worker' : this.useWebGPU ? 'WebGPU' : 'Canvas2D';
     this.label.textContent = `Stream ${this.streamId} | ${resolution} | ${fps} fps | ${renderer}`;
   }
 

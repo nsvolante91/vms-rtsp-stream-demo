@@ -1,5 +1,6 @@
 {
     "chat.tools.terminal.autoApprove": {
-        "ffprobe": true
+        "ffprobe": true,
+        "npx vite": true
     }
 }
