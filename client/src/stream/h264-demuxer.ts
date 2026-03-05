@@ -108,12 +108,22 @@ function removeEmulationPreventionBytes(data: Uint8Array): Uint8Array {
   return new Uint8Array(result);
 }
 
+/** A NAL unit reference: type + offset/length into the source buffer (zero-copy). */
+interface NALURef {
+  /** NAL unit type (lower 5 bits of first byte) */
+  type: number;
+  /** Byte offset of the NAL unit data within the source buffer (after start code) */
+  offset: number;
+  /** Length of the NAL unit data in bytes */
+  length: number;
+}
+
 /**
- * Find NAL units in an Annex B byte stream and return their raw data
- * (without start codes) along with their types.
+ * Find NAL units in an Annex B byte stream and return offset/length
+ * references into the source buffer (no per-NAL Uint8Array allocation).
  */
-function findNALUnits(data: Uint8Array): Array<{ type: number; data: Uint8Array }> {
-  const units: Array<{ type: number; data: Uint8Array }> = [];
+function findNALUnits(data: Uint8Array): NALURef[] {
+  const units: NALURef[] = [];
   const startPositions: { offset: number; len: number }[] = [];
 
   // Use 3-byte start codes only (0x000001). Never promote to 4-byte
@@ -131,9 +141,8 @@ function findNALUnits(data: Uint8Array): Array<{ type: number; data: Uint8Array 
     const start = startPositions[i].offset + startPositions[i].len;
     const end = i + 1 < startPositions.length ? startPositions[i + 1].offset : data.length;
     if (start < end) {
-      const naluData = data.subarray(start, end);
-      const type = naluData[0] & 0x1f;
-      units.push({ type, data: naluData });
+      const type = data[start] & 0x1f;
+      units.push({ type, offset: start, length: end - start });
     }
   }
 
@@ -233,7 +242,7 @@ function annexBToAvcc(annexB: Uint8Array): Uint8Array {
   // Calculate total size: 4 bytes length prefix + data for each NALU
   let totalSize = 0;
   for (const nalu of nalus) {
-    totalSize += 4 + nalu.data.length;
+    totalSize += 4 + nalu.length;
   }
 
   const result = new Uint8Array(totalSize);
@@ -241,10 +250,11 @@ function annexBToAvcc(annexB: Uint8Array): Uint8Array {
   let offset = 0;
 
   for (const nalu of nalus) {
-    view.setUint32(offset, nalu.data.length, false);
+    view.setUint32(offset, nalu.length, false);
     offset += 4;
-    result.set(nalu.data, offset);
-    offset += nalu.data.length;
+    // Copy NAL data from source buffer using offset/length ref
+    result.set(annexB.subarray(nalu.offset, nalu.offset + nalu.length), offset);
+    offset += nalu.length;
   }
 
   return result;
@@ -458,9 +468,9 @@ export class H264Demuxer {
 
     for (const nalu of nalus) {
       if (nalu.type === NAL_SPS) {
-        newSps = new Uint8Array(nalu.data);
+        newSps = data.slice(nalu.offset, nalu.offset + nalu.length);
       } else if (nalu.type === NAL_PPS) {
-        newPps = new Uint8Array(nalu.data);
+        newPps = data.slice(nalu.offset, nalu.offset + nalu.length);
       }
     }
 
@@ -577,7 +587,7 @@ export class H264Demuxer {
     if (type === 'key' && this._keyframeLogCount < 2) {
       this._keyframeLogCount++;
       const nalus = findNALUnits(frame.data);
-      this.log.info(`Keyframe input: ${frame.data.length} bytes, ${nalus.length} NALUs: [${nalus.map(n => `type=${n.type}:${n.data.length}b`).join(', ')}]`);
+      this.log.info(`Keyframe input: ${frame.data.length} bytes, ${nalus.length} NALUs: [${nalus.map(n => `type=${n.type}:${n.length}b`).join(', ')}]`);
       this.log.info(`AVCC output: ${data.length} bytes, first20=${Array.from(data.subarray(0, 20)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
     }
 
