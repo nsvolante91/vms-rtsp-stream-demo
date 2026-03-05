@@ -54,6 +54,15 @@ export class GPURenderer {
   private renderCount = 0;
   private canvas!: HTMLCanvasElement;
   private readonly log: Logger;
+  /** Cached bind group layout — avoids getBindGroupLayout(0) per frame */
+  private bindGroupLayout!: GPUBindGroupLayout;
+
+  /**
+   * Pre-allocated per-stream bind group descriptors.
+   * The entries array and descriptor object are created once per stream
+   * and mutated in place each frame, avoiding per-frame GC pressure.
+   */
+  private bindGroupDescriptors: Map<number, GPUBindGroupDescriptor> = new Map();
 
   /** Cached per-stream video aspect ratios to avoid rewriting buffers every frame */
   private lastVideoARs: Map<number, number> = new Map();
@@ -134,6 +143,9 @@ export class GPURenderer {
       magFilter: 'linear',
       minFilter: 'linear',
     });
+
+    // Cache bind group layout for reuse in pre-allocated descriptors
+    this.bindGroupLayout = this.pipeline.getBindGroupLayout(0);
 
     // Create texture manager for VideoFrame → GPUExternalTexture lifecycle
     this.textureManager = new TextureManager(this.device);
@@ -239,14 +251,25 @@ export class GPURenderer {
       }
 
       try {
-        const bindGroup = this.device.createBindGroup({
-          layout: this.pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: this.sampler },
-            { binding: 1, resource: entry.managed.texture },
-            { binding: 2, resource: { buffer: viewportBuffer } },
-          ],
-        });
+        // Mutate pre-allocated descriptor in place — only the external
+        // texture entry (binding 1) changes per frame.
+        let desc = this.bindGroupDescriptors.get(viewport.streamId);
+        if (!desc) {
+          desc = {
+            layout: this.bindGroupLayout,
+            entries: [
+              { binding: 0, resource: this.sampler },
+              { binding: 1, resource: entry.managed.texture },
+              { binding: 2, resource: { buffer: viewportBuffer } },
+            ],
+          };
+          this.bindGroupDescriptors.set(viewport.streamId, desc);
+        } else {
+          // Mutate only the texture entry (the only thing that changes per frame)
+          (desc.entries as GPUBindGroupEntry[])[1] = { binding: 1, resource: entry.managed.texture };
+        }
+
+        const bindGroup = this.device.createBindGroup(desc);
 
         renderPass.setBindGroup(0, bindGroup);
         renderPass.draw(4); // triangle strip quad
@@ -297,6 +320,7 @@ export class GPURenderer {
       if (!activeStreamIds.has(streamId)) {
         buffer.destroy();
         this.viewportBuffers.delete(streamId);
+        this.bindGroupDescriptors.delete(streamId);
       }
     }
 
