@@ -52,10 +52,13 @@ const pendingFrames = new Map<number, VideoFrame>();
 let rafScheduled = false;
 
 /** Batch-render all pending frames in a single rAF callback.
- *  Collects GPUCommandBuffers from all streams and submits once. */
+ *  Collects GPUCommandBuffers from all streams and submits once.
+ *  Frames are closed AFTER submit because GPUExternalTexture references
+ *  the VideoFrame data and becomes invalid if closed before submit. */
 function renderLoop(): void {
   rafScheduled = false;
   const cmdBuffers: GPUCommandBuffer[] = [];
+  const framesToClose: VideoFrame[] = [];
   for (const [streamId, frame] of pendingFrames) {
     const entry = streams.get(streamId);
     if (entry) {
@@ -63,14 +66,18 @@ function renderLoop(): void {
       if (cmdBuf) {
         cmdBuffers.push(cmdBuf);
       }
-    } else {
-      frame.close();
     }
+    // Always close the frame after encoding (whether it succeeded or not)
+    framesToClose.push(frame);
   }
   pendingFrames.clear();
   // Single batched GPU submit for all streams
   if (cmdBuffers.length > 0 && workerGPU) {
     workerGPU.device.queue.submit(cmdBuffers);
+  }
+  // Close all frames AFTER submit to keep GPUExternalTextures valid
+  for (const frame of framesToClose) {
+    try { frame.close(); } catch { /* already closed */ }
   }
 }
 

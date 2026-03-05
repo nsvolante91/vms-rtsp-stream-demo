@@ -180,15 +180,16 @@ export class OffscreenRenderer {
   /**
    * Encode a render pass for a decoded VideoFrame and return the command buffer.
    *
-   * Does NOT call device.queue.submit() — the caller is responsible for
-   * batching all command buffers and submitting them in a single call.
-   * CRITICAL: The frame is always closed after encoding.
+   * Does NOT call device.queue.submit() or frame.close() — the caller is
+   * responsible for batching command buffers, submitting them, and then
+   * closing all frames AFTER submit. This is required because
+   * GPUExternalTexture references the VideoFrame's underlying data and
+   * becomes invalid if the frame is closed before submit.
    *
    * @returns GPUCommandBuffer if encoding succeeded, null otherwise
    */
   encodeFrame(frame: VideoFrame): GPUCommandBuffer | null {
       if (!this.gpu || !this.gpuContext || !this.viewportBuffer) {
-        frame.close();
         return null;
       }
 
@@ -258,23 +259,21 @@ export class OffscreenRenderer {
       } catch (e) {
         this.log.warn('WebGPU render failed', e);
         return null;
-      } finally {
-        // ALWAYS close the frame after encoding to prevent GPU memory leaks
-        try { frame.close(); } catch { /* already closed */ }
       }
   }
 
   /**
-   * Draw a decoded VideoFrame and close it (single-stream convenience).
+   * Draw a decoded VideoFrame, submit immediately, and close it.
    *
-   * Encodes and immediately submits. For multi-stream batching,
-   * use encodeFrame() + device.queue.submit() instead.
+   * For multi-stream batching, use encodeFrame() + device.queue.submit()
+   * + frame.close() instead.
    */
   drawFrame(frame: VideoFrame): void {
     const cmdBuf = this.encodeFrame(frame);
     if (cmdBuf && this.gpu) {
       this.gpu.device.queue.submit([cmdBuf]);
     }
+    try { frame.close(); } catch { /* already closed */ }
   }
 
   /** Release GPU resources, returning pooled buffers */
