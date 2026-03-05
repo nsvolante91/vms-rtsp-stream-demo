@@ -455,7 +455,7 @@ export class WTReceiver {
     this.reconnectAttempt++;
 
     this.log.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
-    this.reconnectTimer = window.setTimeout(() => {
+    this.reconnectTimer = self.setTimeout(() => {
       this.reconnectTimer = null;
       // Reset cert hash to force re-fetch (cert may have been regenerated)
       this.certHash = null;

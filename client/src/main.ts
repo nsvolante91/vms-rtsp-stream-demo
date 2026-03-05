@@ -8,7 +8,6 @@
 
 import { Logger } from './utils/logger';
 import { WTReceiver } from './stream/wt-receiver';
-import { WSReceiver } from './stream/ws-receiver';
 import { StreamPipeline } from './stream/stream-pipeline';
 import type { StreamReceiver } from './stream/stream-pipeline';
 import { StreamTile, initSharedGPU, type SharedGPU } from './render/stream-tile';
@@ -38,9 +37,6 @@ const CERT_HASH_URL = `${API_URL}/cert-hash`;
 
 /** HTTP endpoint for available streams */
 const STREAMS_URL = `${API_URL}/streams`;
-
-/** WebSocket fallback URL (same HTTP server, /ws path) */
-const WS_URL = `ws://127.0.0.1:9000/ws`;
 
 /** Maximum number of streams to auto-add on startup */
 const AUTO_ADD_MAX = 1;
@@ -99,18 +95,11 @@ class VMSApp {
       return;
     }
 
-    // Connect transport: prefer WebTransport, fall back to WebSocket
-    if (typeof WebTransport !== 'undefined') {
-      log.info('WebTransport available — using QUIC transport');
-      const wt = new WTReceiver(WT_URL, CERT_HASH_URL);
-      await wt.connect();
-      this.receiver = wt;
-    } else {
-      log.warn('WebTransport unavailable — falling back to WebSocket transport');
-      const ws = new WSReceiver(WS_URL);
-      ws.connect();
-      this.receiver = ws;
-    }
+    // Connect WebTransport
+    log.info('Connecting WebTransport...');
+    const wt = new WTReceiver(WT_URL, CERT_HASH_URL);
+    await wt.connect();
+    this.receiver = wt;
 
     // Initialize shared WebGPU resources (shared device, pipeline, sampler)
     this.sharedGPU = await initSharedGPU();
