@@ -82,6 +82,12 @@ export class OffscreenRenderer {
   private gpuContext: GPUCanvasContext | null = null;
   private viewportBuffer: GPUBuffer | null = null;
   private gpu: WorkerGPU | null = null;
+  /** Cached bind group layout — avoids getBindGroupLayout(0) per frame */
+  private bindGroupLayout: GPUBindGroupLayout | null = null;
+  /** Pre-allocated bind group descriptor — mutated in place each frame */
+  private bindGroupDesc: GPUBindGroupDescriptor | null = null;
+  /** Pre-allocated Float32Array for viewport uniform writes */
+  private readonly uniformData = new Float32Array(4);
 
   /** Cached aspect ratios to avoid rewriting the uniform buffer every frame */
   private lastVideoAR = 0;
@@ -153,75 +159,84 @@ export class OffscreenRenderer {
    * CRITICAL: The frame is always closed after drawing.
    */
   drawFrame(frame: VideoFrame): void {
-    if (!this.gpu || !this.gpuContext || !this.viewportBuffer) {
-      frame.close();
-      return;
-    }
-
-    const { device, pipeline, sampler } = this.gpu;
-
-    try {
-      // Update viewport uniform for aspect-ratio-correct rendering
-      const videoAR = frame.displayWidth / frame.displayHeight;
-      const canvasAR = this.canvas.width / this.canvas.height;
-
-      if (videoAR !== this.lastVideoAR || canvasAR !== this.lastCanvasAR) {
-        let scaleX = 1.0;
-        let scaleY = 1.0;
-
-        if (videoAR > canvasAR) {
-          // Video is wider than canvas → black bars top/bottom
-          scaleY = canvasAR / videoAR;
-        } else {
-          // Video is taller than canvas → black bars left/right
-          scaleX = videoAR / canvasAR;
-        }
-
-        device.queue.writeBuffer(
-          this.viewportBuffer,
-          0,
-          new Float32Array([0.0, 0.0, scaleX, scaleY])
-        );
-        this.lastVideoAR = videoAR;
-        this.lastCanvasAR = canvasAR;
+      if (!this.gpu || !this.gpuContext || !this.viewportBuffer || !this.bindGroupLayout) {
+        frame.close();
+        return;
       }
 
-      // Import the VideoFrame as a GPU external texture (zero-copy)
-      const externalTexture = device.importExternalTexture({ source: frame });
+      const { device, pipeline, sampler } = this.gpu;
 
-      const bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: sampler },
-          { binding: 1, resource: externalTexture },
-          { binding: 2, resource: { buffer: this.viewportBuffer } },
-        ],
-      });
+      try {
+        // Update viewport uniform for aspect-ratio-correct rendering
+        const videoAR = frame.displayWidth / frame.displayHeight;
+        const canvasAR = this.canvas.width / this.canvas.height;
 
-      const commandEncoder = device.createCommandEncoder();
-      const textureView = this.gpuContext.getCurrentTexture().createView();
+        if (videoAR !== this.lastVideoAR || canvasAR !== this.lastCanvasAR) {
+          let scaleX = 1.0;
+          let scaleY = 1.0;
 
-      const renderPass = commandEncoder.beginRenderPass({
-        colorAttachments: [{
-          view: textureView,
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: 'clear',
-          storeOp: 'store',
-        }],
-      });
+          if (videoAR > canvasAR) {
+            scaleY = canvasAR / videoAR;
+          } else {
+            scaleX = videoAR / canvasAR;
+          }
 
-      renderPass.setPipeline(pipeline);
-      renderPass.setBindGroup(0, bindGroup);
-      renderPass.draw(4);
-      renderPass.end();
+          this.uniformData[0] = 0.0;
+          this.uniformData[1] = 0.0;
+          this.uniformData[2] = scaleX;
+          this.uniformData[3] = scaleY;
+          device.queue.writeBuffer(this.viewportBuffer, 0, this.uniformData);
+          this.lastVideoAR = videoAR;
+          this.lastCanvasAR = canvasAR;
+        }
 
-      device.queue.submit([commandEncoder.finish()]);
-    } catch (e) {
-      this.log.warn('WebGPU render failed', e);
-    } finally {
-      // ALWAYS close the frame to prevent GPU memory leaks
-      frame.close();
-    }
+        // Import the VideoFrame as a GPU external texture (zero-copy)
+        const externalTexture = device.importExternalTexture({ source: frame });
+
+        // Close frame immediately after import — GPUExternalTexture holds
+        // its own reference to the video data per spec
+        frame.close();
+
+        // Reuse pre-allocated bind group descriptor, mutating only the texture entry
+        if (!this.bindGroupDesc) {
+          this.bindGroupDesc = {
+            layout: this.bindGroupLayout,
+            entries: [
+              { binding: 0, resource: sampler },
+              { binding: 1, resource: externalTexture },
+              { binding: 2, resource: { buffer: this.viewportBuffer } },
+            ],
+          };
+        } else {
+          (this.bindGroupDesc.entries as GPUBindGroupEntry[])[1] = { binding: 1, resource: externalTexture };
+        }
+
+        const bindGroup = device.createBindGroup(this.bindGroupDesc);
+
+        const commandEncoder = device.createCommandEncoder();
+        const textureView = this.gpuContext.getCurrentTexture().createView();
+
+        const renderPass = commandEncoder.beginRenderPass({
+          colorAttachments: [{
+            view: textureView,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: 'clear',
+            storeOp: 'store',
+          }],
+        });
+
+        renderPass.setPipeline(pipeline);
+        renderPass.setBindGroup(0, bindGroup);
+        renderPass.draw(4);
+        renderPass.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+      } catch (e) {
+        this.log.warn('WebGPU render failed', e);
+        // Frame may already be closed after importExternalTexture;
+        // close only if still open (no-op if already closed)
+        try { frame.close(); } catch { /* already closed */ }
+      }
   }
 
   /** Release GPU resources */

@@ -165,8 +165,10 @@ async function* readLengthPrefixed(
         if (!(await readMore())) return;
       }
 
-      // Yield a copy (data escapes into ReceivedFrame.data)
-      yield buf.slice(4, totalNeeded);
+      // Yield a zero-copy view — safe because parseBinaryFrame consumes it
+      // synchronously via the pooled frame, and downstream EncodedVideoChunk
+      // constructor copies the data internally.
+      yield buf.subarray(4, totalNeeded);
 
       // Compact remaining data to front of buffer
       const remaining = filled - totalNeeded;
@@ -511,10 +513,13 @@ export class WTReceiver {
    *
    * @param readable - Readable side of the control bidirectional stream
    */
+  /** Cached TextDecoder — avoids per-message allocation */
+  private static readonly _textDecoder = new TextDecoder();
+
   private async readControlMessages(readable: ReadableStream<Uint8Array>): Promise<void> {
     for await (const msgBytes of readLengthPrefixed(readable)) {
       try {
-        const text = new TextDecoder().decode(msgBytes);
+        const text = WTReceiver._textDecoder.decode(msgBytes);
         const msg = JSON.parse(text);
         this.log.info(`Control message: ${msg.type}`);
       } catch {
@@ -538,10 +543,13 @@ export class WTReceiver {
    *
    * @param message - JSON-serializable message
    */
+  /** Cached TextEncoder — avoids per-message allocation */
+  private static readonly _textEncoder = new TextEncoder();
+
   private async sendControlMessage(message: unknown): Promise<void> {
     if (!this.controlWriter) return;
 
-    const bytes = new TextEncoder().encode(JSON.stringify(message));
+    const bytes = WTReceiver._textEncoder.encode(JSON.stringify(message));
     await writeLengthPrefixed(this.controlWriter, bytes);
   }
 

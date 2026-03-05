@@ -212,10 +212,7 @@ export class VideoStreamDecoder {
         return;
       }
       this._waitingForKeyframe = false;
-      // Log detailed keyframe info for debugging
-      const chunkBuf = new Uint8Array(chunk.byteLength);
-      chunk.copyTo(chunkBuf);
-      this.log.info(`First keyframe: ${chunk.byteLength} bytes, ts=${chunk.timestamp}, first16=${Array.from(chunkBuf.subarray(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+      this.log.info(`First keyframe: ${chunk.byteLength} bytes, ts=${chunk.timestamp}`);
     }
 
     // Backpressure: drop non-keyframes when queue is congested

@@ -88,7 +88,9 @@ class BitReader {
  * detection. The 0x03 byte must be removed before parsing NAL content.
  */
 function removeEmulationPreventionBytes(data: Uint8Array): Uint8Array {
-  const result: number[] = [];
+  // Write directly to a pre-sized Uint8Array (output ≤ input length)
+  const result = new Uint8Array(data.length);
+  let j = 0;
   let i = 0;
   while (i < data.length) {
     if (
@@ -97,15 +99,15 @@ function removeEmulationPreventionBytes(data: Uint8Array): Uint8Array {
       data[i + 1] === 0x00 &&
       data[i + 2] === 0x03
     ) {
-      result.push(0x00);
-      result.push(0x00);
+      result[j++] = 0x00;
+      result[j++] = 0x00;
       i += 3;
     } else {
-      result.push(data[i]);
+      result[j++] = data[i];
       i++;
     }
   }
-  return new Uint8Array(result);
+  return result.subarray(0, j);
 }
 
 /** A NAL unit reference: type + offset/length into the source buffer (zero-copy). */
@@ -235,6 +237,10 @@ function buildAvcC(
  * @param annexB - H.264 data with Annex B start codes
  * @returns H.264 data with 4-byte length-prefixed NALUs (AVCC format)
  */
+/** Reusable output buffer for AVCC conversion — grows as needed, never shrinks */
+let _avccBuf = new Uint8Array(256 * 1024);
+let _avccView = new DataView(_avccBuf.buffer);
+
 function annexBToAvcc(annexB: Uint8Array): Uint8Array {
   const nalus = findNALUnits(annexB);
   if (nalus.length === 0) return annexB;
@@ -245,19 +251,22 @@ function annexBToAvcc(annexB: Uint8Array): Uint8Array {
     totalSize += 4 + nalu.length;
   }
 
-  const result = new Uint8Array(totalSize);
-  const view = new DataView(result.buffer);
-  let offset = 0;
+  // Grow reusable buffer if needed
+  if (totalSize > _avccBuf.byteLength) {
+    _avccBuf = new Uint8Array(Math.max(totalSize, _avccBuf.byteLength * 2));
+    _avccView = new DataView(_avccBuf.buffer);
+  }
 
+  let offset = 0;
   for (const nalu of nalus) {
-    view.setUint32(offset, nalu.length, false);
+    _avccView.setUint32(offset, nalu.length, false);
     offset += 4;
-    // Copy NAL data from source buffer using offset/length ref
-    result.set(annexB.subarray(nalu.offset, nalu.offset + nalu.length), offset);
+    _avccBuf.set(annexB.subarray(nalu.offset, nalu.offset + nalu.length), offset);
     offset += nalu.length;
   }
 
-  return result;
+  // Return a copy — EncodedVideoChunk takes ownership
+  return _avccBuf.slice(0, totalSize);
 }
 
 /**

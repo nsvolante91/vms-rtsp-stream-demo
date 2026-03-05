@@ -107,6 +107,21 @@ export class MetricsCollector {
   }
 
   /**
+   * Record multiple decoded frames at once (batch variant of recordFrame).
+   * @param streamId - Stream that produced the frames
+   * @param count - Number of frames to record
+   */
+  recordFrames(streamId: number, count: number): void {
+    if (count <= 0) return;
+    const data = this.getStream(streamId);
+    const now = performance.now();
+    for (let i = 0; i < count; i++) {
+      data.frameTimes.push(now);
+    }
+    data.decodedFrames += count;
+  }
+
+  /**
    * Record a dropped frame for a stream.
    * @param streamId - Stream that dropped the frame
    */
@@ -305,5 +320,13 @@ export class MetricsCollector {
   reset(): void {
     this.streamData.clear();
     this.globalData = { renderTimes: [], longestFrameMs: 0 };
+  }
+
+  /**
+   * Get sorted list of tracked stream IDs.
+   * @returns Array of stream identifiers
+   */
+  getStreamIds(): number[] {
+    return Array.from(this.streamData.keys()).sort((a, b) => a - b);
   }
 }

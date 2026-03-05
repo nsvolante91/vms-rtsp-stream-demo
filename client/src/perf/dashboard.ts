@@ -142,14 +142,6 @@ export class Dashboard {
    * Reads from the metrics collector by checking known stream ranges.
    */
   private getStreamIds(): number[] {
-    // The metrics collector stores stream data internally.
-    // We use exportJSON to discover active stream IDs.
-    const json = this.metrics.exportJSON();
-    try {
-      const data = JSON.parse(json) as { streams: Array<{ streamId: number }> };
-      return data.streams.map(s => s.streamId).sort((a, b) => a - b);
-    } catch {
-      return [];
-    }
+    return this.metrics.getStreamIds();
   }
 }

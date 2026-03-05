@@ -214,9 +214,7 @@ class VMSApp {
           // Sync decoded/dropped frame counts
           const data = this.metrics.getStreamMetrics(update.streamId);
           const newFrames = update.decodedFrames - data.decodedFrames;
-          for (let i = 0; i < newFrames; i++) {
-            this.metrics.recordFrame(update.streamId);
-          }
+          this.metrics.recordFrames(update.streamId, newFrames);
         }
         break;
     }

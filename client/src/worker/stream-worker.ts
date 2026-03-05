@@ -40,6 +40,50 @@ interface StreamEntry {
 const streams = new Map<number, StreamEntry>();
 let metricsTimer: ReturnType<typeof setInterval> | null = null;
 
+// ─── rAF-Gated Rendering ───────────────────────────────────────
+
+/**
+ * Latest decoded frame per stream, awaiting the next rAF tick.
+ * When a new frame arrives before rAF fires, the previous frame is
+ * closed immediately (it was never displayed) to prevent GPU memory
+ * buildup. This guarantees at most 1 GPU submit per stream per vsync.
+ */
+const pendingFrames = new Map<number, VideoFrame>();
+let rafScheduled = false;
+
+/** Batch-render all pending frames in a single rAF callback */
+function renderLoop(): void {
+  rafScheduled = false;
+  for (const [streamId, frame] of pendingFrames) {
+    const entry = streams.get(streamId);
+    if (entry) {
+      entry.renderer.drawFrame(frame);
+    } else {
+      frame.close();
+    }
+  }
+  pendingFrames.clear();
+}
+
+/** Schedule a rAF tick if not already scheduled */
+function scheduleRender(): void {
+  if (!rafScheduled) {
+    rafScheduled = true;
+    requestAnimationFrame(renderLoop);
+  }
+}
+
+/** Queue a decoded frame for rendering on the next rAF tick */
+function queueFrame(streamId: number, frame: VideoFrame): void {
+  // Close previous un-rendered frame (superseded by this newer one)
+  const prev = pendingFrames.get(streamId);
+  if (prev) {
+    prev.close();
+  }
+  pendingFrames.set(streamId, frame);
+  scheduleRender();
+}
+
 // ─── Helpers ───────────────────────────────────────────────────
 
 /** Post a typed message to the main thread */
@@ -143,11 +187,11 @@ function handleAddStream(
     return;
   }
 
-  // Create pipeline — decoded frames go straight to the renderer
+  // Create pipeline — decoded frames are queued for rAF-gated rendering
   const pipeline = new StreamPipeline(
     streamId,
     receiver,
-    (frame: VideoFrame) => renderer.drawFrame(frame),
+    (frame: VideoFrame) => queueFrame(streamId, frame),
     (_sid, error) => {
       log.error(`Stream ${streamId} decode error: ${error.message}`);
       postMsg({ type: 'error', streamId, message: error.message });
@@ -167,6 +211,12 @@ function handleRemoveStream(streamId: number): void {
   entry.renderer.destroy();
   streams.delete(streamId);
   lastDecodedFrames.delete(streamId);
+  // Close any pending frame for this stream
+  const pending = pendingFrames.get(streamId);
+  if (pending) {
+    pending.close();
+    pendingFrames.delete(streamId);
+  }
   log.info(`Stream ${streamId} removed`);
 }
 
@@ -180,7 +230,11 @@ function handleResize(streamId: number, width: number, height: number): void {
 function handleShutdown(): void {
   log.info('Shutting down worker...');
   stopMetricsReporter();
-
+  // Close all pending frames
+  for (const frame of pendingFrames.values()) {
+    frame.close();
+  }
+  pendingFrames.clear();
   for (const [streamId, entry] of streams) {
     entry.pipeline.stop();
     entry.renderer.destroy();

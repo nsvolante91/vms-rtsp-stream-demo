@@ -36,6 +36,13 @@ const FLAG_KEYFRAME = 0x01;
 /** Flag bit indicating the payload contains SPS/PPS configuration */
 const FLAG_CONFIG = 0x02;
 
+/** Annex B 4-byte start code — shared constant to avoid per-NALU allocation */
+const START_CODE = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+
+/** Cached TextEncoder/TextDecoder for control messages */
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 /** Public information about a managed stream */
 export interface StreamInfo {
   /** Unique stream identifier */
@@ -54,8 +61,8 @@ export interface StreamInfo {
 
 /** A pending access unit being accumulated from VCL NAL units */
 interface PendingAccessUnit {
-  /** Concatenated NAL unit data with Annex B start codes */
-  payload: Buffer;
+  /** Buffer list — concatenated once at flush (avoids O(N²) interim concat) */
+  payloads: (Buffer | Uint8Array)[];
   /** Timestamp for this access unit */
   timestamp: bigint;
   /** Whether this AU contains a keyframe (IDR) */
@@ -161,12 +168,13 @@ function buildFrame(
   flags: number,
   payload: Uint8Array
 ): Buffer {
-  const header = Buffer.alloc(12);
-  header.writeUInt8(PROTOCOL_VERSION, 0);
-  header.writeUInt16BE(streamId, 1);
-  header.writeBigUInt64BE(timestamp, 3);
-  header.writeUInt8(flags, 11);
-  return Buffer.concat([header, payload]);
+  const frame = Buffer.allocUnsafe(12 + payload.length);
+  frame[0] = PROTOCOL_VERSION;
+  frame.writeUInt16BE(streamId, 1);
+  frame.writeBigUInt64BE(timestamp, 3);
+  frame[11] = flags;
+  frame.set(payload, 12);
+  return frame;
 }
 
 let nextClientId = 1;
@@ -482,7 +490,7 @@ export class StreamManager {
       if (!client.connected) break;
 
       try {
-        const text = new TextDecoder().decode(msgBytes);
+        const text = textDecoder.decode(msgBytes);
         const parsed = JSON.parse(text) as ClientMessage;
 
         if (parsed.type === 'subscribe') {
@@ -513,7 +521,7 @@ export class StreamManager {
     try {
       if (client.type === 'webtransport') {
         if (!client.controlWriter) return;
-        const bytes = new TextEncoder().encode(JSON.stringify(message));
+        const bytes = textEncoder.encode(JSON.stringify(message));
         await writeLengthPrefixed(client.controlWriter, bytes);
       } else {
         if (client.ws.readyState === 1 /* OPEN */) {
@@ -631,13 +639,11 @@ export class StreamManager {
     // Combining them into one Annex B frame with start codes causes re-parsing
     // ambiguity: the client's 3-byte start code scanner would absorb a trailing
     // zero from the SPS into the next start code boundary.
-    const startCode = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
-
-    const spsPayload = Buffer.concat([startCode, managed.spsNALU]);
+    const spsPayload = Buffer.concat([START_CODE, managed.spsNALU]);
     const spsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, spsPayload);
     sub.send(spsFrame);
 
-    const ppsPayload = Buffer.concat([startCode, managed.ppsNALU]);
+    const ppsPayload = Buffer.concat([START_CODE, managed.ppsNALU]);
     const ppsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, ppsPayload);
     sub.send(ppsFrame);
   }
@@ -730,8 +736,7 @@ export class StreamManager {
     if (isConfigNAL(event.type)) {
       if (managed.subscribers.size === 0) return;
 
-      const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-      const payload = Buffer.concat([startCode, event.nalUnit]);
+      const payload = Buffer.concat([START_CODE, event.nalUnit]);
       const frame = buildFrame(managed.id, event.timestamp, FLAG_CONFIG, payload);
       this.sendToSubscribers(managed, frame, false);
       return;
@@ -739,21 +744,15 @@ export class StreamManager {
 
     if (!isVCLNAL(event.type)) return;
 
-    const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-    const naluBuf = Buffer.concat([startCode, event.nalUnit]);
-
     if (isFirstSliceInPicture(event.nalUnit)) {
       this.flushAccessUnit(managed);
       managed.pendingAU = {
-        payload: naluBuf,
+        payloads: [START_CODE, event.nalUnit],
         timestamp: event.timestamp,
         isKeyframe: event.isKeyframe,
       };
     } else if (managed.pendingAU) {
-      managed.pendingAU.payload = Buffer.concat([
-        managed.pendingAU.payload,
-        naluBuf,
-      ]);
+      managed.pendingAU.payloads.push(START_CODE, event.nalUnit);
       if (event.isKeyframe) {
         managed.pendingAU.isKeyframe = true;
       }
@@ -776,7 +775,8 @@ export class StreamManager {
       flags |= FLAG_KEYFRAME;
     }
 
-    const frame = buildFrame(managed.id, au.timestamp, flags, au.payload);
+    const payload = Buffer.concat(au.payloads);
+    const frame = buildFrame(managed.id, au.timestamp, flags, payload);
     this.sendToSubscribers(managed, frame, au.isKeyframe);
   }
 

@@ -136,7 +136,8 @@ class BitReader {
  * @returns Data with emulation prevention bytes removed
  */
 function removeEmulationPreventionBytes(data: Uint8Array): Uint8Array {
-  const result: number[] = [];
+  const out = new Uint8Array(data.length);
+  let j = 0;
   let i = 0;
   while (i < data.length) {
     if (
@@ -145,15 +146,14 @@ function removeEmulationPreventionBytes(data: Uint8Array): Uint8Array {
       data[i + 1] === 0x00 &&
       data[i + 2] === 0x03
     ) {
-      result.push(0x00);
-      result.push(0x00);
-      i += 3; // skip the emulation prevention byte (0x03)
+      out[j++] = 0x00;
+      out[j++] = 0x00;
+      i += 3;
     } else {
-      result.push(data[i]);
-      i++;
+      out[j++] = data[i++];
     }
   }
-  return new Uint8Array(result);
+  return out.subarray(0, j);
 }
 
 /**
