@@ -90,15 +90,11 @@ interface WTClient {
   /** Writer for the control bidirectional stream */
   controlWriter: WritableStreamDefaultWriter<Uint8Array> | null;
   /**
-   * Single shared writer for all video data (one unidirectional QUIC stream).
-   *
-   * We use a single uni stream instead of one-per-subscription because
-   * Chrome's QUIC `initial_max_streams_uni` transport parameter is ~16,
-   * and 3 are consumed by HTTP/3 internals (control, QPACK encoder/decoder),
-   * leaving only ~13 for application use. The binary protocol already
-   * carries streamId in each frame header so the client can demux.
+   * Per-stream video writers. Each subscribed streamId gets its own
+   * QUIC unidirectional stream to eliminate head-of-line blocking
+   * between different video feeds.
    */
-  videoWriter: WritableStreamDefaultWriter<Uint8Array> | null;
+  videoWriters: Map<number, WritableStreamDefaultWriter<Uint8Array>>;
   /** Set of subscribed stream IDs */
   subscribedStreams: Set<number>;
   /** Whether the client is still connected */
@@ -282,18 +278,17 @@ export class StreamManager {
       const client = this.clients.get(clientId);
       if (client) {
         client.subscribedStreams.delete(id);
-        // For WT: close the shared video stream when no subscriptions remain
-        if (
-          client.type === 'webtransport' &&
-          client.subscribedStreams.size === 0 &&
-          client.videoWriter
-        ) {
-          try {
-            client.videoWriter.close().catch(() => {});
-          } catch {
-            // Already closed
+        // For WT: close the per-stream video writer
+        if (client.type === 'webtransport') {
+          const writer = client.videoWriters.get(id);
+          if (writer) {
+            try {
+              writer.close().catch(() => {});
+            } catch {
+              // Already closed
+            }
+            client.videoWriters.delete(id);
           }
-          client.videoWriter = null;
         }
       }
     }
@@ -320,7 +315,7 @@ export class StreamManager {
       id: clientId,
       session,
       controlWriter: null,
-      videoWriter: null,
+      videoWriters: new Map(),
       subscribedStreams: new Set(),
       connected: true,
     };
@@ -563,14 +558,14 @@ export class StreamManager {
       let subscription: VideoSubscription;
 
       if (client.type === 'webtransport') {
-        // Create the shared video uni stream on first subscription
-        if (!client.videoWriter) {
-          const sendStream = await client.session.createUnidirectionalStream();
-          client.videoWriter = sendStream.getWriter();
-          console.log(`[WT] Client ${client.id} video stream opened`);
-        }
+        // Create a dedicated QUIC unidirectional stream for this subscription.
+        // Each stream gets independent flow control, eliminating head-of-line
+        // blocking between different video feeds.
+        const sendStream = await client.session.createUnidirectionalStream();
+        const writer = sendStream.getWriter();
+        client.videoWriters.set(streamId, writer);
+        console.log(`[WT] Client ${client.id} video stream opened for stream ${streamId}`);
 
-        const writer = client.videoWriter!;
         subscription = {
           clientId: client.id,
           send: (frame: Buffer) => {
@@ -667,18 +662,17 @@ export class StreamManager {
 
     client.subscribedStreams.delete(streamId);
 
-    // For WT: close the shared video stream when no subscriptions remain
-    if (
-      client.type === 'webtransport' &&
-      client.subscribedStreams.size === 0 &&
-      client.videoWriter
-    ) {
-      try {
-        client.videoWriter.close().catch(() => {});
-      } catch {
-        // Already closed
+    // For WT: close the per-stream video writer
+    if (client.type === 'webtransport') {
+      const writer = client.videoWriters.get(streamId);
+      if (writer) {
+        try {
+          writer.close().catch(() => {});
+        } catch {
+          // Already closed
+        }
+        client.videoWriters.delete(streamId);
       }
-      client.videoWriter = null;
     }
   }
 
@@ -702,14 +696,15 @@ export class StreamManager {
     client.subscribedStreams.clear();
 
     if (client.type === 'webtransport') {
-      if (client.videoWriter) {
+      // Close all per-stream video writers
+      for (const writer of client.videoWriters.values()) {
         try {
-          client.videoWriter.close().catch(() => {});
+          writer.close().catch(() => {});
         } catch {
           // Already closed
         }
-        client.videoWriter = null;
       }
+      client.videoWriters.clear();
 
       if (client.controlWriter) {
         try {

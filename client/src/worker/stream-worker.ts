@@ -51,18 +51,27 @@ let metricsTimer: ReturnType<typeof setInterval> | null = null;
 const pendingFrames = new Map<number, VideoFrame>();
 let rafScheduled = false;
 
-/** Batch-render all pending frames in a single rAF callback */
+/** Batch-render all pending frames in a single rAF callback.
+ *  Collects GPUCommandBuffers from all streams and submits once. */
 function renderLoop(): void {
   rafScheduled = false;
+  const cmdBuffers: GPUCommandBuffer[] = [];
   for (const [streamId, frame] of pendingFrames) {
     const entry = streams.get(streamId);
     if (entry) {
-      entry.renderer.drawFrame(frame);
+      const cmdBuf = entry.renderer.encodeFrame(frame);
+      if (cmdBuf) {
+        cmdBuffers.push(cmdBuf);
+      }
     } else {
       frame.close();
     }
   }
   pendingFrames.clear();
+  // Single batched GPU submit for all streams
+  if (cmdBuffers.length > 0 && workerGPU) {
+    workerGPU.device.queue.submit(cmdBuffers);
+  }
 }
 
 /** Schedule a rAF tick if not already scheduled */
@@ -90,6 +99,56 @@ function queueFrame(streamId: number, frame: VideoFrame): void {
 function postMsg(msg: import('./messages').WorkerToMainMessage): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- worker global self.postMessage
   (self as any).postMessage(msg);
+}
+
+// ─── GPU Device Loss Recovery ──────────────────────────────────
+
+/** Whether a GPU recovery is currently in progress */
+let gpuRecoveryInProgress = false;
+
+/**
+ * Attempt to recover from GPU device loss.
+ *
+ * Requests a new adapter/device, re-creates pipeline/sampler/buffers,
+ * and re-configures all active renderer canvas contexts.
+ */
+async function handleDeviceLost(info: GPUDeviceLostInfo): Promise<void> {
+  if (gpuRecoveryInProgress) return;
+  if (info.reason === 'destroyed') {
+    // Intentional destroy (e.g., shutdown) — don't recover
+    return;
+  }
+
+  gpuRecoveryInProgress = true;
+  log.warn(`GPU device lost (reason: ${info.reason}), attempting recovery...`);
+
+  try {
+    const newGPU = await initWorkerGPU(handleDeviceLost);
+    if (!newGPU) {
+      log.error('GPU recovery failed: could not re-initialize WebGPU');
+      postMsg({ type: 'error', message: 'GPU device lost and recovery failed' });
+      return;
+    }
+
+    workerGPU = newGPU;
+
+    // Re-initialize all active renderers with the new GPU resources
+    let recovered = 0;
+    for (const [streamId, entry] of streams) {
+      if (entry.renderer.reinitGPU(newGPU)) {
+        recovered++;
+      } else {
+        log.warn(`Failed to recover renderer for stream ${streamId}`);
+      }
+    }
+
+    log.info(`GPU recovered: ${recovered}/${streams.size} renderers restored`);
+  } catch (e) {
+    log.error('GPU recovery failed', e);
+    postMsg({ type: 'error', message: 'GPU device lost and recovery failed' });
+  } finally {
+    gpuRecoveryInProgress = false;
+  }
 }
 
 /** Last decoded frame counts for FPS delta calculation */
@@ -133,7 +192,7 @@ async function handleInit(wtUrl: string, certHashUrl: string): Promise<void> {
   log.info('Initializing worker pipeline...');
 
   // 1. WebGPU
-  workerGPU = await initWorkerGPU();
+  workerGPU = await initWorkerGPU(handleDeviceLost);
   if (workerGPU) {
     log.info('WorkerGPU initialized');
   } else {

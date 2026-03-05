@@ -17,14 +17,23 @@ export interface WorkerGPU {
   format: GPUTextureFormat;
   pipeline: GPURenderPipeline;
   sampler: GPUSampler;
+  bindGroupLayout: GPUBindGroupLayout;
+  /** Pool of reusable viewport uniform buffers (16 bytes each) */
+  viewportBufferPool: GPUBuffer[];
 }
+
+/** Maximum number of pre-allocated viewport uniform buffers */
+const MAX_POOLED_BUFFERS = 32;
 
 /**
  * Initialize shared WebGPU resources in the worker context.
  *
+ * @param onDeviceLost - Optional callback invoked when the GPU device is lost
  * @returns WorkerGPU resources, or null if WebGPU is unavailable
  */
-export async function initWorkerGPU(): Promise<WorkerGPU | null> {
+export async function initWorkerGPU(
+  onDeviceLost?: (info: GPUDeviceLostInfo) => void
+): Promise<WorkerGPU | null> {
   if (typeof navigator === 'undefined' || !navigator.gpu) {
     return null;
   }
@@ -65,9 +74,25 @@ export async function initWorkerGPU(): Promise<WorkerGPU | null> {
 
   device.lost.then((info) => {
     console.error(`[WorkerGPU] Device lost: ${info.reason}`, info.message);
+    if (onDeviceLost) {
+      onDeviceLost(info);
+    }
   });
 
-  return { device, format, pipeline, sampler };
+  const bindGroupLayout = pipeline.getBindGroupLayout(0);
+
+  // Pre-allocate viewport uniform buffer pool
+  const viewportBufferPool: GPUBuffer[] = [];
+  for (let i = 0; i < MAX_POOLED_BUFFERS; i++) {
+    const buf = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(buf, 0, new Float32Array([0.0, 0.0, 1.0, 1.0]));
+    viewportBufferPool.push(buf);
+  }
+
+  return { device, format, pipeline, sampler, bindGroupLayout, viewportBufferPool };
 }
 
 /**
@@ -82,8 +107,6 @@ export class OffscreenRenderer {
   private gpuContext: GPUCanvasContext | null = null;
   private viewportBuffer: GPUBuffer | null = null;
   private gpu: WorkerGPU | null = null;
-  /** Cached bind group layout — avoids getBindGroupLayout(0) per frame */
-  private bindGroupLayout: GPUBindGroupLayout | null = null;
   /** Pre-allocated bind group descriptor — mutated in place each frame */
   private bindGroupDesc: GPUBindGroupDescriptor | null = null;
   /** Pre-allocated Float32Array for viewport uniform writes */
@@ -121,10 +144,12 @@ export class OffscreenRenderer {
         alphaMode: 'opaque',
       });
 
-      const viewportBuffer = workerGPU.device.createBuffer({
-        size: 16, // 2x vec2<f32>
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
+      // Acquire viewport buffer from pool, or create a new one if pool is empty
+      const viewportBuffer = workerGPU.viewportBufferPool.pop()
+        ?? workerGPU.device.createBuffer({
+          size: 16,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
       workerGPU.device.queue.writeBuffer(
         viewportBuffer,
         0,
@@ -134,7 +159,6 @@ export class OffscreenRenderer {
       this.gpu = workerGPU;
       this.gpuContext = gpuContext;
       this.viewportBuffer = viewportBuffer;
-      this.bindGroupLayout = workerGPU.pipeline.getBindGroupLayout(0);
       return true;
     } catch (e) {
       this.log.warn('WebGPU init failed on OffscreenCanvas', e);
@@ -154,18 +178,21 @@ export class OffscreenRenderer {
   }
 
   /**
-   * Draw a decoded VideoFrame and close it.
+   * Encode a render pass for a decoded VideoFrame and return the command buffer.
    *
-   * Uses importExternalTexture for zero-copy GPU rendering.
-   * CRITICAL: The frame is always closed after drawing.
+   * Does NOT call device.queue.submit() — the caller is responsible for
+   * batching all command buffers and submitting them in a single call.
+   * CRITICAL: The frame is always closed after encoding.
+   *
+   * @returns GPUCommandBuffer if encoding succeeded, null otherwise
    */
-  drawFrame(frame: VideoFrame): void {
-      if (!this.gpu || !this.gpuContext || !this.viewportBuffer || !this.bindGroupLayout) {
+  encodeFrame(frame: VideoFrame): GPUCommandBuffer | null {
+      if (!this.gpu || !this.gpuContext || !this.viewportBuffer) {
         frame.close();
-        return;
+        return null;
       }
 
-      const { device, pipeline, sampler } = this.gpu;
+      const { device, pipeline, sampler, bindGroupLayout } = this.gpu;
 
       try {
         // Update viewport uniform for aspect-ratio-correct rendering
@@ -197,7 +224,7 @@ export class OffscreenRenderer {
         // Reuse pre-allocated bind group descriptor, mutating only the texture entry
         if (!this.bindGroupDesc) {
           this.bindGroupDesc = {
-            layout: this.bindGroupLayout,
+            layout: bindGroupLayout,
             entries: [
               { binding: 0, resource: sampler },
               { binding: 1, resource: externalTexture },
@@ -227,26 +254,63 @@ export class OffscreenRenderer {
         renderPass.draw(4);
         renderPass.end();
 
-        device.queue.submit([commandEncoder.finish()]);
+        return commandEncoder.finish();
       } catch (e) {
         this.log.warn('WebGPU render failed', e);
+        return null;
       } finally {
-        // ALWAYS close the frame after submit to prevent GPU memory leaks
+        // ALWAYS close the frame after encoding to prevent GPU memory leaks
         try { frame.close(); } catch { /* already closed */ }
       }
   }
 
-  /** Release GPU resources */
+  /**
+   * Draw a decoded VideoFrame and close it (single-stream convenience).
+   *
+   * Encodes and immediately submits. For multi-stream batching,
+   * use encodeFrame() + device.queue.submit() instead.
+   */
+  drawFrame(frame: VideoFrame): void {
+    const cmdBuf = this.encodeFrame(frame);
+    if (cmdBuf && this.gpu) {
+      this.gpu.device.queue.submit([cmdBuf]);
+    }
+  }
+
+  /** Release GPU resources, returning pooled buffers */
   destroy(): void {
-    if (this.viewportBuffer) {
-      this.viewportBuffer.destroy();
+    if (this.viewportBuffer && this.gpu) {
+      // Return buffer to pool for reuse instead of destroying it
+      this.gpu.viewportBufferPool.push(this.viewportBuffer);
       this.viewportBuffer = null;
     }
     if (this.gpuContext) {
       this.gpuContext.unconfigure();
       this.gpuContext = null;
     }
+    this.bindGroupDesc = null;
     this.gpu = null;
     this.log.info('Destroyed');
+  }
+
+  /**
+   * Re-initialize GPU resources after a device loss.
+   *
+   * Reconfigures the canvas context and acquires a new viewport buffer
+   * from the pool. Resets aspect ratio cache to force a uniform buffer
+   * write on the next frame.
+   *
+   * @param workerGPU - New shared GPU resources from re-initialization
+   * @returns true if recovery succeeded
+   */
+  reinitGPU(workerGPU: WorkerGPU): boolean {
+    // Clean up stale state without returning buffer to old pool
+    this.gpuContext = null;
+    this.viewportBuffer = null;
+    this.bindGroupDesc = null;
+    this.gpu = null;
+    this.lastVideoAR = 0;
+    this.lastCanvasAR = 0;
+    return this.initGPU(workerGPU);
   }
 }

@@ -12,8 +12,15 @@ import { Logger } from '../utils/logger';
 /** Callback invoked when the decoder outputs a decoded VideoFrame */
 export type FrameOutputCallback = (frame: VideoFrame) => void;
 
-/** Maximum decode queue size before non-keyframes are dropped */
-const MAX_QUEUE_SIZE = 3;
+/**
+ * Graduated backpressure thresholds:
+ * - queue ≤ NORMAL_THRESHOLD: accept all frames
+ * - queue = SOFT_THRESHOLD: drop B-frames (non-reference delta frames)
+ * - queue ≥ HARD_THRESHOLD: drop all non-keyframes
+ */
+const NORMAL_THRESHOLD = 2;
+const SOFT_THRESHOLD = 3;
+const HARD_THRESHOLD = 4;
 
 /** Minimum interval between recovery attempts in milliseconds */
 const RECOVERY_COOLDOWN_MS = 1000;
@@ -35,6 +42,8 @@ export class VideoStreamDecoder {
   private _waitingForKeyframe = true;
   private _lastRecoveryTime = 0;
   private _softwareFallback = false;
+  /** Previous queue size for tracking derivative (proactive dropping) */
+  private _prevQueueSize = 0;
   private readonly log: Logger;
 
   /**
@@ -191,10 +200,14 @@ export class VideoStreamDecoder {
   /**
    * Submit an encoded video chunk for decoding.
    *
-   * Implements backpressure: if the decoder's internal queue has more
-   * than MAX_QUEUE_SIZE items and the chunk is NOT a keyframe, the chunk
-   * is dropped. Keyframes are never dropped because they are required
-   * for correct decoding of subsequent frames.
+   * Implements graduated backpressure:
+   * - queue ≤ 2: accept all frames
+   * - queue = 3: drop B-frames (small non-keyframes likely to be B-frames)
+   * - queue ≥ 4: drop all non-keyframes
+   * - queue growing rapidly: proactively drop to prevent further buildup
+   *
+   * Keyframes are never dropped because they are required for correct
+   * decoding of subsequent frames.
    *
    * @param chunk - EncodedVideoChunk to decode
    */
@@ -215,10 +228,31 @@ export class VideoStreamDecoder {
       this.log.info(`First keyframe: ${chunk.byteLength} bytes, ts=${chunk.timestamp}`);
     }
 
-    // Backpressure: drop non-keyframes when queue is congested
-    if (this.decoder.decodeQueueSize > MAX_QUEUE_SIZE && chunk.type !== 'key') {
-      this._droppedFrames++;
-      return;
+    const queueSize = this.decoder.decodeQueueSize;
+    const queueGrowing = queueSize > this._prevQueueSize;
+    this._prevQueueSize = queueSize;
+
+    if (chunk.type !== 'key') {
+      // Hard threshold: drop all non-keyframes
+      if (queueSize >= HARD_THRESHOLD) {
+        this._droppedFrames++;
+        return;
+      }
+      // Soft threshold: drop likely B-frames (small delta frames)
+      // B-frames are typically much smaller than P-frames
+      if (queueSize >= SOFT_THRESHOLD) {
+        // Heuristic: B-frames are usually < 25% of keyframe size
+        // and the smallest delta frames in a GOP
+        if (chunk.byteLength < 2048) {
+          this._droppedFrames++;
+          return;
+        }
+      }
+      // Proactive: if queue is at normal limit AND growing, start dropping small frames
+      if (queueSize > NORMAL_THRESHOLD && queueGrowing && chunk.byteLength < 1024) {
+        this._droppedFrames++;
+        return;
+      }
     }
 
     try {

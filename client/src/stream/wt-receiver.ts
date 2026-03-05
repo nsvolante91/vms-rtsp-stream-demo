@@ -51,6 +51,9 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 /** Base reconnection delay in milliseconds */
 const BASE_RECONNECT_DELAY_MS = 1_000;
 
+/** Expected concurrent video streams for QUIC flow control pre-allocation */
+const ANTICIPATED_CONCURRENT_STREAMS = 32;
+
 /**
  * Write a length-prefixed message to a WritableStreamDefaultWriter.
  */
@@ -67,8 +70,41 @@ async function writeLengthPrefixed(
 /** Accumulation buffer initial size (64 KB) */
 const ACCUM_BUFFER_INITIAL_SIZE = 65_536;
 
-/** BYOB read buffer size (32 KB) — recycled by browser on each read */
-const BYOB_READ_BUFFER_SIZE = 32_768;
+/** BYOB read buffer initial size (32 KB) — recycled by browser on each read */
+const BYOB_READ_BUFFER_INITIAL_SIZE = 32_768;
+
+/** Maximum BYOB read buffer size (256 KB) — cap to prevent unbounded growth */
+const BYOB_READ_BUFFER_MAX_SIZE = 262_144;
+
+/**
+ * P99 frame size tracker for BYOB buffer pre-sizing.
+ * Tracks the 99th percentile frame size over a rolling window
+ * so the BYOB read buffer can be pre-sized to avoid reallocations.
+ */
+class FrameSizeTracker {
+  private readonly sizes: number[] = [];
+  private readonly maxSamples = 1000;
+  private _p99Size = BYOB_READ_BUFFER_INITIAL_SIZE;
+
+  /** Record a frame size and update P99 */
+  record(size: number): void {
+    this.sizes.push(size);
+    if (this.sizes.length > this.maxSamples) {
+      this.sizes.shift();
+    }
+    // Recalculate P99 every 100 frames
+    if (this.sizes.length % 100 === 0 && this.sizes.length >= 100) {
+      const sorted = [...this.sizes].sort((a, b) => a - b);
+      const idx = Math.floor(sorted.length * 0.99);
+      this._p99Size = Math.min(sorted[idx], BYOB_READ_BUFFER_MAX_SIZE);
+    }
+  }
+
+  /** Current P99 frame size */
+  get p99Size(): number {
+    return this._p99Size;
+  }
+}
 
 /**
  * Grow a Uint8Array buffer while preserving existing data.
@@ -109,9 +145,13 @@ async function* readLengthPrefixed(
   let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(ACCUM_BUFFER_INITIAL_SIZE);
   let filled = 0;
 
+  // P99 frame size tracker for adaptive BYOB buffer sizing
+  const sizeTracker = new FrameSizeTracker();
+
   // Separate BYOB read buffer — ownership is transferred to/from the browser
-  // on each read call, eliminating browser-side allocation.
-  let readBuf: ArrayBuffer | null = byobReader ? new ArrayBuffer(BYOB_READ_BUFFER_SIZE) : null;
+  // on each read call, eliminating browser-side allocation. Size adapts to P99.
+  let readBufSize = byobReader ? BYOB_READ_BUFFER_INITIAL_SIZE : 0;
+  let readBuf: ArrayBuffer | null = byobReader ? new ArrayBuffer(readBufSize) : null;
 
   /**
    * Read more data into the accumulation buffer.
@@ -169,6 +209,14 @@ async function* readLengthPrefixed(
       // synchronously via the pooled frame, and downstream EncodedVideoChunk
       // constructor copies the data internally.
       yield buf.subarray(4, totalNeeded);
+
+      // Track frame size for P99 BYOB buffer pre-sizing
+      sizeTracker.record(length);
+      // Resize BYOB read buffer if P99 has grown beyond current size
+      if (byobReader && sizeTracker.p99Size > readBufSize) {
+        readBufSize = Math.min(sizeTracker.p99Size, BYOB_READ_BUFFER_MAX_SIZE);
+        readBuf = new ArrayBuffer(readBufSize);
+      }
 
       // Compact remaining data to front of buffer
       const remaining = filled - totalNeeded;
@@ -270,13 +318,15 @@ export class WTReceiver {
       this.log.info(`Connecting to ${this.wtUrl}`);
 
       this.transport = new WebTransport(this.wtUrl, {
+        congestionControl: 'low-latency',
+        anticipatedConcurrentIncomingUnidirectionalStreams: ANTICIPATED_CONCURRENT_STREAMS,
         serverCertificateHashes: [
           {
             algorithm: 'sha-256',
             value: this.certHash.buffer as ArrayBuffer,
           },
         ],
-      });
+      } as WebTransportOptions);
 
       await this.transport.ready;
       this.log.info('WebTransport session established');
