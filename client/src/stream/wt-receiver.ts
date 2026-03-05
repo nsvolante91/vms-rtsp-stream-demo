@@ -474,23 +474,22 @@ export class WTReceiver {
       return;
     }
 
-    const off = buffer.byteOffset;
-    const b = buffer;
-
-    const version = b[off];
+    // Uint8Array indexing already accounts for byteOffset internally,
+    // so always use 0-based indices on the view.
+    const version = buffer[0];
     if (version !== PROTOCOL_VERSION) {
       this.log.warn(`Unknown protocol version: ${version}`);
       return;
     }
 
-    const streamId = (b[off + 1] << 8) | b[off + 2];
+    const streamId = (buffer[1] << 8) | buffer[2];
 
     // Read 64-bit timestamp as BigInt via two 32-bit halves (manual bytes)
-    const hi = ((b[off + 3] << 24) | (b[off + 4] << 16) | (b[off + 5] << 8) | b[off + 6]) >>> 0;
-    const lo = ((b[off + 7] << 24) | (b[off + 8] << 16) | (b[off + 9] << 8) | b[off + 10]) >>> 0;
+    const hi = ((buffer[3] << 24) | (buffer[4] << 16) | (buffer[5] << 8) | buffer[6]) >>> 0;
+    const lo = ((buffer[7] << 24) | (buffer[8] << 16) | (buffer[9] << 8) | buffer[10]) >>> 0;
     const timestamp = (BigInt(hi) << 32n) | BigInt(lo);
 
-    const flags = b[off + 11];
+    const flags = buffer[11];
     const isKeyframe = (flags & 0x01) !== 0;
     const isConfig = (flags & 0x02) !== 0;
     const data = buffer.subarray(HEADER_SIZE);

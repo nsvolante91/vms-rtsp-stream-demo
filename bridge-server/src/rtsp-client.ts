@@ -140,10 +140,12 @@ export class RTSPClient extends EventEmitter {
       });
 
       let resolved = false;
+      let connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
       this.ffmpeg.stdout!.on('data', (chunk: Buffer) => {
         if (!resolved) {
           resolved = true;
+          if (connectTimeout) clearTimeout(connectTimeout);
           resolve();
         }
         this.onData(chunk);
@@ -186,7 +188,7 @@ export class RTSPClient extends EventEmitter {
       });
 
       // Timeout if FFmpeg doesn't produce output within 10 seconds
-      setTimeout(() => {
+      connectTimeout = setTimeout(() => {
         if (!resolved) {
           resolved = true;
           this.close();

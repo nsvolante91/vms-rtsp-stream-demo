@@ -134,6 +134,7 @@ export class OffscreenRenderer {
       this.gpu = workerGPU;
       this.gpuContext = gpuContext;
       this.viewportBuffer = viewportBuffer;
+      this.bindGroupLayout = workerGPU.pipeline.getBindGroupLayout(0);
       return true;
     } catch (e) {
       this.log.warn('WebGPU init failed on OffscreenCanvas', e);
@@ -193,10 +194,6 @@ export class OffscreenRenderer {
         // Import the VideoFrame as a GPU external texture (zero-copy)
         const externalTexture = device.importExternalTexture({ source: frame });
 
-        // Close frame immediately after import — GPUExternalTexture holds
-        // its own reference to the video data per spec
-        frame.close();
-
         // Reuse pre-allocated bind group descriptor, mutating only the texture entry
         if (!this.bindGroupDesc) {
           this.bindGroupDesc = {
@@ -233,8 +230,8 @@ export class OffscreenRenderer {
         device.queue.submit([commandEncoder.finish()]);
       } catch (e) {
         this.log.warn('WebGPU render failed', e);
-        // Frame may already be closed after importExternalTexture;
-        // close only if still open (no-op if already closed)
+      } finally {
+        // ALWAYS close the frame after submit to prevent GPU memory leaks
         try { frame.close(); } catch { /* already closed */ }
       }
   }
