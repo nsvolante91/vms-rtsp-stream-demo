@@ -27,8 +27,8 @@ interface Viewport {
   height: number;
 }
 
-/** Size of the viewport uniform buffer (2x vec2<f32> = 16 bytes) */
-const VIEWPORT_UNIFORM_SIZE = 16;
+/** Size of the viewport uniform buffer (12x f32 = 48 bytes) */
+const VIEWPORT_UNIFORM_SIZE = 48;
 
 /**
  * WebGPU-based video renderer.
@@ -245,7 +245,7 @@ export class GPURenderer {
         const offsetX = viewport.x * 2 - 1 + viewport.width;
         const offsetY = 1 - viewport.y * 2 - viewport.height;
 
-        const uniformData = new Float32Array([offsetX, offsetY, adjScaleX, adjScaleY]);
+        const uniformData = new Float32Array([offsetX, offsetY, adjScaleX, adjScaleY, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0, 1.0]);
         this.device.queue.writeBuffer(viewportBuffer, 0, uniformData);
         this.lastVideoARs.set(viewport.streamId, videoAR);
       }
@@ -341,7 +341,7 @@ export class GPURenderer {
       const scaleX = viewport.width;
       const scaleY = viewport.height;
 
-      const uniformData = new Float32Array([offsetX, offsetY, scaleX, scaleY]);
+      const uniformData = new Float32Array([offsetX, offsetY, scaleX, scaleY, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0, 1.0]);
       this.device.queue.writeBuffer(buffer, 0, uniformData);
 
       this.log.info(`Viewport stream ${viewport.streamId}: norm(${viewport.x.toFixed(2)},${viewport.y.toFixed(2)},${viewport.width.toFixed(2)},${viewport.height.toFixed(2)}) → clip offset(${offsetX.toFixed(3)},${offsetY.toFixed(3)}) scale(${scaleX.toFixed(3)},${scaleY.toFixed(3)})`);

@@ -13,6 +13,7 @@
  */
 
 import { Logger } from '../utils/logger';
+import type { ZoomCrop } from '../worker/messages';
 import shaderCode from './shaders.wgsl?raw';
 
 /** Shared GPU state passed from the app to each tile */
@@ -118,6 +119,27 @@ export class StreamTile {
   /** Callback invoked on resize when canvas is transferred (pixel dimensions) */
   private _resizeCallback: ((width: number, height: number) => void) | null = null;
 
+  // ── Zoom state ────────────────────────────────────────────────
+  private _zoomCallback: ((streamId: number, crop: ZoomCrop | null) => void) | null = null;
+  private _zoomCrop: ZoomCrop | null = null;
+  private _isDragging = false;
+  private _dragStartX = 0;
+  private _dragStartY = 0;
+  private _dragMoved = false;
+  private readonly selectionOverlay: HTMLDivElement;
+  private readonly resetZoomBtn: HTMLDivElement;
+  private readonly zoomLevelLabel: HTMLSpanElement;
+
+  // ── Pause state ───────────────────────────────────────────────
+  private _pauseCallback: ((streamId: number, paused: boolean) => void) | null = null;
+  private _paused = false;
+  private readonly pauseBtn: HTMLDivElement;
+  private readonly pausedOverlay: HTMLDivElement;
+  private _escHandler: ((e: KeyboardEvent) => void) | null = null;
+
+  // ── Comparison mode ───────────────────────────────────────────
+  private _comparisonLabel: string | null = null;
+
   constructor(readonly streamId: number) {
     this.log = new Logger(`Tile[${streamId}]`);
 
@@ -135,6 +157,67 @@ export class StreamTile {
     this.label.className = 'stream-label';
     this.label.textContent = `Stream ${streamId}`;
     this.element.appendChild(this.label);
+
+    // ── Pause button (top-right corner) ──────────────────────
+    this.pauseBtn = document.createElement('div');
+    this.pauseBtn.className = 'tile-pause-btn';
+    this.pauseBtn.textContent = '⏸';
+    this.pauseBtn.title = 'Pause/Resume stream';
+    this.pauseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this._paused = !this._paused;
+      this.pauseBtn.textContent = this._paused ? '▶' : '⏸';
+      this.pausedOverlay.classList.toggle('visible', this._paused);
+      this._pauseCallback?.(this.streamId, this._paused);
+    });
+    this.element.appendChild(this.pauseBtn);
+
+    // Paused overlay (centered ⏸ icon + dimming)
+    this.pausedOverlay = document.createElement('div');
+    this.pausedOverlay.className = 'tile-paused-overlay';
+    this.pausedOverlay.innerHTML = '<span>⏸</span>';
+    this.element.appendChild(this.pausedOverlay);
+
+    // ── Zoom selection overlay (visible during drag) ─────────
+    this.selectionOverlay = document.createElement('div');
+    this.selectionOverlay.className = 'tile-selection-overlay';
+    this.element.appendChild(this.selectionOverlay);
+
+    // ── Reset zoom button (visible when zoomed) ──────────────
+    this.resetZoomBtn = document.createElement('div');
+    this.resetZoomBtn.className = 'tile-reset-zoom';
+    this.zoomLevelLabel = document.createElement('span');
+    this.zoomLevelLabel.className = 'tile-zoom-level';
+    this.resetZoomBtn.appendChild(this.zoomLevelLabel);
+    const resetX = document.createElement('span');
+    resetX.textContent = ' ✕ Reset';
+    resetX.className = 'tile-reset-zoom-action';
+    this.resetZoomBtn.appendChild(resetX);
+    this.resetZoomBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.resetZoom();
+    });
+    this.element.appendChild(this.resetZoomBtn);
+
+    // ── Zoom drag handlers ───────────────────────────────────
+    this.element.addEventListener('mousedown', (e) => this.handleMouseDown(e));
+    this.element.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+    this.element.addEventListener('mouseup', (e) => this.handleMouseUp(e));
+    this.element.addEventListener('mouseleave', () => this.cancelDrag());
+    this.element.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      if (this._zoomCrop) {
+        this.resetZoom();
+      }
+    });
+
+    // Escape key resets zoom
+    this._escHandler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && this._zoomCrop) {
+        this.resetZoom();
+      }
+    };
+    document.addEventListener('keydown', this._escHandler);
 
     // Keep canvas backing store matched to CSS display size
     this.resizeObserver = new ResizeObserver((entries) => {
@@ -184,14 +267,15 @@ export class StreamTile {
 
       // Full-screen viewport: offset (0,0), scale (1,1) in clip space
       const viewportBuffer = sharedGPU.device.createBuffer({
-        size: 16, // 2x vec2<f32>
+        size: 48, // 12x f32: offset, scale, texelSize, mode, sharpness, uvOffset, uvScale
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
       // Clip-space mapping: offset(0,0) scale(1,1) means the quad fills -1..1
+      // UV zoom identity: uvOffset(0,0) uvScale(1,1) = no zoom
       sharedGPU.device.queue.writeBuffer(
         viewportBuffer,
         0,
-        new Float32Array([0.0, 0.0, 1.0, 1.0])
+        new Float32Array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0, 1.0])
       );
 
       this.gpu = sharedGPU;
@@ -267,7 +351,7 @@ export class StreamTile {
         device.queue.writeBuffer(
           this.viewportBuffer!,
           0,
-          new Float32Array([0.0, 0.0, scaleX, scaleY])
+          new Float32Array([0.0, 0.0, scaleX, scaleY, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0, 1.0])
         );
         this.lastVideoAR = videoAR;
         this.lastCanvasAR = canvasAR;
@@ -399,15 +483,157 @@ export class StreamTile {
     this._resizeCallback = callback;
   }
 
+  /** Register a callback for zoom crop changes. */
+  onZoom(callback: (streamId: number, crop: ZoomCrop | null) => void): void {
+    this._zoomCallback = callback;
+  }
+
+  /** Register a callback for pause state changes. */
+  onPause(callback: (streamId: number, paused: boolean) => void): void {
+    this._pauseCallback = callback;
+  }
+
+  /** Whether a drag (not a simple click) occurred during the last mouse interaction. */
+  get wasDrag(): boolean {
+    return this._dragMoved;
+  }
+
+  // ── Zoom drag interaction ──────────────────────────────────
+
+  private handleMouseDown(e: MouseEvent): void {
+    // Only left button, ignore if clicking on buttons
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('.tile-pause-btn') || target.closest('.tile-reset-zoom') || target.closest('.stream-label')) return;
+
+    this._isDragging = true;
+    this._dragMoved = false;
+    const rect = this.element.getBoundingClientRect();
+    this._dragStartX = e.clientX - rect.left;
+    this._dragStartY = e.clientY - rect.top;
+
+    this.selectionOverlay.style.display = 'none';
+  }
+
+  private handleMouseMove(e: MouseEvent): void {
+    if (!this._isDragging) return;
+
+    const rect = this.element.getBoundingClientRect();
+    const currentX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const currentY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+
+    const dx = Math.abs(currentX - this._dragStartX);
+    const dy = Math.abs(currentY - this._dragStartY);
+
+    // Require minimum 5px movement to distinguish from click
+    if (dx < 5 && dy < 5) return;
+    this._dragMoved = true;
+
+    const left = Math.min(this._dragStartX, currentX);
+    const top = Math.min(this._dragStartY, currentY);
+    const width = Math.abs(currentX - this._dragStartX);
+    const height = Math.abs(currentY - this._dragStartY);
+
+    this.selectionOverlay.style.display = 'block';
+    this.selectionOverlay.style.left = `${left}px`;
+    this.selectionOverlay.style.top = `${top}px`;
+    this.selectionOverlay.style.width = `${width}px`;
+    this.selectionOverlay.style.height = `${height}px`;
+  }
+
+  private handleMouseUp(e: MouseEvent): void {
+    if (!this._isDragging) return;
+    this._isDragging = false;
+    this.selectionOverlay.style.display = 'none';
+
+    if (!this._dragMoved) return; // Was just a click, not a drag
+
+    const rect = this.element.getBoundingClientRect();
+    const currentX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const currentY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+
+    // Calculate normalized crop rect (0..1 relative to tile element)
+    const left = Math.min(this._dragStartX, currentX);
+    const top = Math.min(this._dragStartY, currentY);
+    const width = Math.abs(currentX - this._dragStartX);
+    const height = Math.abs(currentY - this._dragStartY);
+
+    // Minimum selection size (10px)
+    if (width < 10 || height < 10) return;
+
+    // Convert from tile-element-relative pixels to 0..1 UV coordinates
+    const crop: ZoomCrop = {
+      x: left / rect.width,
+      y: top / rect.height,
+      w: width / rect.width,
+      h: height / rect.height,
+    };
+
+    this._zoomCrop = crop;
+    this.updateZoomUI();
+    this._zoomCallback?.(this.streamId, crop);
+  }
+
+  private cancelDrag(): void {
+    if (this._isDragging) {
+      this._isDragging = false;
+      this.selectionOverlay.style.display = 'none';
+    }
+  }
+
+  private resetZoom(): void {
+    this._zoomCrop = null;
+    this.updateZoomUI();
+    this._zoomCallback?.(this.streamId, null);
+  }
+
+  private updateZoomUI(): void {
+    if (this._zoomCrop) {
+      const zoomX = 1 / this._zoomCrop.w;
+      const zoomY = 1 / this._zoomCrop.h;
+      const effectiveZoom = Math.min(zoomX, zoomY);
+      this.zoomLevelLabel.textContent = `${effectiveZoom.toFixed(1)}×`;
+      this.resetZoomBtn.classList.add('visible');
+    } else {
+      this.resetZoomBtn.classList.remove('visible');
+    }
+  }
+
   /** Update the label overlay text. */
   updateLabel(resolution: string, fps: number): void {
     const renderer = this._transferred ? 'WebGPU Worker' : this.useWebGPU ? 'WebGPU' : 'Canvas2D';
-    this.label.textContent = `Stream ${this.streamId} | ${resolution} | ${fps} fps | ${renderer}`;
+    const prefix = this._comparisonLabel ? `${this._comparisonLabel} | ` : '';
+    this.label.textContent = `${prefix}Stream ${this.streamId > 10000 ? this.streamId - 10000 : this.streamId} | ${resolution} | ${fps} fps | ${renderer}`;
+  }
+
+  /** Set a comparison mode label prefix (e.g. 'Original' or 'Upscaled'). Null clears it. */
+  setComparisonLabel(label: string | null): void {
+    this._comparisonLabel = label;
+  }
+
+  /** Set zoom crop externally (for syncing between companion and primary tiles). */
+  setZoomExternal(crop: ZoomCrop | null): void {
+    this._zoomCrop = crop;
+    // Update the visual indicators (zoom level label, reset button)
+    if (this._zoomCrop) {
+      const zoomX = 1 / this._zoomCrop.w;
+      const zoomY = 1 / this._zoomCrop.h;
+      const effectiveZoom = Math.min(zoomX, zoomY);
+      this.zoomLevelLabel.textContent = `${effectiveZoom.toFixed(1)}×`;
+      this.resetZoomBtn.classList.add('visible');
+    } else {
+      this.resetZoomBtn.classList.remove('visible');
+    }
   }
 
   /** Remove from DOM and clean up. */
   destroy(): void {
     this.resizeObserver.disconnect();
+
+    if (this._escHandler) {
+      document.removeEventListener('keydown', this._escHandler);
+      this._escHandler = null;
+    }
 
     if (this.viewportBuffer) {
       this.viewportBuffer.destroy();

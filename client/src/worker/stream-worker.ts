@@ -23,6 +23,8 @@ import {
 import type {
   MainToWorkerMessage,
   StreamMetricsUpdate,
+  UpscaleMode,
+  ZoomCrop,
 } from './messages';
 
 const log = new Logger('StreamWorker');
@@ -39,6 +41,19 @@ interface StreamEntry {
 
 const streams = new Map<number, StreamEntry>();
 let metricsTimer: ReturnType<typeof setInterval> | null = null;
+
+/** Current upscale mode applied to all renderers */
+let currentUpscaleMode: UpscaleMode = 'off';
+
+/** Set of paused stream IDs */
+const pausedStreams = new Set<number>();
+
+// ─── Comparison Mode State ─────────────────────────────────────
+
+/** Map primary streamId → companion streamId */
+const companionMap = new Map<number, number>();
+/** Set of companion stream IDs (render at mode=off, fed by cloned frames) */
+const companionSet = new Set<number>();
 
 // ─── rAF-Gated Rendering ───────────────────────────────────────
 
@@ -91,6 +106,23 @@ function scheduleRender(): void {
 
 /** Queue a decoded frame for rendering on the next rAF tick */
 function queueFrame(streamId: number, frame: VideoFrame): void {
+  // If stream is paused, close the frame immediately to prevent GPU memory buildup
+  if (pausedStreams.has(streamId)) {
+    frame.close();
+    return;
+  }
+
+  // If this primary stream has a companion, clone the frame for it
+  const companionId = companionMap.get(streamId);
+  if (companionId !== undefined && streams.has(companionId) && !pausedStreams.has(companionId)) {
+    const clone = frame.clone();
+    const prevCompanion = pendingFrames.get(companionId);
+    if (prevCompanion) {
+      prevCompanion.close();
+    }
+    pendingFrames.set(companionId, clone);
+  }
+
   // Close previous un-rendered frame (superseded by this newer one)
   const prev = pendingFrames.get(streamId);
   if (prev) {
@@ -167,10 +199,17 @@ function startMetricsReporter(): void {
   metricsTimer = setInterval(() => {
     const updates: StreamMetricsUpdate[] = [];
     for (const [streamId, entry] of streams) {
+      // Skip companion renderers — they have no decode pipeline
+      if (companionSet.has(streamId)) continue;
       const m = entry.pipeline.metrics;
       const prev = lastDecodedFrames.get(streamId) ?? 0;
       const fps = m.decodedFrames - prev;
       lastDecodedFrames.set(streamId, m.decodedFrames);
+
+      // Compute bitrate from consumed bytes
+      const { bytes, elapsedMs } = entry.pipeline.consumeBytes();
+      const elapsedSec = elapsedMs / 1000;
+      const bitrateKbps = elapsedSec > 0 ? (bytes * 8) / elapsedSec / 1000 : 0;
 
       updates.push({
         streamId,
@@ -179,6 +218,11 @@ function startMetricsReporter(): void {
         droppedFrames: m.droppedFrames,
         queueSize: m.queueSize,
         resolution: entry.pipeline.resolution,
+        decodeTimeMs: m.decodeTimeMs,
+        frameIntervalMs: m.frameIntervalMs,
+        frameIntervalJitterMs: m.frameIntervalJitterMs,
+        stutterCount: m.stutterCount,
+        bitrateKbps,
       });
     }
     postMsg({ type: 'metrics', streams: updates });
@@ -247,6 +291,7 @@ function handleAddStream(
   // Create renderer
   const renderer = new OffscreenRenderer(streamId, canvas);
   renderer.resize(width, height);
+  renderer.setUpscaleMode(currentUpscaleMode);
   const gpuOk = renderer.initGPU(workerGPU);
   if (!gpuOk) {
     postMsg({ type: 'error', streamId, message: 'Failed to init WebGPU on OffscreenCanvas' });
@@ -273,10 +318,17 @@ function handleRemoveStream(streamId: number): void {
   const entry = streams.get(streamId);
   if (!entry) return;
 
+  // If this primary had a companion, remove it too
+  const companionId = companionMap.get(streamId);
+  if (companionId !== undefined) {
+    handleRemoveCompanion(companionId);
+  }
+
   entry.pipeline.stop();
   entry.renderer.destroy();
   streams.delete(streamId);
   lastDecodedFrames.delete(streamId);
+  pausedStreams.delete(streamId);
   // Close any pending frame for this stream
   const pending = pendingFrames.get(streamId);
   if (pending) {
@@ -302,11 +354,15 @@ function handleShutdown(): void {
   }
   pendingFrames.clear();
   for (const [streamId, entry] of streams) {
-    entry.pipeline.stop();
+    if (!companionSet.has(streamId)) {
+      entry.pipeline.stop();
+    }
     entry.renderer.destroy();
     log.info(`Stream ${streamId} cleaned up`);
   }
   streams.clear();
+  companionMap.clear();
+  companionSet.clear();
 
   receiver = null;
   workerGPU = null;
@@ -342,9 +398,114 @@ self.onmessage = (e: MessageEvent<MainToWorkerMessage>) => {
       handleShutdown();
       break;
 
+    case 'setUpscale':
+      currentUpscaleMode = msg.mode;
+      for (const [sid, entry] of streams) {
+        // Skip companion renderers — they always stay at mode=off
+        if (companionSet.has(sid)) continue;
+        entry.renderer.setUpscaleMode(msg.mode);
+      }
+      log.info(`Upscale mode set to ${msg.mode}`);
+      break;
+
+    case 'setZoom': {
+      const zoomEntry = streams.get(msg.streamId);
+      if (zoomEntry) {
+        zoomEntry.renderer.setZoom(msg.crop);
+        log.info(`Stream ${msg.streamId} zoom ${msg.crop ? `set to (${msg.crop.x.toFixed(2)},${msg.crop.y.toFixed(2)},${msg.crop.w.toFixed(2)},${msg.crop.h.toFixed(2)})` : 'reset'}`);
+      }
+      break;
+    }
+
+    case 'pauseStream': {
+      if (msg.paused) {
+        pausedStreams.add(msg.streamId);
+      } else {
+        pausedStreams.delete(msg.streamId);
+      }
+      log.info(`Stream ${msg.streamId} ${msg.paused ? 'paused' : 'resumed'}`);
+      break;
+    }
+
+    case 'addCompanion':
+      handleAddCompanion(msg.primaryStreamId, msg.companionStreamId, msg.canvas, msg.width, msg.height);
+      break;
+
+    case 'removeCompanion':
+      handleRemoveCompanion(msg.companionStreamId);
+      break;
+
+    case 'setCompareMode':
+      // State is managed on the main thread; worker just receives
+      // addCompanion/removeCompanion messages. This is a no-op.
+      break;
+
     default:
       log.warn('Unknown message type', msg);
   }
 };
+
+// ─── Companion Handlers ────────────────────────────────────────
+
+function handleAddCompanion(
+  primaryStreamId: number,
+  companionStreamId: number,
+  canvas: OffscreenCanvas,
+  width: number,
+  height: number
+): void {
+  if (!workerGPU) {
+    log.warn(`Cannot add companion ${companionStreamId}: worker not initialized`);
+    return;
+  }
+
+  if (streams.has(companionStreamId)) {
+    log.warn(`Companion ${companionStreamId} already exists`);
+    return;
+  }
+
+  // Create renderer — always at mode=off (no upscaling)
+  const renderer = new OffscreenRenderer(companionStreamId, canvas);
+  renderer.resize(width, height);
+  renderer.setUpscaleMode('off');
+  const gpuOk = renderer.initGPU(workerGPU);
+  if (!gpuOk) {
+    postMsg({ type: 'error', streamId: companionStreamId, message: 'Failed to init WebGPU for companion' });
+    return;
+  }
+
+  // Companion has no pipeline — it receives cloned frames via queueFrame
+  // Store with a null pipeline sentinel
+  streams.set(companionStreamId, { pipeline: null as unknown as StreamPipeline, renderer });
+  companionMap.set(primaryStreamId, companionStreamId);
+  companionSet.add(companionStreamId);
+  log.info(`Companion ${companionStreamId} added for primary ${primaryStreamId} (${width}x${height})`);
+}
+
+function handleRemoveCompanion(companionStreamId: number): void {
+  const entry = streams.get(companionStreamId);
+  if (!entry) return;
+
+  entry.renderer.destroy();
+  streams.delete(companionStreamId);
+  companionSet.delete(companionStreamId);
+
+  // Remove from companionMap
+  for (const [primary, companion] of companionMap) {
+    if (companion === companionStreamId) {
+      companionMap.delete(primary);
+      break;
+    }
+  }
+
+  // Close any pending frame
+  const pending = pendingFrames.get(companionStreamId);
+  if (pending) {
+    pending.close();
+    pendingFrames.delete(companionStreamId);
+  }
+
+  log.info(`Companion ${companionStreamId} removed`);
+}
 
 log.info('Stream worker loaded');

@@ -24,9 +24,24 @@
       <div class="control-group">
         <button id="btn-benchmark">Run Benchmark</button>
         <button id="btn-export">Export Metrics</button>
+        <button id="btn-reset-metrics" title="Reset all metrics and analytics">↺ Reset</button>
+        <button id="btn-metrics-overlay" title="Toggle per-stream metrics overlay (M)">📊</button>
       </div>
       <div class="control-group">
         <button id="btn-cpu-hog" title="CPU Hogger — blocks main thread ~100ms every 1s">🌶️</button>
+        <button id="btn-compare" title="Compare Mode — show original vs upscaled side by side">⚖️ Compare</button>
+        <select id="upscale-select" title="GPU Upscaling — enhances video sharpness and detail using GPU shader techniques.">
+          <option value="off">Off — No upscaling</option>
+          <option value="cas">CAS — Contrast Adaptive Sharpening</option>
+          <option value="fsr">FSR — FidelityFX Super Resolution</option>
+          <option value="a4k">A4K — Anime4K Neural Upscale</option>
+          <option value="tsr">TSR — Temporal Super Resolution</option>
+          <option value="spec">SPEC — Spectral Frequency Hallucination</option>
+          <option value="vqsr">VQSR — Vector-Quantized Texture Lookup</option>
+          <option value="gen">GEN — Compact ESRGAN Generator</option>
+          <option value="dlss">DLSS — 4K Upscale (Temporal+Spatial)</option>
+        </select>
+        <span id="upscale-info" class="upscale-info">No upscaling — raw bilinear filtering</span>
       </div>
     </div>
     <div id="dashboard" class="dashboard hidden"></div>

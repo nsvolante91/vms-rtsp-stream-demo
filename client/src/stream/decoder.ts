@@ -46,6 +46,13 @@ export class VideoStreamDecoder {
   private _prevQueueSize = 0;
   private readonly log: Logger;
 
+  // ── Decode time tracking ──────────────────────────────────
+  /** Timestamps of chunks submitted for decoding (rolling, capped at 30) */
+  private _decodeSubmitTimes: number[] = [];
+  /** Rolling decode time samples (ms) for averaging */
+  private _decodeTimeSamples: number[] = [];
+  private static readonly MAX_DECODE_SAMPLES = 60;
+
   /**
    * Create a new VideoStreamDecoder.
    * @param streamId - Stream identifier for logging purposes
@@ -105,6 +112,15 @@ export class VideoStreamDecoder {
       output: (frame: VideoFrame) => {
         this._decodedFrames++;
         this._lastDecodeTime = performance.now();
+        // Record decode time from oldest pending submit
+        if (this._decodeSubmitTimes.length > 0) {
+          const submitTime = this._decodeSubmitTimes.shift()!;
+          const dt = this._lastDecodeTime - submitTime;
+          this._decodeTimeSamples.push(dt);
+          if (this._decodeTimeSamples.length > VideoStreamDecoder.MAX_DECODE_SAMPLES) {
+            this._decodeTimeSamples.shift();
+          }
+        }
         if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
           this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
         }
@@ -153,6 +169,15 @@ export class VideoStreamDecoder {
       output: (frame: VideoFrame) => {
         this._decodedFrames++;
         this._lastDecodeTime = performance.now();
+        // Record decode time from oldest pending submit
+        if (this._decodeSubmitTimes.length > 0) {
+          const submitTime = this._decodeSubmitTimes.shift()!;
+          const dt = this._lastDecodeTime - submitTime;
+          this._decodeTimeSamples.push(dt);
+          if (this._decodeTimeSamples.length > VideoStreamDecoder.MAX_DECODE_SAMPLES) {
+            this._decodeTimeSamples.shift();
+          }
+        }
         if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
           this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
         }
@@ -256,9 +281,15 @@ export class VideoStreamDecoder {
     }
 
     try {
+      this._decodeSubmitTimes.push(performance.now());
+      // Cap pending timestamps to prevent unbounded growth on stalls
+      if (this._decodeSubmitTimes.length > 30) {
+        this._decodeSubmitTimes.shift();
+      }
       this.decoder.decode(chunk);
     } catch (e) {
       this.log.error('Failed to decode chunk', e);
+      this._decodeSubmitTimes.pop(); // remove the timestamp we just pushed
       this._droppedFrames++;
     }
   }
@@ -321,5 +352,12 @@ export class VideoStreamDecoder {
   /** Timestamp (performance.now()) of the last successfully decoded frame */
   get lastDecodeTime(): number {
     return this._lastDecodeTime;
+  }
+
+  /** Average decode time in milliseconds (rolling window) */
+  get avgDecodeTimeMs(): number {
+    if (this._decodeTimeSamples.length === 0) return 0;
+    const sum = this._decodeTimeSamples.reduce((a, b) => a + b, 0);
+    return sum / this._decodeTimeSamples.length;
   }
 }

@@ -44,6 +44,21 @@ export class StreamPipeline {
   /** Discontinuity threshold (500ms in µs) */
   private static readonly DISCONTINUITY_THRESHOLD_US = 500_000;
 
+  // ── Frame timing & stutter detection ───────────────────────
+  /** Rolling buffer of inter-frame intervals (ms) */
+  private _frameIntervals: number[] = [];
+  /** Timestamp of last decoded frame (performance.now()) */
+  private _lastFrameTime = 0;
+  /** Cumulative stutter count (frame interval > 2× median) */
+  private _stutterCount = 0;
+  private static readonly FRAME_INTERVAL_WINDOW = 60;
+
+  // ── Bitrate tracking ───────────────────────────────────────
+  /** Accumulated bytes received since last metrics read */
+  private _bytesReceived = 0;
+  /** Timestamp of last bitrate reset */
+  private _bytesTimestamp = 0;
+
   /**
    * Create a new StreamPipeline.
    * @param streamId - Numeric stream identifier
@@ -121,15 +136,58 @@ export class StreamPipeline {
   }
 
   /** Current performance metrics for this stream's decoder */
-  get metrics(): { decodedFrames: number; droppedFrames: number; queueSize: number } {
+  get metrics(): {
+    decodedFrames: number;
+    droppedFrames: number;
+    queueSize: number;
+    decodeTimeMs: number;
+    frameIntervalMs: number;
+    frameIntervalJitterMs: number;
+    stutterCount: number;
+  } {
     if (!this.decoder) {
-      return { decodedFrames: 0, droppedFrames: 0, queueSize: 0 };
+      return {
+        decodedFrames: 0, droppedFrames: 0, queueSize: 0,
+        decodeTimeMs: 0, frameIntervalMs: 0, frameIntervalJitterMs: 0, stutterCount: 0,
+      };
     }
+
+    // Compute frame interval stats
+    let frameIntervalMs = 0;
+    let frameIntervalJitterMs = 0;
+    const intervals = this._frameIntervals;
+    if (intervals.length > 0) {
+      const sum = intervals.reduce((a, b) => a + b, 0);
+      frameIntervalMs = sum / intervals.length;
+      if (intervals.length > 1) {
+        const mean = frameIntervalMs;
+        const variance = intervals.reduce((acc, v) => acc + (v - mean) ** 2, 0) / intervals.length;
+        frameIntervalJitterMs = Math.sqrt(variance);
+      }
+    }
+
     return {
       decodedFrames: this.decoder.decodedFrames,
       droppedFrames: this.decoder.droppedFrames,
       queueSize: this.decoder.queueSize,
+      decodeTimeMs: this.decoder.avgDecodeTimeMs,
+      frameIntervalMs,
+      frameIntervalJitterMs,
+      stutterCount: this._stutterCount,
     };
+  }
+
+  /**
+   * Get accumulated bytes since last call and reset counter.
+   * Used by the worker metrics reporter for bitrate calculation.
+   */
+  consumeBytes(): { bytes: number; elapsedMs: number } {
+    const now = performance.now();
+    const elapsed = this._bytesTimestamp > 0 ? now - this._bytesTimestamp : 1000;
+    const bytes = this._bytesReceived;
+    this._bytesReceived = 0;
+    this._bytesTimestamp = now;
+    return { bytes, elapsedMs: elapsed };
   }
 
   /** Video resolution from the SPS, or null if not yet configured */
@@ -156,6 +214,9 @@ export class StreamPipeline {
     if (!this.demuxer.isConfigured || !this.decoder) {
       return;
     }
+
+    // Track bytes received for bitrate calculation
+    this._bytesReceived += frame.data.byteLength;
 
     // Smooth the timestamp before creating the chunk
     const smoothedFrame = this.smoothTimestamp(frame);
@@ -239,6 +300,26 @@ export class StreamPipeline {
    */
   private handleDecodedFrame(frame: VideoFrame): void {
     this._decodedFrameCount++;
+
+    // Track inter-frame timing for stutter detection
+    const now = performance.now();
+    if (this._lastFrameTime > 0) {
+      const interval = now - this._lastFrameTime;
+      this._frameIntervals.push(interval);
+      if (this._frameIntervals.length > StreamPipeline.FRAME_INTERVAL_WINDOW) {
+        this._frameIntervals.shift();
+      }
+      // Stutter detection: interval > 2× median
+      if (this._frameIntervals.length >= 5) {
+        const sorted = [...this._frameIntervals].sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length / 2)];
+        if (interval > median * 2) {
+          this._stutterCount++;
+        }
+      }
+    }
+    this._lastFrameTime = now;
+
     if (this._decodedFrameCount <= 3 || this._decodedFrameCount % 300 === 0) {
       this.log.info(`Decoded frame ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrameCount})`);
     }

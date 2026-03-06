@@ -35,7 +35,11 @@ export class Controls {
     private readonly onRemoveStream: () => void,
     private readonly onBenchmark: () => void,
     private readonly onExport: () => void,
-    private readonly onToggleDashboard: () => void
+    private readonly onToggleDashboard: () => void,
+    private readonly onUpscaleChange?: (mode: 'off' | 'cas' | 'fsr' | 'a4k' | 'tsr' | 'spec' | 'vqsr' | 'gen' | 'dlss') => void,
+    private readonly onToggleMetricsOverlay?: () => void,
+    private readonly onResetMetrics?: () => void,
+    private readonly onToggleCompare?: () => void
   ) {}
 
   /**
@@ -84,10 +88,50 @@ export class Controls {
       exportBtn.addEventListener('click', () => this.onExport());
     }
 
+    // Reset metrics button
+    const resetBtn = document.getElementById('btn-reset-metrics');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => this.onResetMetrics?.());
+    }
+
     // CPU Hogger button
     const cpuHogBtn = document.getElementById('btn-cpu-hog');
     if (cpuHogBtn) {
       cpuHogBtn.addEventListener('click', () => this.toggleCpuHog(cpuHogBtn));
+    }
+
+    // Compare mode toggle button
+    const compareBtn = document.getElementById('btn-compare');
+    if (compareBtn) {
+      compareBtn.addEventListener('click', () => {
+        compareBtn.classList.toggle('active');
+        this.onToggleCompare?.();
+      });
+    }
+
+    // Metrics overlay toggle button
+    const metricsOverlayBtn = document.getElementById('btn-metrics-overlay');
+    if (metricsOverlayBtn) {
+      metricsOverlayBtn.addEventListener('click', () => {
+        metricsOverlayBtn.classList.toggle('active');
+        this.onToggleMetricsOverlay?.();
+      });
+    }
+
+    // Upscale dropdown
+    const upscaleSelect = document.getElementById('upscale-select') as HTMLSelectElement | null;
+    if (upscaleSelect) {
+      upscaleSelect.addEventListener('change', () => {
+        const mode = upscaleSelect.value as typeof Controls.UPSCALE_MODES[number];
+        const infoEl = document.getElementById('upscale-info');
+        if (infoEl) {
+          infoEl.textContent = Controls.UPSCALE_DESCRIPTIONS[mode];
+          infoEl.dataset.mode = mode;
+        }
+        upscaleSelect.dataset.mode = mode;
+        console.log(`[Upscale] Mode: ${mode}`);
+        this.onUpscaleChange?.(mode);
+      });
     }
 
     // Keyboard shortcut: 'D' toggles dashboard
@@ -99,6 +143,15 @@ export class Controls {
           return;
         }
         this.onToggleDashboard();
+      }
+      if (e.key === 'm' || e.key === 'M') {
+        const target = e.target as HTMLElement;
+        if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+          return;
+        }
+        const btn = document.getElementById('btn-metrics-overlay');
+        btn?.classList.toggle('active');
+        this.onToggleMetricsOverlay?.();
       }
     });
   }
@@ -130,4 +183,17 @@ export class Controls {
       }
     }, 1000);
   }
+
+  private static readonly UPSCALE_MODES = ['off', 'cas', 'fsr', 'a4k', 'tsr', 'spec', 'vqsr', 'gen', 'dlss'] as const;
+  private static readonly UPSCALE_DESCRIPTIONS: Record<string, string> = {
+    off: 'No upscaling — raw bilinear filtering',
+    cas: 'Contrast Adaptive Sharpening — sharpens soft/blurry areas while leaving edges intact. Minimal GPU cost (~1% overhead). Based on AMD FidelityFX CAS.',
+    fsr: 'FidelityFX Super Resolution — detects edges via Sobel analysis then sharpens adaptively, avoiding halos. Low GPU cost (~2%). Based on AMD FSR 1.0 (EASU+RCAS).',
+    a4k: 'Anime4K Neural Upscale — 4-layer CNN (FSRCNN) with edge & line detection. Reconstructs fine detail lost in compression. Moderate GPU cost (~5-8%). All weights baked into shader, no model download.',
+    tsr: 'Temporal Super Resolution — accumulates detail across multiple frames using motion-compensated blending. Builds sharpness over ~10 frames on static scenes. Higher GPU cost (~8-12%). Scene-cut detection auto-resets.',
+    spec: 'Spectral Frequency Hallucination — DCT gap filling using 1/f natural image statistics. Synthesizes missing high-frequency bands with orientation-coherent detail from neighboring blocks. Low-moderate GPU cost (~4-6%).',
+    vqsr: 'Vector-Quantized Texture Lookup — encodes 4×4 patches into 8D feature vectors, finds nearest match in 512-entry HF texture codebook, pastes high-res detail. Moderate GPU cost (~6-10%).',
+    gen: 'Compact ESRGAN Generator — 4-block RRDB neural network that invents texture detail from nothing. 16-channel width, ~30K parameters baked into shader. Highest quality, highest GPU cost (~15-25%).',
+    dlss: '4K Upscale (DLSS-style) — Combines temporal accumulation with spatial super-resolution and detail hallucination. Motion-compensated history blending builds sub-pixel detail over frames; edge-directed interpolation + contrast-adaptive detail synthesis enhance spatial quality; anti-ringing prevents artifacts. Mac-compatible. GPU cost (~12-18%).',
+  };
 }
