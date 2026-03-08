@@ -1,0 +1,69 @@
+%%{ init: { "theme": "base", "themeVariables": { "fontSize": "14px", "fontFamily": "Segoe UI, sans-serif" } } }%%
+
+flowchart LR
+  subgraph DOCKER["Docker / Test Environment"]
+    direction TB
+    style DOCKER fill:#e8d5f5,stroke:#7b2d8e,stroke-width:2px,color:#333
+    FFmpeg["FFmpeg\n(loop test videos)"]
+    MediaMTX["MediaMTX\nRTSP Server\n:8554"]
+    FFmpeg -->|"RTSP/RTP\nTCP"| MediaMTX
+  end
+
+  subgraph BRIDGE["Bridge Server · Node.js / TypeScript"]
+    direction TB
+    style BRIDGE fill:#d5e8f5,stroke:#2d6b8e,stroke-width:2px,color:#333
+    RTSPClient["RTSPClient\n(FFmpeg subprocess)"]
+    H264Parser["H264Parser\nNAL extraction\nSPS decode"]
+    StreamMgr["StreamManager\nsubscription\nmultiplexing"]
+    RTSPClient --> H264Parser --> StreamMgr
+    REST["REST API\nHTTP/1.1 :9000\n/streams · /cert-hash"]
+    WT["WebTransport\nHTTP/3 QUIC :9001\nbinary protocol"]
+    WS["WebSocket\nTCP fallback\n/ws"]
+    StreamMgr --> WT
+    StreamMgr --> WS
+  end
+
+  subgraph CLIENT["Browser Client · TypeScript / Vite"]
+    direction TB
+    style CLIENT fill:#d5f5e0,stroke:#2d8e4a,stroke-width:2px,color:#333
+
+    subgraph MAIN["Main Thread"]
+      direction TB
+      style MAIN fill:#c2e8cf,stroke:#2d8e4a,stroke-width:1px,color:#333
+      VMSApp["VMSApp\ndevice detection\nCSS Grid layout"]
+      Controls["Controls\ngrid · streams\nupscale · compare"]
+      Tiles["StreamTile[]\ncanvas + overlay"]
+      Dashboard["Dashboard\nMetricsCollector"]
+      VMSApp --- Controls
+      VMSApp --- Tiles
+      VMSApp --- Dashboard
+    end
+
+    subgraph WORKER["Web Worker"]
+      direction TB
+      style WORKER fill:#b8dcc5,stroke:#2d8e4a,stroke-width:1px,color:#333
+      WTRecv["WTReceiver\nbinary protocol\nBYOB reader"]
+      Pipeline["StreamPipeline\nper-stream orchestrator"]
+      Demux["H264Demuxer\nAnnex B → chunks"]
+      Decoder["VideoDecoder\nWebCodecs HW accel\nbackpressure"]
+      Renderer["OffscreenRenderer\nrAF batch render"]
+      WTRecv --> Pipeline --> Demux --> Decoder --> Renderer
+    end
+
+    MAIN <-->|"postMessage\nmetrics · commands"| WORKER
+  end
+
+  MediaMTX -->|"RTSP/RTP\nTCP"| RTSPClient
+  REST <-->|"HTTP/1.1\nJSON"| VMSApp
+  WT -->|"HTTP/3 QUIC\n12B header + H.264"| WTRecv
+  WS -.->|"WebSocket TCP\nbinary frames"| WTRecv
+
+  subgraph GPU["GPU Hardware"]
+    direction TB
+    style GPU fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#333
+    ExtTex["importExternalTexture\nzero-copy"]
+    Shaders["Upscale Shaders\n10 modes"]
+    ExtTex --> Shaders
+  end
+
+  Renderer -->|"WebGPU"| ExtTex

@@ -20,15 +20,35 @@ A technology demonstrator showing that modern browsers can hardware-decode, GPU-
 
 ## Architecture
 
-```
-FFmpeg loops ──RTSP──▶ MediaMTX ──RTSP──▶ Bridge Server ──WebTransport──▶ Web Worker ──WebGPU──▶ Browser
-  (test videos)        (RTSP server)     (Node.js HTTP/3)  (QUIC, :9001)  (decode+render)       (display)
-                                          REST API (:9000)
-```
+### System Overview & Data Flow
 
-1. **Test Environment** (Docker): MediaMTX RTSP server + FFmpeg looping test videos as simulated cameras
-2. **Bridge Server** (Node.js/TypeScript): Reads RTSP streams via FFmpeg, extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) on port 9001 with a binary protocol. Also provides an HTTP/1.1 REST API on port 9000 for stream management and TLS certificate hash retrieval. One unidirectional QUIC stream per video subscription eliminates cross-stream head-of-line blocking. Generates a self-signed ECDSA P-256 certificate at startup for WebTransport TLS.
-3. **Browser Client** (TypeScript/Vite): Fetches the server certificate hash from the REST API, connects via WebTransport, receives H.264 in a dedicated Web Worker, demuxes Annex B into `EncodedVideoChunk`s, decodes via WebCodecs `VideoDecoder` (hardware-accelerated), renders via WebGPU `importExternalTexture` (zero-copy), applies GPU upscaling shaders, and displays in a CSS grid with real-time performance metrics.
+<img src="docs/architecture-overview.svg" alt="System architecture: Docker test environment → Bridge Server → Browser Client" />
+
+1. **Test Environment** (Docker): FFmpeg loops test videos and publishes them as RTSP streams to MediaMTX on port 8554.
+2. **Bridge Server** (Node.js/TypeScript): RTSPClient spawns FFmpeg to read RTSP streams, H264Parser extracts NAL units + SPS metadata, StreamManager multiplexes frames to subscribers. Serves video over **WebTransport** (HTTP/3 QUIC, port 9001) with a 12-byte binary header protocol, plus a **REST API** (HTTP/1.1, port 9000) for stream management and TLS cert-hash retrieval. **WebSocket** fallback on `/ws` when QUIC is unavailable. Self-signed ECDSA P-256 certificate generated at startup.
+3. **Browser Client** (TypeScript/Vite): Dedicated Web Worker owns the entire media pipeline — transport, decode, and render all happen off the main thread. Main thread handles only DOM, CSS Grid layout, and UI controls.
+
+### Browser Client Pipeline
+
+<img src="docs/architecture-browser.svg" alt="Browser client pipeline: Main Thread vs Web Worker architecture" />
+
+- **Main Thread**: VMSApp orchestrates device detection, CSS Grid layout (1×1 to 4×4), StreamTile[] (canvas + overlay per stream), Controls, MetricsCollector, Dashboard, and BenchmarkRunner.
+- **Web Worker**: WTReceiver (BYOB reader, auto-reconnect) → StreamPipeline → H264Demuxer (Annex B → EncodedVideoChunk) → VideoDecoder (WebCodecs HW accel, backpressure: drop B-frames at queue ≥3, non-keyframes at ≥4) → rAF-gated batch render via OffscreenRenderer.
+  - **WebGPU path**: `importExternalTexture` (zero-copy, valid until microtask end) → upscale shaders (10 modes: off, CAS, FSR, Anime4K, Lanczos, TSR, Spectral, VQSR, Generative, DLSS) → `queue.submit()` → `frame.close()`.
+  - **Canvas2D fallback**: `drawImage(VideoFrame)` with letterbox/pillarbox → `frame.close()`.
+- **postMessage** carries commands (init, addStream, resize, setUpscale, setZoom) main→worker and events (connected, error, metrics at 1 Hz) worker→main.
+
+### Mobile vs Desktop Configuration
+
+| Setting | Mobile | Desktop |
+|---------|--------|---------|
+| Max streams | 4 | 16 |
+| GPU power preference | `default` | `high-performance` |
+| Max DPR (device pixel ratio) | 2 | 3 |
+| Available upscale modes | off, CAS, FSR, Anime4K, Lanczos | All 10 modes |
+| Zoom interaction | Pinch-to-zoom, one-finger pan, double-tap | Drag rectangle, double-click reset |
+| Transport fallback | WebSocket (if QUIC unavailable) | WebSocket (if QUIC unavailable) |
+| Render fallback | Canvas2D (if WebGPU blocklisted) | Canvas2D (if WebGPU unavailable) |
 
 ## Prerequisites
 
