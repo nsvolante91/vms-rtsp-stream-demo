@@ -11,19 +11,19 @@
 import { Logger } from '../utils/logger';
 import type { UpscaleMode, ZoomCrop } from './messages';
 import shaderCode from '../render/shaders.wgsl?raw';
-import computeShaderCode from '../render/compute-shaders.wgsl?raw';
+import blitShaderCode from '../render/blit-shader.wgsl?raw';
 import temporalShaderCode from '../render/temporal-shaders.wgsl?raw';
 import spectralShaderCode from '../render/spectral-shaders.wgsl?raw';
 import vqsrShaderCode from '../render/vqsr-shaders.wgsl?raw';
 import genShaderCode from '../render/gen-shaders.wgsl?raw';
 import dlssShaderCode from '../render/dlss-shaders.wgsl?raw';
+import { CNNVL, CNNM } from 'anime4k-webgpu';
+import type { Anime4KPipeline } from 'anime4k-webgpu';
 
-/** Lazy-initialized compute pipelines for A4K mode */
-export interface A4KPipelines {
-  edgeDetect: GPUComputePipeline;
-  lineReconstruct: GPUComputePipeline;
-  cnnUpscale: GPUComputePipeline;
-  shaderModule: GPUShaderModule;
+/** Shared blit render pipeline for rendering rgba16float → rgba8unorm canvas */
+export interface BlitPipeline {
+  pipeline: GPURenderPipeline;
+  bindGroupLayout: GPUBindGroupLayout;
 }
 
 /** Lazy-initialized compute pipelines for TSR mode */
@@ -80,8 +80,8 @@ export interface WorkerGPU {
   copyBindGroupLayout: GPUBindGroupLayout;
   /** Pool of reusable viewport uniform buffers (32 bytes each) */
   viewportBufferPool: GPUBuffer[];
-  /** Lazy A4K compute pipelines — created on first use */
-  a4k?: A4KPipelines;
+  /** Lazy blit pipeline — created on first use for A4K modes */
+  blitPipeline?: BlitPipeline;
   /** Lazy TSR compute pipelines — created on first use */
   tsr?: TSRPipelines;
   /** Lazy SPEC compute pipelines — created on first use */
@@ -210,31 +210,35 @@ export async function initWorkerGPU(
 }
 
 /**
- * Lazily initialize A4K compute pipelines. Called once on first A4K usage,
+ * Lazily initialize the blit render pipeline. Called once on first A4K usage,
  * then stored on WorkerGPU for reuse across all renderers.
  */
-export function ensureA4KPipelines(gpu: WorkerGPU): A4KPipelines {
-  if (gpu.a4k) return gpu.a4k;
+export function ensureBlitPipeline(gpu: WorkerGPU): BlitPipeline {
+  if (gpu.blitPipeline) return gpu.blitPipeline;
 
-  const shaderModule = gpu.device.createShaderModule({ code: computeShaderCode });
+  const shaderModule = gpu.device.createShaderModule({ code: blitShaderCode });
 
-  const edgeDetect = gpu.device.createComputePipeline({
+  const pipeline = gpu.device.createRenderPipeline({
     layout: 'auto',
-    compute: { module: shaderModule, entryPoint: 'a4k_edge_detect' },
+    vertex: {
+      module: shaderModule,
+      entryPoint: 'vertexMain',
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: 'fragmentMain',
+      targets: [{ format: 'rgba8unorm' }],
+    },
+    primitive: {
+      topology: 'triangle-strip',
+      stripIndexFormat: undefined,
+    },
   });
 
-  const lineReconstruct = gpu.device.createComputePipeline({
-    layout: 'auto',
-    compute: { module: shaderModule, entryPoint: 'a4k_line_reconstruct' },
-  });
+  const bindGroupLayout = pipeline.getBindGroupLayout(0);
 
-  const cnnUpscale = gpu.device.createComputePipeline({
-    layout: 'auto',
-    compute: { module: shaderModule, entryPoint: 'a4k_cnn_upscale' },
-  });
-
-  gpu.a4k = { edgeDetect, lineReconstruct, cnnUpscale, shaderModule };
-  return gpu.a4k;
+  gpu.blitPipeline = { pipeline, bindGroupLayout };
+  return gpu.blitPipeline;
 }
 
 /**
@@ -407,10 +411,16 @@ export class OffscreenRenderer {
   private lastVideoAR = 0;
   private lastCanvasAR = 0;
 
-  /** Current upscale mode: 0=off, 1=cas, 2=fsr, 3=a4k, 4=tsr */
+  /** Current upscale mode: 0=off, 1=cas, 2=fsr, 3=a4k, 4=tsr, 9=a4k-fast */
   private upscaleModeValue = 0;
   /** Whether uniforms need a full rewrite (e.g. after mode change) */
   private uniformsDirty = true;
+
+  // ── Anime4K pipeline state (per-renderer) ──────────────────
+  private a4kPipeline: Anime4KPipeline | null = null;
+  private a4kInputW = 0;
+  private a4kInputH = 0;
+  private a4kCurrentMode: 'a4k' | 'a4k-fast' | null = null;
 
   // ── A4K/TSR intermediate textures (created lazily) ──────────
   private sourceCopyTex: GPUTexture | null = null;
@@ -418,9 +428,6 @@ export class OffscreenRenderer {
   private intermediateB: GPUTexture | null = null;
   private lastIntermediateW = 0;
   private lastIntermediateH = 0;
-  /** Uniform buffer for compute passes (32 bytes) */
-  private computeUniformBuffer: GPUBuffer | null = null;
-  private readonly computeUniformData = new Float32Array(8);
   /** "Identity" viewport buffer for copy pass (mode=0, full scale) */
   private copyViewportBuffer: GPUBuffer | null = null;
 
@@ -585,7 +592,7 @@ export class OffscreenRenderer {
 
   /** Set GPU upscale mode for this renderer */
   setUpscaleMode(mode: UpscaleMode): void {
-    const modeMap: Record<UpscaleMode, number> = { off: 0, cas: 1, fsr: 2, a4k: 3, tsr: 4, spec: 5, vqsr: 6, gen: 7, dlss: 8 };
+    const modeMap: Record<UpscaleMode, number> = { off: 0, cas: 1, fsr: 2, a4k: 3, tsr: 4, spec: 5, vqsr: 6, gen: 7, dlss: 8, 'a4k-fast': 9 };
     const prev = this.upscaleModeValue;
     this.upscaleModeValue = modeMap[mode];
     this.uniformsDirty = true;
@@ -607,9 +614,9 @@ export class OffscreenRenderer {
       this.dlssFrameCount = 0;
     }
 
-    // Lazy-init compute pipelines
+    // Lazy-init compute/blit pipelines
     if (this.gpu) {
-      if (this.upscaleModeValue === 3) ensureA4KPipelines(this.gpu);
+      if (this.upscaleModeValue === 3 || this.upscaleModeValue === 9) ensureBlitPipeline(this.gpu);
       if (this.upscaleModeValue === 4) ensureTSRPipelines(this.gpu);
       if (this.upscaleModeValue === 5) ensureSPECPipelines(this.gpu);
       if (this.upscaleModeValue === 6) ensureVQSRPipelines(this.gpu);
@@ -724,8 +731,8 @@ export class OffscreenRenderer {
         // Import the VideoFrame as a GPU external texture (zero-copy)
         const externalTexture = device.importExternalTexture({ source: frame });
 
-        // ── A4K compute path ──────────────────────────────────
-        if (this.upscaleModeValue === 3) {
+        // ── A4K compute path (mode 3 = a4k, mode 9 = a4k-fast) ──
+        if (this.upscaleModeValue === 3 || this.upscaleModeValue === 9) {
           return this.encodeA4K(device, externalTexture, sampler, videoW, videoH);
         }
 
@@ -833,14 +840,6 @@ export class OffscreenRenderer {
     this.lastIntermediateW = w;
     this.lastIntermediateH = h;
 
-    // Create compute uniform buffer if needed
-    if (!this.computeUniformBuffer) {
-      this.computeUniformBuffer = device.createBuffer({
-        size: 48,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
-    }
-
     // Create identity-scale viewport buffer for copy pass
     if (!this.copyViewportBuffer) {
       this.copyViewportBuffer = device.createBuffer({
@@ -893,11 +892,57 @@ export class OffscreenRenderer {
     this.tsrFrameCount = 0;
   }
 
-  // ── A4K Compute Encode ──────────────────────────────────────
+  /**
+   * Destroy internal GPU textures created by the anime4k-webgpu library pipeline.
+   * The library has no dispose/destroy API, so we manually iterate its sub-pipelines
+   * and destroy their output textures to prevent GPU memory leaks.
+   */
+  private destroyA4KPipelineTextures(): void {
+    if (!this.a4kPipeline) return;
+    const pipeline = this.a4kPipeline as CNNVL | CNNM;
+    if (pipeline.pipelines) {
+      const destroyed = new Set<GPUTexture>();
+      for (const sub of pipeline.pipelines) {
+        const tex = sub.getOutputTexture();
+        if (!destroyed.has(tex)) {
+          tex.destroy();
+          destroyed.add(tex);
+        }
+      }
+    }
+    this.a4kPipeline = null;
+  }
+
+  // ── A4K (anime4k-webgpu) Encode ────────────────────────────
 
   /**
-   * Encode A4K compute passes: external texture → sourceCopy → 3 compute dispatches → canvas.
-   * All passes are in ONE command encoder to stay within the GPUExternalTexture microtask.
+   * Ensure the per-renderer Anime4K pipeline exists and matches current dimensions/mode.
+   * Recreates when canvas dimensions change or mode switches between a4k/a4k-fast.
+   */
+  private ensureA4KPipeline(device: GPUDevice): void {
+    const cw = this.canvas.width;
+    const ch = this.canvas.height;
+    const wantedMode: 'a4k' | 'a4k-fast' = this.upscaleModeValue === 9 ? 'a4k-fast' : 'a4k';
+
+    if (this.a4kPipeline && this.a4kInputW === cw && this.a4kInputH === ch && this.a4kCurrentMode === wantedMode) {
+      return;
+    }
+
+    // Destroy old pipeline's internal GPU textures (library has no dispose API)
+    this.destroyA4KPipelineTextures();
+
+    // (Re)create: library bind groups reference sourceCopyTex internally
+    this.a4kPipeline = wantedMode === 'a4k'
+      ? new CNNVL({ device, inputTexture: this.sourceCopyTex! })
+      : new CNNM({ device, inputTexture: this.sourceCopyTex! });
+    this.a4kInputW = cw;
+    this.a4kInputH = ch;
+    this.a4kCurrentMode = wantedMode;
+  }
+
+  /**
+   * Encode A4K passes: external texture → sourceCopy → anime4k-webgpu compute → blit → canvas.
+   * Works for both a4k (CNNVL, 17 sub-passes) and a4k-fast (CNNM, 8 sub-passes).
    */
   private encodeA4K(
     device: GPUDevice,
@@ -906,18 +951,21 @@ export class OffscreenRenderer {
     videoW: number,
     videoH: number,
   ): GPUCommandBuffer | null {
-    if (!this.gpu?.a4k || !this.gpuContext) return null;
-    const { a4k, copyPipeline, copyBindGroupLayout } = this.gpu;
+    if (!this.gpu?.blitPipeline || !this.gpuContext) return null;
+    const { copyPipeline, copyBindGroupLayout, blitPipeline } = this.gpu;
 
     const cw = this.canvas.width;
     const ch = this.canvas.height;
     this.ensureIntermediateTextures(device, cw, ch);
-    if (!this.sourceCopyTex || !this.intermediateA || !this.intermediateB || !this.computeUniformBuffer || !this.copyViewportBuffer) return null;
+    if (!this.sourceCopyTex || !this.copyViewportBuffer) return null;
+
+    // Ensure anime4k-webgpu pipeline is created/up-to-date
+    this.ensureA4KPipeline(device);
+    if (!this.a4kPipeline) return null;
 
     const commandEncoder = device.createCommandEncoder();
 
-    // Step 1: Render external texture → sourceCopyTex (bilinear, mode=0)
-    // Apply zoom crop so compute shaders only process the visible region
+    // Step 1: Render external texture → sourceCopyTex (bilinear, with zoom crop)
     this.writeCopyViewport(device, videoW, videoH);
 
     const copyBindGroup = device.createBindGroup({
@@ -942,92 +990,32 @@ export class OffscreenRenderer {
     copyPass.draw(4);
     copyPass.end();
 
-    // Update compute uniforms
-    this.computeUniformData[0] = 1.0 / cw;
-    this.computeUniformData[1] = 1.0 / ch;
-    this.computeUniformData[2] = cw;
-    this.computeUniformData[3] = ch;
-    this.computeUniformData[4] = 3.0;  // mode = a4k
-    this.computeUniformData[5] = this.upscaleModeValue === 3 ? 0.6 : 0.5;
-    this.computeUniformData[6] = 0.0;
-    this.computeUniformData[7] = 0.0;
-    device.queue.writeBuffer(this.computeUniformBuffer, 0, this.computeUniformData);
+    // Step 2: anime4k-webgpu compute sub-passes
+    this.a4kPipeline.pass(commandEncoder);
 
-    const wgX = Math.ceil(cw / 8);
-    const wgY = Math.ceil(ch / 8);
-
-    // Step 2: Edge detection compute pass
-    const edgeBG0 = device.createBindGroup({
-      layout: a4k.edgeDetect.getBindGroupLayout(0),
+    // Step 3: Blit library output (rgba16float) → canvas (rgba8unorm)
+    const outputTex = this.a4kPipeline.getOutputTexture();
+    const blitBindGroup = device.createBindGroup({
+      layout: blitPipeline.bindGroupLayout,
       entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.computeUniformBuffer } },
-      ],
-    });
-    const edgeBG1 = device.createBindGroup({
-      layout: a4k.edgeDetect.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.intermediateA.createView() },
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: outputTex.createView() },
       ],
     });
 
-    const edgePass = commandEncoder.beginComputePass();
-    edgePass.setPipeline(a4k.edgeDetect);
-    edgePass.setBindGroup(0, edgeBG0);
-    edgePass.setBindGroup(1, edgeBG1);
-    edgePass.dispatchWorkgroups(wgX, wgY);
-    edgePass.end();
-
-    // Step 3: Line reconstruction compute pass
-    const lineBG0 = device.createBindGroup({
-      layout: a4k.lineReconstruct.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.computeUniformBuffer } },
-      ],
-    });
-    const lineBG1 = device.createBindGroup({
-      layout: a4k.lineReconstruct.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.intermediateA.createView() },
-        { binding: 1, resource: this.intermediateB.createView() },
-      ],
-    });
-
-    const linePass = commandEncoder.beginComputePass();
-    linePass.setPipeline(a4k.lineReconstruct);
-    linePass.setBindGroup(0, lineBG0);
-    linePass.setBindGroup(1, lineBG1);
-    linePass.dispatchWorkgroups(wgX, wgY);
-    linePass.end();
-
-    // Step 4: CNN upscale compute pass → canvas texture
     const canvasTex = this.gpuContext.getCurrentTexture();
-    const cnnBG0 = device.createBindGroup({
-      layout: a4k.cnnUpscale.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.computeUniformBuffer } },
-      ],
+    const blitPass = commandEncoder.beginRenderPass({
+      colorAttachments: [{
+        view: canvasTex.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: 'clear',
+        storeOp: 'store',
+      }],
     });
-    const cnnBG1 = device.createBindGroup({
-      layout: a4k.cnnUpscale.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.intermediateA.createView() },
-        { binding: 1, resource: this.intermediateB.createView() },
-        { binding: 2, resource: canvasTex.createView() },
-      ],
-    });
-
-    const cnnPass = commandEncoder.beginComputePass();
-    cnnPass.setPipeline(a4k.cnnUpscale);
-    cnnPass.setBindGroup(0, cnnBG0);
-    cnnPass.setBindGroup(1, cnnBG1);
-    cnnPass.dispatchWorkgroups(wgX, wgY);
-    cnnPass.end();
+    blitPass.setPipeline(blitPipeline.pipeline);
+    blitPass.setBindGroup(0, blitBindGroup);
+    blitPass.draw(4);
+    blitPass.end();
 
     return commandEncoder.finish();
   }
@@ -2028,12 +2016,16 @@ export class OffscreenRenderer {
     this.sourceCopyTex = null;
     this.intermediateA = null;
     this.intermediateB = null;
-    this.computeUniformBuffer?.destroy();
-    this.computeUniformBuffer = null;
     this.copyViewportBuffer?.destroy();
     this.copyViewportBuffer = null;
     this.lastIntermediateW = 0;
     this.lastIntermediateH = 0;
+
+    // Destroy anime4k-webgpu pipeline and its internal GPU textures
+    this.destroyA4KPipelineTextures();
+    this.a4kInputW = 0;
+    this.a4kInputH = 0;
+    this.a4kCurrentMode = null;
 
     // Destroy TSR temporal textures
     this.prevFrameTex?.destroy();

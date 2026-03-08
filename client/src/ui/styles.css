@@ -373,6 +373,13 @@ button.active {
   color: #fff;
 }
 
+#upscale-select[data-mode="a4k-fast"] {
+  background: #5500aa;
+  border-color: #7700dd;
+  box-shadow: 0 0 8px rgba(119, 0, 221, 0.5);
+  color: #fff;
+}
+
 #upscale-select[data-mode="tsr"] {
   background: #006699;
   border-color: #0099cc;
@@ -424,6 +431,11 @@ button.active {
 .upscale-info[data-mode="a4k"] {
   color: #bb88ff;
   border-color: #8800ff;
+}
+
+.upscale-info[data-mode="a4k-fast"] {
+  color: #aa77ee;
+  border-color: #7700dd;
 }
 
 .upscale-info[data-mode="tsr"] {

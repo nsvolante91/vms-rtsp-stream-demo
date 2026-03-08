@@ -38,18 +38,15 @@ export function detectDevice(): DeviceProfile {
 }
 
 /** Heavy upscale modes that should be disabled on mobile */
-const HEAVY_UPSCALE_MODES = new Set(['a4k', 'tsr', 'spec', 'vqsr', 'gen', 'dlss']);
-
-/** Lightweight upscale modes safe for mobile */
-const LIGHT_UPSCALE_MODES = new Set(['off', 'cas', 'fsr']);
+const HEAVY_UPSCALE_MODES = new Set(['tsr', 'spec', 'vqsr', 'gen', 'dlss']);
 
 /**
  * Check if an upscale mode is suitable for the current device.
- * On mobile, only lightweight modes (off, CAS, FSR) are allowed.
+ * On mobile, heavy modes (TSR, SPEC, VQSR, GEN, DLSS) are disabled.
  */
 export function isUpscaleModeAllowed(mode: string, isMobile: boolean): boolean {
   if (!isMobile) return true;
-  return LIGHT_UPSCALE_MODES.has(mode);
+  return !HEAVY_UPSCALE_MODES.has(mode);
 }
 
 /**
