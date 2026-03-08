@@ -169,7 +169,8 @@ docker compose -f docker/docker-compose.yml down
 │   │   │   ├── stream-overlay.ts       # Per-tile metrics overlay
 │   │   │   └── styles.css              # Global styles
 │   │   └── utils/
-│   │       └── logger.ts               # Tagged debug logging
+│   │       ├── logger.ts               # Tagged debug logging
+│   │       └── device.ts               # Mobile/desktop device detection
 │   └── tests/
 ├── docker/                     # Docker Compose + MediaMTX config
 │   ├── docker-compose.yml
@@ -204,14 +205,31 @@ npm run typecheck        # TypeScript type checking (both packages)
 
 ## Browser Support
 
+### Desktop
+
 | Browser | WebTransport | WebGPU | WebCodecs | Status |
 |---------|-------------|--------|-----------|--------|
 | Chrome 114+ | Yes | Yes | Yes | **Full support** |
 | Edge 114+ | Yes | Yes | Yes | **Full support** |
-| Firefox | Behind flag | Behind flag | Yes | Not supported |
-| Safari | No | Partial | Yes | Not supported |
+| Firefox 133+ | Yes | Yes | Yes | Functional (not primary target) |
+| Safari 18+ | Behind flag | Partial | Yes | Not supported |
 
-The client includes a WebSocket fallback for transport and Canvas2D fallback for rendering, but the full feature set (upscaling, zero-copy GPU rendering) requires Chrome or Edge 114+.
+### Mobile
+
+| Browser | WebTransport | WebGPU | WebCodecs | Status |
+|---------|-------------|--------|-----------|--------|
+| Chrome Android 123+ | Yes | Yes | Yes | **Full support** (Android 12+, Qualcomm/ARM GPU) |
+| Edge Android 113+ | Yes | Yes | Yes | **Full support** (same engine as Chrome) |
+| Samsung Internet 25+ | Yes | Yes | Yes | **Full support** (Chromium-based) |
+| Safari iOS 26+ | Behind flag | Yes | Yes | **Partial** — WebSocket fallback works, WebTransport experimental |
+| Firefox Android | No | No | No | Not supported |
+
+### Notes
+
+- **Chrome Android** is the primary mobile target — the only mobile browser where all three APIs (WebTransport + WebGPU + WebCodecs) are stable. Requires Android 12+ with a Qualcomm or ARM GPU for WebGPU.
+- **Safari iOS 26** (released 2025) adds WebGPU with `importExternalTexture` support and WebCodecs `VideoDecoder`. WebTransport remains experimental (behind a flag), but the client's WebSocket fallback enables video playback. GPU upscaling and zero-copy rendering work fully.
+- **Samsung Internet / Edge Android** are Chromium-based and inherit Chrome's API support, subject to the same Android 12+ / GPU hardware requirements for WebGPU.
+- The client includes a **WebSocket fallback** for transport and **Canvas2D fallback** for rendering, so basic playback works on browsers missing WebTransport or WebGPU. The full feature set (GPU upscaling, zero-copy rendering, QUIC streaming) requires Chrome or Edge 114+ (desktop) or Chrome Android 123+ (mobile).
 
 ## License
 
