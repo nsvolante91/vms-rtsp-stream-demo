@@ -23,4 +23,8 @@ export default defineConfig({
     target: 'esnext',
     outDir: 'dist',
   },
+  optimizeDeps: {
+    exclude: ['onnxruntime-web'],
+  },
+  assetsInclude: ['**/*.onnx'],
 });

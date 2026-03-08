@@ -87,15 +87,15 @@ function postResult(msg: InferenceResultMessage): void {
 
 async function handleInit(modelUrl: string): Promise<void> {
   try {
-    // Import the self-contained WASM bundle — no separate .mjs files needed.
-    // The default 'onnxruntime-web' entry tries to dynamically import .mjs glue
-    // modules that Vite can't serve from public/, so we use the bundle variant.
-    // @ts-ignore — bundled ORT variant
-    ort = await import('onnxruntime-web/wasm');
+    // Dynamic import of ONNX Runtime Web.
+    // onnxruntime-web is excluded from Vite's optimizeDeps so it loads as native ESM.
+    // @ts-ignore
+    ort = await import('onnxruntime-web');
 
-    // Configure WASM paths BEFORE any session creation.
-    // WASM files are copied to public/ so Vite serves them with correct MIME type.
-    ort.env.wasm.wasmPaths = '/';
+    // Point WASM + .mjs glue files at CDN to avoid Vite serving issues.
+    // Must be set BEFORE any session creation (initWasm() caches on first call).
+    const ORT_CDN = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/';
+    ort.env.wasm.wasmPaths = ORT_CDN;
     ort.env.wasm.numThreads = 1;
     // Disable proxy worker — we're already in a worker
     ort.env.wasm.proxy = false;
