@@ -168,6 +168,10 @@ export class RTSPClient extends EventEmitter {
         this.running = false;
         if (!resolved) {
           resolved = true;
+          if (this.authProxy) {
+            this.authProxy.close();
+            this.authProxy = null;
+          }
           reject(new Error(`Failed to spawn FFmpeg: ${err.message}`));
         } else {
           this.emit('error', err);
@@ -180,6 +184,10 @@ export class RTSPClient extends EventEmitter {
         this.flushBuffer();
         if (!resolved) {
           resolved = true;
+          if (this.authProxy) {
+            this.authProxy.close();
+            this.authProxy = null;
+          }
           reject(
             new Error(`FFmpeg exited with code ${code} before producing output`)
           );
@@ -223,13 +231,15 @@ export class RTSPClient extends EventEmitter {
       // Force kill after 5 seconds if still alive
       const killTimeout = setTimeout(() => {
         try {
-          proc.kill('SIGKILL');
+          if (!proc.killed) {
+            proc.kill('SIGKILL');
+          }
         } catch {
           // Process may have already exited
         }
       }, 5000);
 
-      proc.on('close', () => {
+      proc.once('exit', () => {
         clearTimeout(killTimeout);
       });
     }

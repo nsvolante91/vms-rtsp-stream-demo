@@ -124,7 +124,11 @@ export class VideoStreamDecoder {
         if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
           this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
         }
-        this.onFrame(frame);
+        try {
+          this.onFrame(frame);
+        } catch {
+          try { frame.close(); } catch { /* already closed */ }
+        }
       },
       error: (error: DOMException) => {
         this.log.error('Decoder error', error);
@@ -181,7 +185,11 @@ export class VideoStreamDecoder {
         if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
           this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
         }
-        this.onFrame(frame);
+        try {
+          this.onFrame(frame);
+        } catch {
+          try { frame.close(); } catch { /* already closed */ }
+        }
       },
       error: (error: DOMException) => {
         this.log.error('Decoder error (fallback)', error);

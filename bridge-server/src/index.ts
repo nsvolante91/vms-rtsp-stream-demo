@@ -26,7 +26,7 @@ import { attachWebSocketServer } from './ws-handler.js';
 
 const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
 const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
-const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://adminbob:Test123.@10.10.33.32:554/live/0582abb4-1cd7-469e-9b7c-b0c1cffab49b';
+const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://localhost:8554';
 const MAX_DISCOVER_STREAMS = 1;
 
 const streamManager = new StreamManager();
@@ -84,7 +84,7 @@ async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://192.168.3.123:${HTTP_PORT}`);
+  const url = new URL(req.url ?? '/', `http://localhost:${HTTP_PORT}`);
   const method = req.method ?? 'GET';
 
   // CORS preflight

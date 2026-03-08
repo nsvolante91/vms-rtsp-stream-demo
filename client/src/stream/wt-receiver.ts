@@ -328,11 +328,7 @@ export class WTReceiver {
         ],
       } as WebTransportOptions);
 
-      await this.transport.ready;
-      this.log.info('WebTransport session established');
-      this.reconnectAttempt = 0;
-
-      // Monitor session close
+      // Monitor session close BEFORE awaiting ready, so early closes aren't missed
       this.transport.closed
         .then(() => {
           this.log.warn('WebTransport session closed');
@@ -350,6 +346,10 @@ export class WTReceiver {
             this.scheduleReconnect();
           }
         });
+
+      await this.transport.ready;
+      this.log.info('WebTransport session established');
+      this.reconnectAttempt = 0;
 
       // Open the control bidirectional stream
       const controlStream = await this.transport.createBidirectionalStream();
@@ -381,10 +381,13 @@ export class WTReceiver {
       } else {
         this.log.error('Connection failed', err);
       }
-      this.transport = null;
-      this.controlWriter = null;
-      if (!this.closing) {
-        this.scheduleReconnect();
+      // Guard: .closed handler may have already nulled transport and scheduled reconnect
+      if (this.transport) {
+        this.transport = null;
+        this.controlWriter = null;
+        if (!this.closing) {
+          this.scheduleReconnect();
+        }
       }
     }
   }

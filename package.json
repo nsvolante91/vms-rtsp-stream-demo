@@ -9,6 +9,8 @@
   ],
   "scripts": {
     "bridge": "npm run start -w bridge-server",
+    "bridge:local": "npm run start -w bridge-server",
+    "bridge:external": "npm run start -w bridge-server",
     "dev": "npm run dev -w client",
     "build": "npm run build -w client",
     "test": "npm run test:bridge && npm run test:client",

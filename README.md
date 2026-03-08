@@ -1,29 +1,34 @@
 # VMS Browser Prototype
 
-**Multi-stream H.264 video surveillance in the browser using WebCodecs + Canvas2D**
+**Multi-stream H.264 video surveillance in the browser using WebCodecs + WebGPU + WebTransport**
 
-A technology demonstrator showing that modern browsers can hardware-decode and render multiple simultaneous H.264 video streams with near-native performance. Built with zero runtime dependencies in the browser client — pure browser APIs.
+A technology demonstrator showing that modern browsers can hardware-decode, GPU-upscale, and render multiple simultaneous H.264 video streams with near-native performance. Built with zero runtime dependencies in the browser client — pure browser APIs.
 
 ## What It Does
 
 - Displays 1–16+ simultaneous video streams in a configurable CSS grid layout
 - Hardware-accelerated H.264 decode via **WebCodecs** `VideoDecoder`
-- Per-stream Canvas2D rendering — each stream has its own `<canvas>` element
-- Real-time performance dashboard (FPS, decode latency, memory, frame drops)
-- Automated benchmark that progressively adds streams and measures limits
-- Click-to-zoom on any stream tile
+- Zero-copy GPU rendering via **WebGPU** `importExternalTexture` — frames stay on the GPU
+- Low-latency streaming via **WebTransport** (HTTP/3 QUIC) — per-stream flow control, no head-of-line blocking
+- Dedicated **Web Worker** pipeline — decode + render off the main thread
+- 9 GPU upscaling/super-resolution modes (bilinear, Lanczos, FSR, DLSS-style, spectral, temporal, VQSR, generative, compute)
+- Side-by-side comparison mode (upscaled vs. original)
+- Per-stream overlay with real-time metrics (FPS, bitrate, decode latency, resolution)
+- Click-to-zoom with GPU-accelerated crop and pan
 - Auto-recovery from decoder errors (reconnects on next keyframe)
+- WebSocket fallback when WebTransport is unavailable
 
 ## Architecture
 
 ```
-FFmpeg loops ──RTSP──▶ MediaMTX ──RTSP──▶ Bridge Server ──WebSocket──▶ Browser
-  (test videos)        (RTSP server)     (Node.js)                    (WebCodecs + Canvas2D)
+FFmpeg loops ──RTSP──▶ MediaMTX ──RTSP──▶ Bridge Server ──WebTransport──▶ Web Worker ──WebGPU──▶ Browser
+  (test videos)        (RTSP server)     (Node.js HTTP/3)  (QUIC, :9001)  (decode+render)       (display)
+                                          REST API (:9000)
 ```
 
 1. **Test Environment** (Docker): MediaMTX RTSP server + FFmpeg looping test videos as simulated cameras
-2. **Bridge Server** (Node.js/TypeScript): Reads RTSP streams via FFmpeg, extracts H.264 NAL units, accumulates them into complete access units, and serves them over WebSocket with a binary protocol
-3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebSocket, demuxes Annex B into `EncodedVideoChunk`s, decodes via WebCodecs `VideoDecoder` (hardware-accelerated), renders each stream to its own canvas via `ctx.drawImage(VideoFrame)`, displays in a CSS grid with real-time performance metrics
+2. **Bridge Server** (Node.js/TypeScript): Reads RTSP streams via FFmpeg, extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) on port 9001 with a binary protocol. Also provides an HTTP/1.1 REST API on port 9000 for stream management and TLS certificate hash retrieval. One unidirectional QUIC stream per video subscription eliminates cross-stream head-of-line blocking. Generates a self-signed ECDSA P-256 certificate at startup for WebTransport TLS.
+3. **Browser Client** (TypeScript/Vite): Fetches the server certificate hash from the REST API, connects via WebTransport, receives H.264 in a dedicated Web Worker, demuxes Annex B into `EncodedVideoChunk`s, decodes via WebCodecs `VideoDecoder` (hardware-accelerated), renders via WebGPU `importExternalTexture` (zero-copy), applies GPU upscaling shaders, and displays in a CSS grid with real-time performance metrics.
 
 ## Prerequisites
 
@@ -32,13 +37,11 @@ FFmpeg loops ──RTSP──▶ MediaMTX ──RTSP──▶ Bridge Server ─�
 | **Node.js** | 20+ | Bridge server + build tooling |
 | **Docker** + Docker Compose | Any recent | Runs MediaMTX RTSP server |
 | **FFmpeg** | 5+ (on host) | Generates simulated camera streams |
-| **Chrome** or **Edge** | 113+ | WebCodecs `VideoDecoder` support |
+| **Chrome** or **Edge** | 114+ | WebTransport + WebGPU + WebCodecs |
 
 ## Quick Start
 
-You need **4 terminal windows** (or use background processes).
-
-### 1. Clone and install
+### 1. Install
 
 ```bash
 git clone https://github.com/nsvolante91/vms-rtsp-stream-demo.git
@@ -54,18 +57,13 @@ Downloads sample videos and starts the MediaMTX RTSP server in Docker:
 ./scripts/setup-test-env.sh
 ```
 
-This will:
-- Download Big Buck Bunny and Tears of Steel sample videos to `test-videos/`
-- Generate 720p and 480p resolution variants
-- Start the MediaMTX Docker container (RTSP on port 8554)
-
 ### 3. Start simulated camera streams
 
 ```bash
 ./scripts/generate-streams.sh 4
 ```
 
-This spawns 4 FFmpeg processes, each looping a test video and publishing to MediaMTX as an RTSP stream (`stream1` through `stream4`). You can pass a different number for more/fewer streams.
+Spawns 4 FFmpeg processes, each looping a test video and publishing to MediaMTX as RTSP (`stream1`–`stream4`).
 
 Verify a stream is working:
 ```bash
@@ -74,11 +72,21 @@ ffprobe -rtsp_transport tcp rtsp://localhost:8554/stream1
 
 ### 4. Start the bridge server
 
+**Local mode** (MediaMTX test streams on localhost):
 ```bash
 npm run bridge
+# or equivalently:
+npm run bridge:local
 ```
 
-The bridge server connects to the RTSP streams, extracts H.264 NAL units, and serves them over WebSocket on `ws://localhost:9000`. It also exposes `http://localhost:9000/streams` for the client to discover available streams.
+The bridge server auto-discovers streams at `rtsp://localhost:8554/stream1..N` and serves them over WebTransport on port 9001 with a REST API on port 9000. The TLS certificate hash is available at `http://localhost:9000/cert-hash` — the client fetches it automatically.
+
+**External camera mode** (real IP camera or remote RTSP server):
+```bash
+RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/path npm run bridge:external
+```
+
+Set `RTSP_BASE_URL` to any RTSP URL. The bridge will treat it as a single direct stream.
 
 ### 5. Start the browser client
 
@@ -86,14 +94,17 @@ The bridge server connects to the RTSP streams, extracts H.264 NAL units, and se
 npm run dev
 ```
 
-Open **Chrome** at `http://localhost:5173`. The client auto-detects available streams and begins playing up to 4 streams in a 2x2 grid.
+Open **Chrome** at `http://localhost:5173`. The client auto-fetches the certificate hash, connects via WebTransport, and begins playing streams.
 
 ## Usage
 
 - **Grid layout**: Click 1x1, 2x2, 3x3, or 4x4 buttons to change grid columns
 - **Add/Remove streams**: Use the + Stream / - Stream buttons
-- **Zoom**: Click any stream tile to focus it full-screen; click again to return to grid
-- **Dashboard**: Toggle the performance overlay via the Dashboard button
+- **Upscale mode**: Select from 9 GPU upscaling modes in the dropdown — bilinear, Lanczos, FSR, DLSS, spectral, temporal, VQSR, generative, compute
+- **Comparison mode**: Toggle to show upscaled vs. original side-by-side for each stream
+- **Zoom**: Click any stream tile to focus it; the GPU shader crops and pans
+- **Stream overlay**: Per-tile overlay shows FPS, resolution, bitrate, decode time, and frame drops
+- **Dashboard**: Toggle the global performance overlay
 - **Benchmark**: Click "Run Benchmark" to auto-test stream scaling limits
 - **Export**: Click "Export Metrics" to download performance data as JSON
 
@@ -113,41 +124,62 @@ docker compose -f docker/docker-compose.yml down
 ## Project Layout
 
 ```
-├── bridge-server/          # Node.js WebSocket bridge (RTSP → WS)
+├── bridge-server/              # Node.js WebTransport bridge (RTSP → QUIC)
 │   ├── src/
-│   │   ├── server.ts           # HTTP + WebSocket server
-│   │   ├── stream-manager.ts   # RTSP stream lifecycle + access unit packaging
-│   │   ├── rtsp-client.ts      # FFmpeg subprocess for RTSP reading
-│   │   └── h264-parser.ts      # NAL unit parsing, SPS decode, codec string
+│   │   ├── index.ts                # HTTP/1.1 REST API + HTTP/3 WebTransport server
+│   │   ├── stream-manager.ts       # RTSP stream lifecycle + per-client multiplexing
+│   │   ├── rtsp-client.ts          # FFmpeg subprocess for RTSP reading
+│   │   ├── rtsp-auth-proxy.ts      # RTSP Digest auth proxy (FFmpeg 8.x workaround)
+│   │   ├── h264-parser.ts          # NAL unit parsing, SPS decode, codec string
+│   │   ├── cert-utils.ts           # ECDSA P-256 self-signed cert generation
+│   │   ├── framing.ts              # 4-byte length-prefix framing for QUIC streams
+│   │   └── ws-handler.ts           # WebSocket fallback handler
 │   └── tests/
-├── client/                 # Vite TypeScript browser app (zero runtime deps)
+├── client/                     # Vite TypeScript browser app (zero runtime deps)
 │   ├── src/
-│   │   ├── main.ts             # App controller, CSS grid management
+│   │   ├── main.ts                 # App controller, CSS grid, UI wiring
+│   │   ├── worker/
+│   │   │   ├── stream-worker.ts        # Web Worker: owns decode + render pipeline
+│   │   │   ├── offscreen-renderer.ts   # OffscreenCanvas WebGPU renderer per stream
+│   │   │   └── messages.ts             # Worker ↔ main thread message types
 │   │   ├── stream/
-│   │   │   ├── ws-receiver.ts      # WebSocket client + binary protocol parser
-│   │   │   ├── stream-pipeline.ts  # Per-stream decode pipeline
-│   │   │   ├── h264-demuxer.ts     # Annex B → EncodedVideoChunk
-│   │   │   └── decoder.ts         # VideoDecoder wrapper with backpressure + auto-recovery
+│   │   │   ├── wt-receiver.ts          # WebTransport client + binary protocol parser
+│   │   │   ├── stream-pipeline.ts      # Per-stream decode pipeline orchestrator
+│   │   │   ├── h264-demuxer.ts         # Annex B → EncodedVideoChunk
+│   │   │   └── decoder.ts             # VideoDecoder wrapper with backpressure
 │   │   ├── render/
-│   │   │   ├── stream-tile.ts     # Per-stream canvas + label overlay (Canvas2D)
-│   │   │   ├── gpu-renderer.ts    # WebGPU renderer (partial, not yet active)
-│   │   │   └── shaders.wgsl       # WGSL vertex/fragment shaders for WebGPU
+│   │   │   ├── gpu-renderer.ts         # WebGPU render pipeline setup
+│   │   │   ├── canvas2d-renderer.ts    # Canvas2D fallback renderer
+│   │   │   ├── stream-tile.ts          # Per-stream canvas + label overlay
+│   │   │   ├── grid-layout.ts          # Grid viewport calculations
+│   │   │   ├── texture-manager.ts      # GPU texture lifecycle management
+│   │   │   ├── shaders.wgsl            # Core vertex/fragment shaders
+│   │   │   ├── compute-shaders.wgsl    # Compute upscaling shader
+│   │   │   ├── dlss-shaders.wgsl       # DLSS-style temporal upscaling
+│   │   │   ├── spectral-shaders.wgsl   # Spectral analysis upscaling
+│   │   │   ├── temporal-shaders.wgsl   # Temporal accumulation upscaling
+│   │   │   ├── vqsr-shaders.wgsl       # VQSR super-resolution
+│   │   │   └── gen-shaders.wgsl        # Generative upscaling
 │   │   ├── perf/
-│   │   │   ├── metrics-collector.ts
-│   │   │   ├── dashboard.ts
-│   │   │   └── benchmark-runner.ts
-│   │   └── ui/
-│   │       ├── controls.ts
-│   │       └── styles.css
+│   │   │   ├── metrics-collector.ts    # FPS, latency, memory tracking
+│   │   │   ├── dashboard.ts            # Real-time metrics UI overlay
+│   │   │   └── benchmark-runner.ts     # Automated stream scaling benchmark
+│   │   ├── ui/
+│   │   │   ├── controls.ts             # Stream control panel
+│   │   │   ├── stream-overlay.ts       # Per-tile metrics overlay
+│   │   │   └── styles.css              # Global styles
+│   │   └── utils/
+│   │       └── logger.ts               # Tagged debug logging
 │   └── tests/
-├── docker/                 # Docker Compose + MediaMTX config
+├── docker/                     # Docker Compose + MediaMTX config
 │   ├── docker-compose.yml
 │   └── mediamtx.yml
 ├── scripts/
-│   ├── setup-test-env.sh       # One-time setup (download videos, start Docker)
-│   └── generate-streams.sh     # Spawn FFmpeg RTSP stream publishers
-├── CLAUDE.md               # AI assistant context
-└── package.json            # Monorepo root (npm workspaces)
+│   ├── setup-test-env.sh           # One-time setup (download videos, start Docker)
+│   ├── generate-streams.sh         # Spawn FFmpeg RTSP stream publishers
+│   └── run-benchmark.sh            # Automated benchmark runner
+├── CLAUDE.md                   # AI assistant context
+└── package.json                # Monorepo root (npm workspaces)
 ```
 
 ## Testing
@@ -161,90 +193,25 @@ npm run typecheck        # TypeScript type checking (both packages)
 
 ## Key Technical Details
 
-- **Binary WebSocket protocol**: 12-byte header (version + streamId + timestamp + flags) followed by H.264 Annex B payload. Config frames carry SPS/PPS for decoder initialization; video frames carry complete access units.
-- **Access unit packaging**: The bridge server accumulates H.264 NAL units into complete access units (all slices for one picture) before sending, using `first_mb_in_slice` detection for slice boundary detection.
-- **Decoder auto-recovery**: If the WebCodecs `VideoDecoder` hits an error, it automatically resets, reconfigures, and resumes decoding on the next keyframe.
-- **Backpressure**: Non-keyframes are dropped when `decodeQueueSize > 3` to prevent queue buildup. Keyframes are never dropped.
-- **VideoFrame lifecycle**: Every `VideoFrame` from the decoder is closed after rendering via `frame.close()` to prevent GPU memory leaks.
+- **WebTransport binary protocol**: 12-byte header (1B version + 2B streamId + 8B timestamp + 1B flags) followed by H.264 Annex B payload. All messages use 4-byte big-endian length-prefix framing since QUIC streams are byte-oriented. Config frames carry SPS/PPS for decoder initialization; video frames carry complete access units.
+- **Zero-copy GPU rendering**: `importExternalTexture(VideoFrame)` creates a `GPUExternalTexture` that references the decoded frame directly on the GPU — no CPU-side pixel copies. The external texture is only valid until the current microtask ends, so `importExternalTexture` + render pass + `queue.submit()` must happen synchronously.
+- **Web Worker pipeline**: All decode and render work runs in a dedicated Web Worker via `OffscreenCanvas`. The main thread only handles DOM, layout, and UI. Frames are batched into a single `rAF`-gated GPU submit per vsync.
+- **BYOB stream reader**: Uses `ReadableStreamBYOBReader` to read WebTransport QUIC streams with zero browser-side allocation per read. A stable accumulation buffer with doubling growth and `copyWithin` compaction avoids O(n²) concat+slice patterns.
+- **Certificate pinning**: The bridge server generates an ECDSA P-256 self-signed certificate at startup (≤14 days validity). The client fetches the SHA-256 hash via the REST API and passes it to `WebTransport` via `serverCertificateHashes`.
+- **Backpressure**: Graduated thresholds on `decodeQueueSize` — accept all at ≤2, drop B-frames at 3, drop all non-keyframes at ≥4. Keyframes are never dropped.
+- **VideoFrame lifecycle**: Every `VideoFrame` from the decoder is closed after GPU submit via `frame.close()` to prevent GPU memory leaks.
+- **GPU upscaling modes**: 9 shader-based upscaling pipelines — bilinear (default sampler), Lanczos (windowed sinc), FSR (AMD FidelityFX-style edge sharpening), DLSS-style (temporal accumulation with motion vectors), spectral (frequency-domain enhancement), temporal (multi-frame accumulation), VQSR (learned super-resolution approximation), generative (detail synthesis), and compute (compute shader upscale).
 
-## Roadmap: WebGPU Rendering
+## Browser Support
 
-The current renderer uses Canvas2D (`ctx.drawImage(VideoFrame)`) per stream tile. This works well and proves the decode pipeline, but leaves performance on the table. The next major step is **WebGPU rendering** using `importExternalTexture` for zero-copy GPU compositing.
+| Browser | WebTransport | WebGPU | WebCodecs | Status |
+|---------|-------------|--------|-----------|--------|
+| Chrome 114+ | Yes | Yes | Yes | **Full support** |
+| Edge 114+ | Yes | Yes | Yes | **Full support** |
+| Firefox | Behind flag | Behind flag | Yes | Not supported |
+| Safari | No | Partial | Yes | Not supported |
 
-A partial WebGPU implementation already exists in `client/src/render/gpu-renderer.ts` and `client/src/render/shaders.wgsl` from an earlier iteration. It uses a single shared canvas with viewport uniforms. The plan below adapts it to the current per-tile architecture.
-
-### Why WebGPU
-
-| | Canvas2D (current) | WebGPU (planned) |
-|---|---|---|
-| **Frame transfer** | CPU-side drawImage copies pixels | `importExternalTexture` — zero-copy, frame stays on GPU |
-| **Color conversion** | Browser does YUV→RGB on CPU | GPU does YUV→RGB via external texture sampling |
-| **Scaling** | CPU bilinear interpolation | GPU bilinear via sampler, runs in parallel |
-| **Compositing** | One drawImage call per tile, sequential | Single render pass draws all tiles with GPU parallelism |
-| **Target benefit** | Baseline working | ~2-3x more streams before hitting limits |
-
-### Implementation Plan
-
-#### Phase 1: Per-tile WebGPU renderer
-
-Replace Canvas2D in `StreamTile` with a WebGPU canvas context. Each tile gets its own `GPUCanvasContext` but shares a single `GPUDevice`.
-
-**Files to change:**
-- `client/src/render/stream-tile.ts` — Switch canvas context from `2d` to `webgpu`, add `importExternalTexture` + single-quad render pass in `drawFrame()`
-- `client/src/render/gpu-context.ts` — **New.** Singleton that initializes `GPUAdapter` + `GPUDevice` once, shared across all tiles. Holds the `GPURenderPipeline`, `GPUSampler`, and `GPUShaderModule`.
-- `client/src/main.ts` — Initialize GPU context at startup, pass to each `StreamTile`
-- `client/src/render/shaders.wgsl` — Simplify: remove viewport uniforms (each canvas is full-quad), keep `texture_external` sampling
-
-**Key constraints:**
-- `importExternalTexture` returns a `GPUExternalTexture` that expires at the end of the current microtask. Must call `importExternalTexture` and submit the command buffer in the same synchronous block — no `await` between them.
-- `VideoFrame.close()` must still be called after the command buffer is submitted (not before, or the external texture is invalidated).
-- Feature detection: fall back to Canvas2D if `navigator.gpu` is unavailable.
-
-**Per-tile render flow:**
-```
-decoder callback fires with VideoFrame
-  → tile.drawFrame(frame)
-    → device.importExternalTexture({ source: frame })
-    → device.createBindGroup(externalTexture + sampler)
-    → commandEncoder.beginRenderPass(canvasTextureView)
-    → renderPass.draw(4)  // fullscreen triangle strip
-    → device.queue.submit([commandEncoder.finish()])
-    → frame.close()
-```
-
-#### Phase 2: Single-canvas compositor (optional, for 16+ streams)
-
-For very high stream counts, per-tile canvases create overhead from multiple `GPUCanvasContext`s. Switch to a single `<canvas>` that composites all streams in one render pass using viewport uniforms.
-
-**Files to change:**
-- `client/src/render/gpu-compositor.ts` — **New.** Single canvas, one render pass, loops over streams drawing textured quads at viewport positions (reuse existing `gpu-renderer.ts` pattern)
-- `client/src/render/shaders.wgsl` — Restore viewport uniform (`offset` + `scale`) for multi-tile rendering
-- `client/src/main.ts` — Replace CSS grid + per-tile rendering with single canvas + compositor
-- `client/src/ui/styles.css` — Overlay stream labels as absolutely-positioned divs on top of the single canvas
-
-**Tradeoffs vs Phase 1:**
-- Pro: single render pass for all streams, less context switching
-- Pro: better scaling past 16 streams
-- Con: loses CSS grid flexibility (must calculate viewport positions manually)
-- Con: single canvas resize affects all streams
-- Con: label overlays require separate DOM positioning logic
-
-#### Phase 3: Advanced GPU features
-
-- **Multi-render-target**: Render different streams to different texture views in one pass
-- **Compute shader post-processing**: Deinterlacing, edge enhancement, or motion detection on the GPU
-- **HDR / wide-gamut**: Use `rgba16float` canvas format for HDR surveillance cameras
-- **WebCodecs `VideoFrame` → `GPUTexture` via `copyExternalImageToTexture`**: Alternative to `importExternalTexture` when you need the frame to persist across microtasks (costs a copy but allows deferred rendering)
-
-### Browser Support
-
-WebGPU `importExternalTexture(VideoFrame)` requires:
-- Chrome 113+ (stable since May 2023)
-- Edge 113+
-- Firefox: not yet supported (behind flag)
-- Safari: WebGPU supported but `importExternalTexture` with VideoFrame not yet available
-
-The implementation should always include a Canvas2D fallback path for unsupported browsers.
+The client includes a WebSocket fallback for transport and Canvas2D fallback for rendering, but the full feature set (upscaling, zero-copy GPU rendering) requires Chrome or Edge 114+.
 
 ## License
 

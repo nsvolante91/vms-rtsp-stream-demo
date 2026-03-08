@@ -323,6 +323,11 @@ export class StreamPipeline {
     if (this._decodedFrameCount <= 3 || this._decodedFrameCount % 300 === 0) {
       this.log.info(`Decoded frame ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrameCount})`);
     }
-    this.onFrame(frame);
+    try {
+      this.onFrame(frame);
+    } catch (e) {
+      try { frame.close(); } catch { /* already closed */ }
+      this.log.error('onFrame callback threw', e);
+    }
   }
 }

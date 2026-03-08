@@ -77,10 +77,12 @@ function renderLoop(): void {
   for (const [streamId, frame] of pendingFrames) {
     const entry = streams.get(streamId);
     if (entry) {
-      const cmdBuf = entry.renderer.encodeFrame(frame);
-      if (cmdBuf) {
-        cmdBuffers.push(cmdBuf);
-      }
+      try {
+        const cmdBuf = entry.renderer.encodeFrame(frame);
+        if (cmdBuf) {
+          cmdBuffers.push(cmdBuf);
+        }
+      } catch { /* frame will still be closed below */ }
     }
     // Always close the frame after encoding (whether it succeeded or not)
     framesToClose.push(frame);
