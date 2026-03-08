@@ -59,10 +59,8 @@ export interface StreamInfo {
   active: boolean;
 }
 
-/** A pending access unit being accumulated from VCL NAL units */
+/** Metadata for a pending access unit being accumulated from VCL NAL units */
 interface PendingAccessUnit {
-  /** Buffer list — concatenated once at flush (avoids O(N²) interim concat) */
-  payloads: (Buffer | Uint8Array)[];
   /** Timestamp for this access unit */
   timestamp: bigint;
   /** Whether this AU contains a keyframe (IDR) */
@@ -130,8 +128,12 @@ interface ManagedStream {
   ppsNALU: Uint8Array | null;
   /** Map of clientId → video subscription for this stream */
   subscribers: Map<number, VideoSubscription>;
-  /** Pending access unit accumulator for VCL NAL units */
+  /** Pending access unit metadata (null = no pending AU) */
   pendingAU: PendingAccessUnit | null;
+  /** Reusable buffer for AU assembly — avoids per-frame concat allocation */
+  auBuffer: Buffer;
+  /** Current write position in auBuffer */
+  auFilled: number;
 }
 
 /** Client subscribe/unsubscribe message format */
@@ -223,6 +225,8 @@ export class StreamManager {
       ppsNALU: null,
       subscribers: new Map(),
       pendingAU: null,
+      auBuffer: Buffer.allocUnsafe(128 * 1024),
+      auFilled: 0,
     };
 
     this.streams.set(id, managed);
@@ -272,6 +276,7 @@ export class StreamManager {
     if (!managed) return;
 
     managed.pendingAU = null;
+    managed.auFilled = 0;
     managed.client.close();
 
     for (const [clientId] of managed.subscribers) {
@@ -587,12 +592,17 @@ export class StreamManager {
               ws.send(frame);
             }
           },
-          isBackpressured: () => ws.bufferedAmount > 1024 * 1024,
+          isBackpressured: () => ws.bufferedAmount > 256 * 1024,
         };
       }
 
       client.subscribedStreams.add(streamId);
       managed.subscribers.set(client.id, subscription);
+
+      // Resume FFmpeg stdout if this is the first subscriber
+      if (managed.subscribers.size === 1) {
+        managed.client.resume();
+      }
 
       const tag = client.type === 'webtransport' ? 'WT' : 'WS';
       console.log(
@@ -653,6 +663,12 @@ export class StreamManager {
     const managed = this.streams.get(streamId);
     if (managed) {
       managed.subscribers.delete(client.id);
+
+      // Pause FFmpeg stdout when last subscriber disconnects
+      if (managed.subscribers.size === 0) {
+        managed.client.pause();
+      }
+
       const tag = client.type === 'webtransport' ? 'WT' : 'WS';
       console.log(
         `[${tag}] Client ${client.id} unsubscribed from stream ${streamId} ` +
@@ -691,6 +707,10 @@ export class StreamManager {
       const managed = this.streams.get(streamId);
       if (managed) {
         managed.subscribers.delete(clientId);
+        // Pause FFmpeg stdout when last subscriber disconnects
+        if (managed.subscribers.size === 0) {
+          managed.client.pause();
+        }
       }
     }
     client.subscribedStreams.clear();
@@ -742,16 +762,36 @@ export class StreamManager {
     if (isFirstSliceInPicture(event.nalUnit)) {
       this.flushAccessUnit(managed);
       managed.pendingAU = {
-        payloads: [START_CODE, event.nalUnit],
         timestamp: event.timestamp,
         isKeyframe: event.isKeyframe,
       };
+      managed.auFilled = 0;
+      this.appendToAUBuffer(managed, event.nalUnit);
     } else if (managed.pendingAU) {
-      managed.pendingAU.payloads.push(START_CODE, event.nalUnit);
+      this.appendToAUBuffer(managed, event.nalUnit);
       if (event.isKeyframe) {
         managed.pendingAU.isKeyframe = true;
       }
     }
+  }
+
+  /**
+   * Append a NAL unit (with start code prefix) to the stream's AU buffer.
+   * Grows the buffer by doubling if needed.
+   */
+  private appendToAUBuffer(managed: ManagedStream, nalUnit: Uint8Array): void {
+    const needed = managed.auFilled + 4 + nalUnit.length;
+    if (needed > managed.auBuffer.length) {
+      const newBuf = Buffer.allocUnsafe(Math.max(managed.auBuffer.length * 2, needed));
+      if (managed.auFilled > 0) {
+        managed.auBuffer.copy(newBuf, 0, 0, managed.auFilled);
+      }
+      managed.auBuffer = newBuf;
+    }
+    managed.auBuffer.set(START_CODE, managed.auFilled);
+    managed.auFilled += 4;
+    managed.auBuffer.set(nalUnit, managed.auFilled);
+    managed.auFilled += nalUnit.length;
   }
 
   /**
@@ -763,14 +803,15 @@ export class StreamManager {
     const au = managed.pendingAU;
     managed.pendingAU = null;
 
-    if (!au || managed.subscribers.size === 0) return;
+    if (!au || managed.auFilled === 0 || managed.subscribers.size === 0) return;
 
     let flags = 0;
     if (au.isKeyframe) {
       flags |= FLAG_KEYFRAME;
     }
 
-    const payload = Buffer.concat(au.payloads);
+    // Use subarray view — buildFrame copies the payload into a new frame buffer
+    const payload = managed.auBuffer.subarray(0, managed.auFilled);
     const frame = buildFrame(managed.id, au.timestamp, flags, payload);
     this.sendToSubscribers(managed, frame, au.isKeyframe);
   }

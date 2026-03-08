@@ -265,8 +265,9 @@ function annexBToAvcc(annexB: Uint8Array): Uint8Array {
     offset += nalu.length;
   }
 
-  // Return a copy — EncodedVideoChunk takes ownership
-  return _avccBuf.slice(0, totalSize);
+  // Return a view — EncodedVideoChunk constructor copies the data internally
+  // (per WebCodecs spec), so the view is consumed before _avccBuf is reused.
+  return _avccBuf.subarray(0, totalSize);
 }
 
 /**
@@ -574,13 +575,15 @@ export class H264Demuxer {
       return null;
     }
 
-    // Only process VCL NAL units (actual picture data: slices).
-    // Non-VCL NALs like AUD (type 9) and SEI (type 6) must not be sent
-    // to the decoder as standalone EncodedVideoChunks — they are not
-    // complete access units and will cause decoder errors or distortion.
-    const nalType = extractNALType(frame.data);
-    if (nalType === null || !isVCLNAL(nalType)) {
-      return null;
+    // The bridge server already filters non-VCL NALs in handleNALU(),
+    // and config frames are handled by processConfig() before createChunk().
+    // Debug assertion only — skip the per-frame extractNALType+isVCLNAL cost.
+    if (import.meta.env.DEV) {
+      const nalType = extractNALType(frame.data);
+      if (nalType !== null && !isVCLNAL(nalType)) {
+        this.log.warn(`Non-VCL NAL type ${nalType} in createChunk`);
+        return null;
+      }
     }
 
     const type: EncodedVideoChunkType = frame.isKeyframe ? 'key' : 'delta';

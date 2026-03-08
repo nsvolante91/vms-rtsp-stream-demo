@@ -456,6 +456,42 @@ export class OffscreenRenderer {
   /** Per-RRDB uniform buffers (4 buffers, one per RRDB dispatch) */
   private genRRDBUniformBuffers: GPUBuffer[] = [];
 
+  // ── Cached compute bind groups (invalidated on texture resize) ──
+  /** TSR bind groups that reference only stable textures/buffers */
+  private tsrCachedBGs: {
+    meBG0: GPUBindGroup; meBG1: GPUBindGroup;
+    accumBG0: GPUBindGroup; accumBG1: GPUBindGroup;
+    sharpenBG0: GPUBindGroup;
+  } | null = null;
+  /** SPEC bind groups that reference only stable textures/buffers */
+  private specCachedBGs: {
+    dctFwdBG0: GPUBindGroup; dctFwdBG1: GPUBindGroup;
+    hallBG0: GPUBindGroup; hallBG1: GPUBindGroup;
+    idctBG0: GPUBindGroup;
+  } | null = null;
+  /** VQSR bind groups that reference only stable textures/buffers */
+  private vqsrCachedBGs: {
+    encBG0: GPUBindGroup; encBG1: GPUBindGroup;
+    lookBG0: GPUBindGroup; lookBG1: GPUBindGroup;
+    blndBG0: GPUBindGroup;
+  } | null = null;
+  /** GEN bind groups that reference only stable textures/buffers */
+  private genCachedBGs: {
+    feBG0: GPUBindGroup; feBG1: GPUBindGroup;
+    rrdbBGs: { bg0: GPUBindGroup; bg1: GPUBindGroup }[];
+    reconBG0: GPUBindGroup; reconBG1: GPUBindGroup;
+    blendBG0: GPUBindGroup;
+  } | null = null;
+  /** DLSS bind groups that reference only stable textures/buffers */
+  private dlssCachedBGs: {
+    motionBG0: GPUBindGroup; motionBG1: GPUBindGroup;
+    accumBG0: GPUBindGroup; accumBG1: GPUBindGroup;
+    spatialBG0: GPUBindGroup; spatialBG1: GPUBindGroup;
+    finalBG0: GPUBindGroup;
+  } | null = null;
+  /** A4K blit bind group (stable output texture) */
+  private a4kCachedBlitBG: GPUBindGroup | null = null;
+
   // ── DLSS temporal + spatial state ──────────────────────────
   private dlssPrevFrameTex: GPUTexture | null = null;
   private dlssAccumTex: GPUTexture | null = null;
@@ -840,6 +876,14 @@ export class OffscreenRenderer {
     this.lastIntermediateW = w;
     this.lastIntermediateH = h;
 
+    // Invalidate all compute bind group caches (they reference sourceCopyTex/intermediateA)
+    this.tsrCachedBGs = null;
+    this.specCachedBGs = null;
+    this.vqsrCachedBGs = null;
+    this.genCachedBGs = null;
+    this.dlssCachedBGs = null;
+    this.a4kCachedBlitBG = null;
+
     // Create identity-scale viewport buffer for copy pass
     if (!this.copyViewportBuffer) {
       this.copyViewportBuffer = device.createBuffer({
@@ -890,6 +934,7 @@ export class OffscreenRenderer {
     }
 
     this.tsrFrameCount = 0;
+    this.tsrCachedBGs = null;
   }
 
   /**
@@ -938,6 +983,7 @@ export class OffscreenRenderer {
     this.a4kInputW = cw;
     this.a4kInputH = ch;
     this.a4kCurrentMode = wantedMode;
+    this.a4kCachedBlitBG = null;
   }
 
   /**
@@ -994,14 +1040,18 @@ export class OffscreenRenderer {
     this.a4kPipeline.pass(commandEncoder);
 
     // Step 3: Blit library output (rgba16float) → canvas (rgba8unorm)
-    const outputTex = this.a4kPipeline.getOutputTexture();
-    const blitBindGroup = device.createBindGroup({
-      layout: blitPipeline.bindGroupLayout,
-      entries: [
-        { binding: 0, resource: sampler },
-        { binding: 1, resource: outputTex.createView() },
-      ],
-    });
+    // Cache the blit bind group — output texture is stable until pipeline recreation
+    if (!this.a4kCachedBlitBG) {
+      const outputTex = this.a4kPipeline.getOutputTexture();
+      this.a4kCachedBlitBG = device.createBindGroup({
+        layout: blitPipeline.bindGroupLayout,
+        entries: [
+          { binding: 0, resource: sampler },
+          { binding: 1, resource: outputTex.createView() },
+        ],
+      });
+    }
+    const blitBindGroup = this.a4kCachedBlitBG;
 
     const canvasTex = this.gpuContext.getCurrentTexture();
     const blitPass = commandEncoder.beginRenderPass({
@@ -1083,23 +1133,55 @@ export class OffscreenRenderer {
     const wgX = Math.ceil(cw / 8);
     const wgY = Math.ceil(ch / 8);
 
-    // Step 2: Motion estimation
-    const meBG0 = device.createBindGroup({
-      layout: tsr.motionEstimate.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.tsrUniformBuffer } },
-      ],
-    });
-    const meBG1 = device.createBindGroup({
-      layout: tsr.motionEstimate.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.prevFrameTex.createView() },
-        { binding: 1, resource: this.motionVecTex.createView() },
-      ],
-    });
+    // Cache stable bind groups (recreated only on texture resize)
+    if (!this.tsrCachedBGs) {
+      this.ensureIntermediateTextures(device, cw, ch);
+      if (!this.intermediateA) return null;
+      this.tsrCachedBGs = {
+        meBG0: device.createBindGroup({
+          layout: tsr.motionEstimate.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.tsrUniformBuffer } },
+          ],
+        }),
+        meBG1: device.createBindGroup({
+          layout: tsr.motionEstimate.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.prevFrameTex.createView() },
+            { binding: 1, resource: this.motionVecTex.createView() },
+          ],
+        }),
+        accumBG0: device.createBindGroup({
+          layout: tsr.accumulate.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.tsrUniformBuffer } },
+          ],
+        }),
+        accumBG1: device.createBindGroup({
+          layout: tsr.accumulate.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.motionVecTex.createView() },
+            { binding: 1, resource: this.accumTex.createView() },
+            { binding: 2, resource: this.intermediateA.createView() },
+          ],
+        }),
+        sharpenBG0: device.createBindGroup({
+          layout: tsr.sharpen.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.tsrUniformBuffer } },
+          ],
+        }),
+      };
+    }
+    const { meBG0, meBG1, accumBG0, accumBG1, sharpenBG0 } = this.tsrCachedBGs;
 
+    // Step 2: Motion estimation
     const mePass = commandEncoder.beginComputePass();
     mePass.setPipeline(tsr.motionEstimate);
     mePass.setBindGroup(0, meBG0);
@@ -1108,27 +1190,8 @@ export class OffscreenRenderer {
     mePass.end();
 
     // Step 3: Temporal accumulation
-    // We need a second accum texture to avoid read-write conflict.
-    // Use intermediateA as temp target, then copy back to accumTex after.
     this.ensureIntermediateTextures(device, cw, ch);
     if (!this.intermediateA) return null;
-
-    const accumBG0 = device.createBindGroup({
-      layout: tsr.accumulate.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.tsrUniformBuffer } },
-      ],
-    });
-    const accumBG1 = device.createBindGroup({
-      layout: tsr.accumulate.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.motionVecTex.createView() },
-        { binding: 1, resource: this.accumTex.createView() },
-        { binding: 2, resource: this.intermediateA.createView() }, // write to intermediateA as temp accum
-      ],
-    });
 
     const accumPass = commandEncoder.beginComputePass();
     accumPass.setPipeline(tsr.accumulate);
@@ -1144,20 +1207,12 @@ export class OffscreenRenderer {
       { width: cw, height: ch },
     );
 
-    // Step 4: RCAS sharpen → canvas
+    // Step 4: RCAS sharpen → canvas (sharpenBG1 references canvasTex — must be per-frame)
     const canvasTex = this.gpuContext.getCurrentTexture();
-    const sharpenBG0 = device.createBindGroup({
-      layout: tsr.sharpen.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.tsrUniformBuffer } },
-      ],
-    });
     const sharpenBG1 = device.createBindGroup({
       layout: tsr.sharpen.getBindGroupLayout(1),
       entries: [
-        { binding: 0, resource: this.intermediateA.createView() }, // accumulated result
+        { binding: 0, resource: this.intermediateA.createView() },
         { binding: 1, resource: canvasTex.createView() },
       ],
     });
@@ -1249,6 +1304,9 @@ export class OffscreenRenderer {
 
     this.lastFloat32W = w;
     this.lastFloat32H = h;
+    this.specCachedBGs = null;
+    this.vqsrCachedBGs = null;
+    this.genCachedBGs = null;
 
     if (!this.specVqsrGenUniformBuffer) {
       this.specVqsrGenUniformBuffer = device.createBuffer({
@@ -1328,22 +1386,51 @@ export class OffscreenRenderer {
     const wg8X = Math.ceil(cw / 8);
     const wg8Y = Math.ceil(ch / 8);
 
-    // Step 2: Forward DCT
-    const dctFwdBG0 = device.createBindGroup({
-      layout: spec.dctForward.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
-    const dctFwdBG1 = device.createBindGroup({
-      layout: spec.dctForward.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.dctCoeffTex.createView() },
-      ],
-    });
+    // Cache stable bind groups (recreated only on texture resize)
+    if (!this.specCachedBGs) {
+      this.specCachedBGs = {
+        dctFwdBG0: device.createBindGroup({
+          layout: spec.dctForward.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+        dctFwdBG1: device.createBindGroup({
+          layout: spec.dctForward.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.dctCoeffTex.createView() },
+          ],
+        }),
+        hallBG0: device.createBindGroup({
+          layout: spec.hallucinate.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+        hallBG1: device.createBindGroup({
+          layout: spec.hallucinate.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.dctCoeffTex.createView() },
+            { binding: 1, resource: this.dctFilledTex.createView() },
+          ],
+        }),
+        idctBG0: device.createBindGroup({
+          layout: spec.dctInverse.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+      };
+    }
+    const { dctFwdBG0, dctFwdBG1, hallBG0, hallBG1, idctBG0 } = this.specCachedBGs;
 
+    // Step 2: Forward DCT
     const dctFwdPass = commandEncoder.beginComputePass();
     dctFwdPass.setPipeline(spec.dctForward);
     dctFwdPass.setBindGroup(0, dctFwdBG0);
@@ -1352,22 +1439,6 @@ export class OffscreenRenderer {
     dctFwdPass.end();
 
     // Step 3: Hallucinate
-    const hallBG0 = device.createBindGroup({
-      layout: spec.hallucinate.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
-    const hallBG1 = device.createBindGroup({
-      layout: spec.hallucinate.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.dctCoeffTex.createView() },
-        { binding: 1, resource: this.dctFilledTex.createView() },
-      ],
-    });
-
     const hallPass = commandEncoder.beginComputePass();
     hallPass.setPipeline(spec.hallucinate);
     hallPass.setBindGroup(0, hallBG0);
@@ -1375,16 +1446,8 @@ export class OffscreenRenderer {
     hallPass.dispatchWorkgroups(wg8X, wg8Y);
     hallPass.end();
 
-    // Step 4: Inverse DCT + Blend → canvas
+    // Step 4: Inverse DCT + Blend → canvas (idctBG1 references canvasTex — must be per-frame)
     const canvasTex = this.gpuContext.getCurrentTexture();
-    const idctBG0 = device.createBindGroup({
-      layout: spec.dctInverse.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
     const idctBG1 = device.createBindGroup({
       layout: spec.dctInverse.getBindGroupLayout(1),
       entries: [
@@ -1466,22 +1529,51 @@ export class OffscreenRenderer {
     const wgFullX = Math.ceil(cw / 8);
     const wgFullY = Math.ceil(ch / 8);
 
-    // Step 2: Feature encoding (1/4 resolution)
-    const encBG0 = device.createBindGroup({
-      layout: vqsr.encode.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
-    const encBG1 = device.createBindGroup({
-      layout: vqsr.encode.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.featureTex.createView() },
-      ],
-    });
+    // Cache stable bind groups (recreated only on texture resize)
+    if (!this.vqsrCachedBGs) {
+      this.vqsrCachedBGs = {
+        encBG0: device.createBindGroup({
+          layout: vqsr.encode.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+        encBG1: device.createBindGroup({
+          layout: vqsr.encode.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.featureTex.createView() },
+          ],
+        }),
+        lookBG0: device.createBindGroup({
+          layout: vqsr.lookup.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+        lookBG1: device.createBindGroup({
+          layout: vqsr.lookup.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.featureTex.createView() },
+            { binding: 1, resource: this.detailTex.createView() },
+          ],
+        }),
+        blndBG0: device.createBindGroup({
+          layout: vqsr.blend.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+      };
+    }
+    const { encBG0, encBG1, lookBG0, lookBG1, blndBG0 } = this.vqsrCachedBGs;
 
+    // Step 2: Feature encoding (1/4 resolution)
     const encPass = commandEncoder.beginComputePass();
     encPass.setPipeline(vqsr.encode);
     encPass.setBindGroup(0, encBG0);
@@ -1490,22 +1582,6 @@ export class OffscreenRenderer {
     encPass.end();
 
     // Step 3: Codebook lookup (1/4 resolution)
-    const lookBG0 = device.createBindGroup({
-      layout: vqsr.lookup.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
-    const lookBG1 = device.createBindGroup({
-      layout: vqsr.lookup.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.featureTex.createView() },
-        { binding: 1, resource: this.detailTex.createView() },
-      ],
-    });
-
     const lookPass = commandEncoder.beginComputePass();
     lookPass.setPipeline(vqsr.lookup);
     lookPass.setBindGroup(0, lookBG0);
@@ -1513,16 +1589,8 @@ export class OffscreenRenderer {
     lookPass.dispatchWorkgroups(wgEncX, wgEncY);
     lookPass.end();
 
-    // Step 4: Edge-aware blend → canvas
+    // Step 4: Edge-aware blend → canvas (blndBG1 references canvasTex — must be per-frame)
     const canvasTex = this.gpuContext.getCurrentTexture();
-    const blndBG0 = device.createBindGroup({
-      layout: vqsr.blend.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
     const blndBG1 = device.createBindGroup({
       layout: vqsr.blend.getBindGroupLayout(1),
       entries: [
@@ -1604,23 +1672,86 @@ export class OffscreenRenderer {
     this.specVqsrGenUniformData[7] = 0.0;
     device.queue.writeBuffer(this.specVqsrGenUniformBuffer, 0, this.specVqsrGenUniformData);
 
-    const feBG0 = device.createBindGroup({
-      layout: gen.featureExtract.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
-    const feBG1 = device.createBindGroup({
-      layout: gen.featureExtract.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.genFeatA[0].createView() },
-        { binding: 1, resource: this.genFeatA[1].createView() },
-        { binding: 2, resource: this.genFeatA[2].createView() },
-        { binding: 3, resource: this.genFeatA[3].createView() },
-      ],
-    });
+    // Cache stable bind groups (recreated only on texture resize)
+    if (!this.genCachedBGs) {
+      const rrdbBGs: { bg0: GPUBindGroup; bg1: GPUBindGroup }[] = [];
+      for (let rrdbIdx = 0; rrdbIdx < 4; rrdbIdx++) {
+        const inSet = rrdbIdx % 2 === 0 ? this.genFeatA : this.genFeatB;
+        const outSet = rrdbIdx % 2 === 0 ? this.genFeatB : this.genFeatA;
+        const rrdbUB = this.genRRDBUniformBuffers[rrdbIdx];
+        rrdbBGs.push({
+          bg0: device.createBindGroup({
+            layout: gen.rrdb.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: this.sourceCopyTex.createView() },
+              { binding: 1, resource: sampler },
+              { binding: 2, resource: { buffer: rrdbUB } },
+            ],
+          }),
+          bg1: device.createBindGroup({
+            layout: gen.rrdb.getBindGroupLayout(1),
+            entries: [
+              { binding: 0, resource: inSet[0].createView() },
+              { binding: 1, resource: inSet[1].createView() },
+              { binding: 2, resource: inSet[2].createView() },
+              { binding: 3, resource: inSet[3].createView() },
+              { binding: 4, resource: outSet[0].createView() },
+              { binding: 5, resource: outSet[1].createView() },
+              { binding: 6, resource: outSet[2].createView() },
+              { binding: 7, resource: outSet[3].createView() },
+            ],
+          }),
+        });
+      }
+      const finalFeat = this.genFeatA;
+      this.genCachedBGs = {
+        feBG0: device.createBindGroup({
+          layout: gen.featureExtract.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+        feBG1: device.createBindGroup({
+          layout: gen.featureExtract.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.genFeatA[0].createView() },
+            { binding: 1, resource: this.genFeatA[1].createView() },
+            { binding: 2, resource: this.genFeatA[2].createView() },
+            { binding: 3, resource: this.genFeatA[3].createView() },
+          ],
+        }),
+        rrdbBGs,
+        reconBG0: device.createBindGroup({
+          layout: gen.reconstruct.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+        reconBG1: device.createBindGroup({
+          layout: gen.reconstruct.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: finalFeat[0].createView() },
+            { binding: 1, resource: finalFeat[1].createView() },
+            { binding: 2, resource: finalFeat[2].createView() },
+            { binding: 3, resource: finalFeat[3].createView() },
+            { binding: 4, resource: this.genResidualTex.createView() },
+          ],
+        }),
+        blendBG0: device.createBindGroup({
+          layout: gen.blend.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
+          ],
+        }),
+      };
+    }
+    const { feBG0, feBG1, rrdbBGs, reconBG0, reconBG1, blendBG0 } = this.genCachedBGs;
 
     const fePass = commandEncoder.beginComputePass();
     fePass.setPipeline(gen.featureExtract);
@@ -1631,67 +1762,21 @@ export class OffscreenRenderer {
 
     // Dispatches 2-5: 4× RRDB blocks, ping-pong between A↔B
     for (let rrdbIdx = 0; rrdbIdx < 4; rrdbIdx++) {
-      const inSet = rrdbIdx % 2 === 0 ? this.genFeatA : this.genFeatB;
-      const outSet = rrdbIdx % 2 === 0 ? this.genFeatB : this.genFeatA;
-
       // Write to per-RRDB uniform buffer so each dispatch sees its own rrdbIndex
       this.specVqsrGenUniformData[6] = rrdbIdx;
       const rrdbUB = this.genRRDBUniformBuffers[rrdbIdx];
       device.queue.writeBuffer(rrdbUB, 0, this.specVqsrGenUniformData);
 
-      const rrdbBG0 = device.createBindGroup({
-        layout: gen.rrdb.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: this.sourceCopyTex.createView() },
-          { binding: 1, resource: sampler },
-          { binding: 2, resource: { buffer: rrdbUB } },
-        ],
-      });
-      const rrdbBG1 = device.createBindGroup({
-        layout: gen.rrdb.getBindGroupLayout(1),
-        entries: [
-          { binding: 0, resource: inSet[0].createView() },
-          { binding: 1, resource: inSet[1].createView() },
-          { binding: 2, resource: inSet[2].createView() },
-          { binding: 3, resource: inSet[3].createView() },
-          { binding: 4, resource: outSet[0].createView() },
-          { binding: 5, resource: outSet[1].createView() },
-          { binding: 6, resource: outSet[2].createView() },
-          { binding: 7, resource: outSet[3].createView() },
-        ],
-      });
-
+      const { bg0, bg1 } = rrdbBGs[rrdbIdx];
       const rrdbPass = commandEncoder.beginComputePass();
       rrdbPass.setPipeline(gen.rrdb);
-      rrdbPass.setBindGroup(0, rrdbBG0);
-      rrdbPass.setBindGroup(1, rrdbBG1);
+      rrdbPass.setBindGroup(0, bg0);
+      rrdbPass.setBindGroup(1, bg1);
       rrdbPass.dispatchWorkgroups(wg16X, wg16Y);
       rrdbPass.end();
     }
 
-    // Final features are in genFeatA (after 4 ping-pongs: 0→B, 1→A, 2→B, 3→A)
-    const finalFeat = this.genFeatA;
-
     // Dispatch 6: Reconstruct 16ch → RGB residual
-    const reconBG0 = device.createBindGroup({
-      layout: gen.reconstruct.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
-    const reconBG1 = device.createBindGroup({
-      layout: gen.reconstruct.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: finalFeat[0].createView() },
-        { binding: 1, resource: finalFeat[1].createView() },
-        { binding: 2, resource: finalFeat[2].createView() },
-        { binding: 3, resource: finalFeat[3].createView() },
-        { binding: 4, resource: this.genResidualTex.createView() },
-      ],
-    });
-
     const reconPass = commandEncoder.beginComputePass();
     reconPass.setPipeline(gen.reconstruct);
     reconPass.setBindGroup(0, reconBG0);
@@ -1699,16 +1784,8 @@ export class OffscreenRenderer {
     reconPass.dispatchWorkgroups(wg16X, wg16Y);
     reconPass.end();
 
-    // Dispatch 7: Blend residual + source → canvas
+    // Dispatch 7: Blend residual + source → canvas (blendBG1 references canvasTex — must be per-frame)
     const canvasTex = this.gpuContext.getCurrentTexture();
-    const blendBG0 = device.createBindGroup({
-      layout: gen.blend.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.specVqsrGenUniformBuffer } },
-      ],
-    });
     const blendBG1 = device.createBindGroup({
       layout: gen.blend.getBindGroupLayout(1),
       entries: [
@@ -1793,6 +1870,7 @@ export class OffscreenRenderer {
     this.lastDlssW = w;
     this.lastDlssH = h;
     this.dlssFrameCount = 0;
+    this.dlssCachedBGs = null;
   }
 
   // ── DLSS Compute Encode ─────────────────────────────────────
@@ -1861,24 +1939,71 @@ export class OffscreenRenderer {
     const wgX = Math.ceil(cw / 8);
     const wgY = Math.ceil(ch / 8);
 
-    // Step 2: Motion estimation + depth hints
-    const motionBG0 = device.createBindGroup({
-      layout: dlss.motionDepth.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
-      ],
-    });
-    const motionBG1 = device.createBindGroup({
-      layout: dlss.motionDepth.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.dlssPrevFrameTex.createView() },
-        { binding: 1, resource: this.dlssMotionVecTex.createView() },
-        { binding: 2, resource: this.dlssDepthHintsTex.createView() },
-      ],
-    });
+    // Cache stable bind groups (recreated only on texture resize)
+    if (!this.dlssCachedBGs) {
+      this.dlssCachedBGs = {
+        motionBG0: device.createBindGroup({
+          layout: dlss.motionDepth.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
+          ],
+        }),
+        motionBG1: device.createBindGroup({
+          layout: dlss.motionDepth.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.dlssPrevFrameTex.createView() },
+            { binding: 1, resource: this.dlssMotionVecTex.createView() },
+            { binding: 2, resource: this.dlssDepthHintsTex.createView() },
+          ],
+        }),
+        accumBG0: device.createBindGroup({
+          layout: dlss.temporalAccum.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
+          ],
+        }),
+        accumBG1: device.createBindGroup({
+          layout: dlss.temporalAccum.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.dlssMotionVecTex.createView() },
+            { binding: 1, resource: this.dlssDepthHintsTex.createView() },
+            { binding: 2, resource: this.dlssAccumTex.createView() },
+            { binding: 3, resource: this.dlssAccumOutTex.createView() },
+          ],
+        }),
+        spatialBG0: device.createBindGroup({
+          layout: dlss.spatialEnhance.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
+          ],
+        }),
+        spatialBG1: device.createBindGroup({
+          layout: dlss.spatialEnhance.getBindGroupLayout(1),
+          entries: [
+            { binding: 0, resource: this.dlssAccumOutTex.createView() },
+            { binding: 1, resource: this.dlssDepthHintsTex.createView() },
+            { binding: 2, resource: this.dlssEnhancedTex.createView() },
+          ],
+        }),
+        finalBG0: device.createBindGroup({
+          layout: dlss.finalReconstruct.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: this.sourceCopyTex.createView() },
+            { binding: 1, resource: sampler },
+            { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
+          ],
+        }),
+      };
+    }
+    const { motionBG0, motionBG1, accumBG0, accumBG1, spatialBG0, spatialBG1, finalBG0 } = this.dlssCachedBGs;
 
+    // Step 2: Motion estimation + depth hints
     const motionPass = commandEncoder.beginComputePass();
     motionPass.setPipeline(dlss.motionDepth);
     motionPass.setBindGroup(0, motionBG0);
@@ -1887,24 +2012,6 @@ export class OffscreenRenderer {
     motionPass.end();
 
     // Step 3: Temporal accumulation
-    const accumBG0 = device.createBindGroup({
-      layout: dlss.temporalAccum.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
-      ],
-    });
-    const accumBG1 = device.createBindGroup({
-      layout: dlss.temporalAccum.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.dlssMotionVecTex.createView() },
-        { binding: 1, resource: this.dlssDepthHintsTex.createView() },
-        { binding: 2, resource: this.dlssAccumTex.createView() },
-        { binding: 3, resource: this.dlssAccumOutTex.createView() },
-      ],
-    });
-
     const accumPass = commandEncoder.beginComputePass();
     accumPass.setPipeline(dlss.temporalAccum);
     accumPass.setBindGroup(0, accumBG0);
@@ -1920,23 +2027,6 @@ export class OffscreenRenderer {
     );
 
     // Step 4: Spatial enhancement
-    const spatialBG0 = device.createBindGroup({
-      layout: dlss.spatialEnhance.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
-      ],
-    });
-    const spatialBG1 = device.createBindGroup({
-      layout: dlss.spatialEnhance.getBindGroupLayout(1),
-      entries: [
-        { binding: 0, resource: this.dlssAccumOutTex.createView() },
-        { binding: 1, resource: this.dlssDepthHintsTex.createView() },
-        { binding: 2, resource: this.dlssEnhancedTex.createView() },
-      ],
-    });
-
     const spatialPass = commandEncoder.beginComputePass();
     spatialPass.setPipeline(dlss.spatialEnhance);
     spatialPass.setBindGroup(0, spatialBG0);
@@ -1944,16 +2034,8 @@ export class OffscreenRenderer {
     spatialPass.dispatchWorkgroups(wgX, wgY);
     spatialPass.end();
 
-    // Step 5: Final reconstruction → canvas
+    // Step 5: Final reconstruction → canvas (finalBG1 references canvasTex — must be per-frame)
     const canvasTex = this.gpuContext.getCurrentTexture();
-    const finalBG0 = device.createBindGroup({
-      layout: dlss.finalReconstruct.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sourceCopyTex.createView() },
-        { binding: 1, resource: sampler },
-        { binding: 2, resource: { buffer: this.dlssUniformBuffer } },
-      ],
-    });
     const finalBG1 = device.createBindGroup({
       layout: dlss.finalReconstruct.getBindGroupLayout(1),
       entries: [
@@ -2008,6 +2090,14 @@ export class OffscreenRenderer {
       this.gpuContext = null;
     }
     this.bindGroupDesc = null;
+
+    // Clear cached compute bind groups
+    this.tsrCachedBGs = null;
+    this.specCachedBGs = null;
+    this.vqsrCachedBGs = null;
+    this.genCachedBGs = null;
+    this.dlssCachedBGs = null;
+    this.a4kCachedBlitBG = null;
 
     // Destroy intermediate textures
     this.sourceCopyTex?.destroy();

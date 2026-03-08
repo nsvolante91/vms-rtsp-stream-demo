@@ -64,7 +64,10 @@ export interface RTSPClientEvents {
  */
 export class RTSPClient extends EventEmitter {
   private ffmpeg: ChildProcess | null = null;
-  private buffer: Buffer = Buffer.alloc(0);
+  /** Pre-allocated accumulation buffer — grows by doubling, never shrinks */
+  private buffer: Buffer = Buffer.allocUnsafe(256 * 1024);
+  /** Number of valid bytes in the accumulation buffer */
+  private bufferFilled = 0;
   private running = false;
   private frameCount = 0;
   private startTime = 0n;
@@ -117,7 +120,7 @@ export class RTSPClient extends EventEmitter {
     this.running = true;
     this.frameCount = 0;
     this.startTime = process.hrtime.bigint();
-    this.buffer = Buffer.alloc(0);
+    this.bufferFilled = 0;
 
     // Start auth proxy to work around FFmpeg 8.x SHA-256 Digest auth bug
     const { host, port: rtspPort } = parseRtspUrl(this.rtspUrl);
@@ -207,6 +210,25 @@ export class RTSPClient extends EventEmitter {
   }
 
   /**
+   * Pause FFmpeg stdout to stop data flow when no subscribers need it.
+   * Prevents unbounded memory growth when streams have no active viewers.
+   */
+  pause(): void {
+    if (this.ffmpeg?.stdout && !this.ffmpeg.stdout.isPaused()) {
+      this.ffmpeg.stdout.pause();
+    }
+  }
+
+  /**
+   * Resume FFmpeg stdout when subscribers become available.
+   */
+  resume(): void {
+    if (this.ffmpeg?.stdout?.isPaused()) {
+      this.ffmpeg.stdout.resume();
+    }
+  }
+
+  /**
    * Close the connection and kill the FFmpeg process.
    *
    * Sends SIGTERM to the FFmpeg process for graceful shutdown.
@@ -256,14 +278,26 @@ export class RTSPClient extends EventEmitter {
    * @param chunk - Raw bytes from FFmpeg stdout
    */
   private onData(chunk: Buffer): void {
-    // Append new data to buffer
-    this.buffer = Buffer.concat([this.buffer, chunk]);
+    // Grow buffer if needed (doubling strategy)
+    const needed = this.bufferFilled + chunk.length;
+    if (needed > this.buffer.length) {
+      const newSize = Math.max(this.buffer.length * 2, needed);
+      const newBuf = Buffer.allocUnsafe(newSize);
+      if (this.bufferFilled > 0) {
+        this.buffer.copy(newBuf, 0, 0, this.bufferFilled);
+      }
+      this.buffer = newBuf;
+    }
+
+    // Append without allocation — copy directly into pre-allocated buffer
+    chunk.copy(this.buffer, this.bufferFilled);
+    this.bufferFilled += chunk.length;
 
     // Find all NAL units in the current buffer
     const data = new Uint8Array(
       this.buffer.buffer,
       this.buffer.byteOffset,
-      this.buffer.length
+      this.bufferFilled
     );
     const nalUnits = findNALUnits(data);
 
@@ -280,20 +314,27 @@ export class RTSPClient extends EventEmitter {
     // Emit all NAL units except possibly the last one (which may be incomplete)
     // We can tell a NAL unit is complete if there's a start code after it
     const completeCount =
-      lastNALUEnd < this.buffer.length ? nalUnits.length : nalUnits.length - 1;
+      lastNALUEnd < this.bufferFilled ? nalUnits.length : nalUnits.length - 1;
 
     for (let i = 0; i < completeCount; i++) {
       const nalu = nalUnits[i];
       this.emitNALU(nalu.data, nalu.type);
     }
 
-    // Keep remaining data in buffer
+    // Compact remaining data to front of buffer (no allocation)
     if (completeCount > 0 && completeCount < nalUnits.length) {
       // Keep from the last NAL unit's start code position onward
-      this.buffer = Buffer.from(this.buffer.subarray(lastNALU.offset));
+      const keepFrom = lastNALU.offset;
+      const remaining = this.bufferFilled - keepFrom;
+      this.buffer.copyWithin(0, keepFrom, this.bufferFilled);
+      this.bufferFilled = remaining;
     } else if (completeCount === nalUnits.length) {
       // All NAL units were complete; keep any trailing data after the last one
-      this.buffer = Buffer.from(this.buffer.subarray(lastNALUEnd));
+      const remaining = this.bufferFilled - lastNALUEnd;
+      if (remaining > 0) {
+        this.buffer.copyWithin(0, lastNALUEnd, this.bufferFilled);
+      }
+      this.bufferFilled = remaining;
     }
     // If completeCount === 0, keep the entire buffer
   }
@@ -317,14 +358,14 @@ export class RTSPClient extends EventEmitter {
    * Called when the FFmpeg process exits to ensure no data is lost.
    */
   private flushBuffer(): void {
-    if (this.buffer.length === 0) {
+    if (this.bufferFilled === 0) {
       return;
     }
 
     const data = new Uint8Array(
       this.buffer.buffer,
       this.buffer.byteOffset,
-      this.buffer.length
+      this.bufferFilled
     );
     const nalUnits = findNALUnits(data);
 
@@ -332,7 +373,7 @@ export class RTSPClient extends EventEmitter {
       this.emitNALU(nalu.data, nalu.type);
     }
 
-    this.buffer = Buffer.alloc(0);
+    this.bufferFilled = 0;
   }
 
   /**
