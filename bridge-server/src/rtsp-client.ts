@@ -388,15 +388,20 @@ export async function probeRTSPStream(
   rtspUrl: string,
   timeoutMs = 5000
 ): Promise<boolean> {
-  // Start auth proxy to work around FFmpeg 8.x SHA-256 Digest auth bug
+  // Skip auth proxy for localhost — MediaMTX has no auth and the proxy
+  // adds a potential failure point during discovery probes.
+  const { host, port: rtspPort } = parseRtspUrl(rtspUrl);
+  const isLocalhost = host === 'localhost' || host === '127.0.0.1';
+
   let proxy: RtspAuthProxy | null = null;
   let proxiedUrl = rtspUrl;
-  try {
-    const { host, port: rtspPort } = parseRtspUrl(rtspUrl);
-    proxy = await createRtspAuthProxy(host, rtspPort);
-    proxiedUrl = proxy.rewriteUrl(rtspUrl);
-  } catch {
-    // If proxy fails to start, try direct connection
+  if (!isLocalhost) {
+    try {
+      proxy = await createRtspAuthProxy(host, rtspPort);
+      proxiedUrl = proxy.rewriteUrl(rtspUrl);
+    } catch {
+      // If proxy fails to start, try direct connection
+    }
   }
 
   return new Promise<boolean>((resolve) => {
