@@ -19,6 +19,7 @@
  */
 export class Controls {
   private cpuHogInterval: number | null = null;
+  private secondaryVisible = false;
 
   /**
    * Create a new Controls instance.
@@ -134,21 +135,46 @@ export class Controls {
       });
     }
 
-    // Keyboard shortcut: 'D' toggles dashboard
+    // "More" toggle for secondary controls on mobile
+    const moreBtn = document.getElementById('btn-more');
+    if (moreBtn) {
+      moreBtn.addEventListener('click', () => {
+        this.secondaryVisible = !this.secondaryVisible;
+        const secondary = document.querySelector('.control-secondary');
+        if (secondary) {
+          secondary.classList.toggle('visible', this.secondaryVisible);
+        }
+        moreBtn.textContent = this.secondaryVisible ? 'Less ▴' : 'More ▾';
+      });
+    }
+
+    // Fullscreen toggle button
+    const fullscreenBtn = document.getElementById('btn-fullscreen');
+    if (fullscreenBtn) {
+      fullscreenBtn.addEventListener('click', () => {
+        if (document.fullscreenElement) {
+          document.exitFullscreen();
+        } else {
+          document.documentElement.requestFullscreen().catch(() => {
+            // Fullscreen not supported or denied
+          });
+        }
+      });
+
+      document.addEventListener('fullscreenchange', () => {
+        fullscreenBtn.textContent = document.fullscreenElement ? '⛶' : '⛶';
+        fullscreenBtn.title = document.fullscreenElement ? 'Exit fullscreen' : 'Toggle fullscreen';
+      });
+    }
+
+    // Keyboard shortcuts
     document.addEventListener('keydown', (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
       if (e.key === 'd' || e.key === 'D') {
-        // Ignore if user is typing in an input element
-        const target = e.target as HTMLElement;
-        if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
-          return;
-        }
         this.onToggleDashboard();
-      }
-      if (e.key === 'm' || e.key === 'M') {
-        const target = e.target as HTMLElement;
-        if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
-          return;
-        }
+      } else if (e.key === 'm' || e.key === 'M') {
         const btn = document.getElementById('btn-metrics-overlay');
         btn?.classList.toggle('active');
         this.onToggleMetricsOverlay?.();

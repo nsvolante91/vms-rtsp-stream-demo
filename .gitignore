@@ -3,5 +3,6 @@ dist/
 test-videos/
 .stream-pids
 .certs/
+.env
 *.log
 .DS_Store

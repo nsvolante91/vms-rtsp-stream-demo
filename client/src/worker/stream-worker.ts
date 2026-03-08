@@ -35,7 +35,7 @@ let receiver: StreamReceiver | null = null;
 let workerGPU: WorkerGPU | null = null;
 
 interface StreamEntry {
-  pipeline: StreamPipeline;
+  pipeline: StreamPipeline | null;
   renderer: OffscreenRenderer;
 }
 
@@ -202,7 +202,7 @@ function startMetricsReporter(): void {
     const updates: StreamMetricsUpdate[] = [];
     for (const [streamId, entry] of streams) {
       // Skip companion renderers — they have no decode pipeline
-      if (companionSet.has(streamId)) continue;
+      if (companionSet.has(streamId) || !entry.pipeline) continue;
       const m = entry.pipeline.metrics;
       const prev = lastDecodedFrames.get(streamId) ?? 0;
       const fps = m.decodedFrames - prev;
@@ -241,11 +241,11 @@ function stopMetricsReporter(): void {
 
 // ─── Message Handlers ──────────────────────────────────────────
 
-async function handleInit(wtUrl: string, certHashUrl: string): Promise<void> {
+async function handleInit(wtUrl: string, certHashUrl: string, gpuPowerPreference?: GPUPowerPreference): Promise<void> {
   log.info('Initializing worker pipeline...');
 
   // 1. WebGPU
-  workerGPU = await initWorkerGPU(handleDeviceLost);
+  workerGPU = await initWorkerGPU(handleDeviceLost, gpuPowerPreference);
   if (workerGPU) {
     log.info('WorkerGPU initialized');
   } else {
@@ -326,7 +326,7 @@ function handleRemoveStream(streamId: number): void {
     handleRemoveCompanion(companionId);
   }
 
-  entry.pipeline.stop();
+  entry.pipeline?.stop();
   entry.renderer.destroy();
   streams.delete(streamId);
   lastDecodedFrames.delete(streamId);
@@ -357,7 +357,7 @@ function handleShutdown(): void {
   pendingFrames.clear();
   for (const [streamId, entry] of streams) {
     if (!companionSet.has(streamId)) {
-      entry.pipeline.stop();
+      entry.pipeline?.stop();
     }
     entry.renderer.destroy();
     log.info(`Stream ${streamId} cleaned up`);
@@ -378,7 +378,7 @@ self.onmessage = (e: MessageEvent<MainToWorkerMessage>) => {
 
   switch (msg.type) {
     case 'init':
-      handleInit(msg.wtUrl, msg.certHashUrl).catch((err) => {
+      handleInit(msg.wtUrl, msg.certHashUrl, msg.gpuPowerPreference).catch((err) => {
         log.error('Init failed', err);
         postMsg({ type: 'error', message: `Init failed: ${err}` });
       });
@@ -478,7 +478,7 @@ function handleAddCompanion(
 
   // Companion has no pipeline — it receives cloned frames via queueFrame
   // Store with a null pipeline sentinel
-  streams.set(companionStreamId, { pipeline: null as unknown as StreamPipeline, renderer });
+  streams.set(companionStreamId, { pipeline: null, renderer });
   companionMap.set(primaryStreamId, companionStreamId);
   companionSet.add(companionStreamId);
   log.info(`Companion ${companionStreamId} added for primary ${primaryStreamId} (${width}x${height})`);

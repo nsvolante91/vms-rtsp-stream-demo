@@ -107,14 +107,15 @@ const UNIFORM_BUFFER_SIZE = 48;
  * @returns WorkerGPU resources, or null if WebGPU is unavailable
  */
 export async function initWorkerGPU(
-  onDeviceLost?: (info: GPUDeviceLostInfo) => void
+  onDeviceLost?: (info: GPUDeviceLostInfo) => void,
+  gpuPowerPreference?: GPUPowerPreference
 ): Promise<WorkerGPU | null> {
   if (typeof navigator === 'undefined' || !navigator.gpu) {
     return null;
   }
 
   const adapter = await navigator.gpu.requestAdapter({
-    powerPreference: 'high-performance',
+    powerPreference: gpuPowerPreference ?? 'high-performance',
   });
   if (!adapter) {
     return null;

@@ -28,6 +28,8 @@ export interface SharedGPU {
   pipeline: GPURenderPipeline;
   /** Linear-filtering sampler (shared across tiles) */
   sampler: GPUSampler;
+  /** Cached bind group layout from the pipeline */
+  bindGroupLayout: GPUBindGroupLayout;
 }
 
 /**
@@ -82,7 +84,9 @@ export async function initSharedGPU(): Promise<SharedGPU | null> {
     console.error(`[SharedGPU] Device lost: ${info.reason}`, info.message);
   });
 
-  return { device, format, shaderModule, pipeline, sampler };
+  const bindGroupLayout = pipeline.getBindGroupLayout(0);
+
+  return { device, format, shaderModule, pipeline, sampler, bindGroupLayout };
 }
 
 /**
@@ -136,6 +140,14 @@ export class StreamTile {
   private readonly pauseBtn: HTMLDivElement;
   private readonly pausedOverlay: HTMLDivElement;
   private _escHandler: ((e: KeyboardEvent) => void) | null = null;
+
+  // ── Double-tap detection (touch) ───────────────────────────
+  private _lastTapTime = 0;
+  private _lastTapX = 0;
+  private _lastTapY = 0;
+
+  // ── DPR cap for mobile ─────────────────────────────────────
+  private _maxDPR = 0; // 0 = no cap
 
   // ── Comparison mode ───────────────────────────────────────────
   private _comparisonLabel: string | null = null;
@@ -199,11 +211,12 @@ export class StreamTile {
     });
     this.element.appendChild(this.resetZoomBtn);
 
-    // ── Zoom drag handlers ───────────────────────────────────
-    this.element.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-    this.element.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-    this.element.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-    this.element.addEventListener('mouseleave', () => this.cancelDrag());
+    // ── Zoom drag handlers (Pointer Events — unifies mouse + touch + stylus) ──
+    this.element.addEventListener('pointerdown', (e) => this.handlePointerDown(e));
+    this.element.addEventListener('pointermove', (e) => this.handlePointerMove(e));
+    this.element.addEventListener('pointerup', (e) => this.handlePointerUp(e));
+    this.element.addEventListener('pointercancel', () => this.cancelDrag());
+    this.element.addEventListener('pointerleave', () => this.cancelDrag());
     this.element.addEventListener('dblclick', (e) => {
       e.stopPropagation();
       if (this._zoomCrop) {
@@ -222,7 +235,10 @@ export class StreamTile {
     // Keep canvas backing store matched to CSS display size
     this.resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        const dpr = window.devicePixelRatio || 1;
+        let dpr = window.devicePixelRatio || 1;
+        if (this._maxDPR > 0 && dpr > this._maxDPR) {
+          dpr = this._maxDPR;
+        }
         const w = entry.contentRect.width;
         const h = entry.contentRect.height;
         if (w > 0 && h > 0) {
@@ -329,7 +345,7 @@ export class StreamTile {
    * ratio changes to maintain square pixel aspect ratio (letterbox/pillarbox).
    */
   private drawFrameGPU(frame: VideoFrame): void {
-    const { device, pipeline, sampler } = this.gpu!;
+    const { device, pipeline, sampler, bindGroupLayout } = this.gpu!;
 
     try {
       // Update viewport uniform for aspect-ratio-correct rendering
@@ -363,7 +379,7 @@ export class StreamTile {
       });
 
       const bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
+        layout: bindGroupLayout,
         entries: [
           { binding: 0, resource: sampler },
           { binding: 1, resource: externalTexture },
@@ -460,7 +476,10 @@ export class StreamTile {
     if (this._transferred) {
       throw new Error(`Tile ${this.streamId}: canvas already transferred`);
     }
-    const dpr = window.devicePixelRatio || 1;
+    let dpr = window.devicePixelRatio || 1;
+    if (this._maxDPR > 0 && dpr > this._maxDPR) {
+      dpr = this._maxDPR;
+    }
     const rect = this.canvas.getBoundingClientRect();
     const width = Math.round(rect.width * dpr) || 640;
     const height = Math.round(rect.height * dpr) || 360;
@@ -498,13 +517,24 @@ export class StreamTile {
     return this._dragMoved;
   }
 
-  // ── Zoom drag interaction ──────────────────────────────────
+  /** Set maximum DPR cap for ResizeObserver (0 = no cap). */
+  setMaxDPR(maxDPR: number): void {
+    this._maxDPR = maxDPR;
+  }
 
-  private handleMouseDown(e: MouseEvent): void {
-    // Only left button, ignore if clicking on buttons
+  // ── Zoom drag interaction (Pointer Events) ──────────────────
+
+  private handlePointerDown(e: PointerEvent): void {
+    // Only left button / primary touch, ignore if clicking on buttons
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (target.closest('.tile-pause-btn') || target.closest('.tile-reset-zoom') || target.closest('.stream-label')) return;
+
+    // Capture pointer so drag works even if finger leaves the tile
+    this.element.setPointerCapture(e.pointerId);
+
+    // Prevent browser scroll/zoom during drag
+    this.element.style.touchAction = 'none';
 
     this._isDragging = true;
     this._dragMoved = false;
@@ -515,7 +545,7 @@ export class StreamTile {
     this.selectionOverlay.style.display = 'none';
   }
 
-  private handleMouseMove(e: MouseEvent): void {
+  private handlePointerMove(e: PointerEvent): void {
     if (!this._isDragging) return;
 
     const rect = this.element.getBoundingClientRect();
@@ -525,8 +555,9 @@ export class StreamTile {
     const dx = Math.abs(currentX - this._dragStartX);
     const dy = Math.abs(currentY - this._dragStartY);
 
-    // Require minimum 5px movement to distinguish from click
-    if (dx < 5 && dy < 5) return;
+    // Touch fingers jitter more than mouse; use a higher threshold
+    const threshold = e.pointerType === 'touch' ? 15 : 5;
+    if (dx < threshold && dy < threshold) return;
     this._dragMoved = true;
 
     const left = Math.min(this._dragStartX, currentX);
@@ -541,12 +572,33 @@ export class StreamTile {
     this.selectionOverlay.style.height = `${height}px`;
   }
 
-  private handleMouseUp(e: MouseEvent): void {
+  private handlePointerUp(e: PointerEvent): void {
     if (!this._isDragging) return;
     this._isDragging = false;
     this.selectionOverlay.style.display = 'none';
 
-    if (!this._dragMoved) return; // Was just a click, not a drag
+    // Restore touch-action
+    this.element.style.touchAction = 'manipulation';
+
+    // Double-tap detection for touch (reset zoom)
+    if (e.pointerType === 'touch' && !this._dragMoved) {
+      const now = performance.now();
+      const dt = now - this._lastTapTime;
+      const tapDx = Math.abs(e.clientX - this._lastTapX);
+      const tapDy = Math.abs(e.clientY - this._lastTapY);
+
+      if (dt < 300 && tapDx < 30 && tapDy < 30 && this._zoomCrop) {
+        this.resetZoom();
+        this._lastTapTime = 0;
+        return;
+      }
+
+      this._lastTapTime = now;
+      this._lastTapX = e.clientX;
+      this._lastTapY = e.clientY;
+    }
+
+    if (!this._dragMoved) return; // Was just a click/tap, not a drag
 
     const rect = this.element.getBoundingClientRect();
     const currentX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
@@ -578,6 +630,7 @@ export class StreamTile {
     if (this._isDragging) {
       this._isDragging = false;
       this.selectionOverlay.style.display = 'none';
+      this.element.style.touchAction = 'manipulation';
     }
   }
 
@@ -614,16 +667,7 @@ export class StreamTile {
   /** Set zoom crop externally (for syncing between companion and primary tiles). */
   setZoomExternal(crop: ZoomCrop | null): void {
     this._zoomCrop = crop;
-    // Update the visual indicators (zoom level label, reset button)
-    if (this._zoomCrop) {
-      const zoomX = 1 / this._zoomCrop.w;
-      const zoomY = 1 / this._zoomCrop.h;
-      const effectiveZoom = Math.min(zoomX, zoomY);
-      this.zoomLevelLabel.textContent = `${effectiveZoom.toFixed(1)}×`;
-      this.resetZoomBtn.classList.add('visible');
-    } else {
-      this.resetZoomBtn.classList.remove('visible');
-    }
+    this.updateZoomUI();
   }
 
   /** Remove from DOM and clean up. */

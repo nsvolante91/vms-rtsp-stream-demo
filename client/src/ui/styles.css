@@ -10,13 +10,16 @@ body {
   font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   overflow: hidden;
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
+  touch-action: manipulation;
 }
 
 #app {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
 }
 
@@ -35,6 +38,7 @@ body {
   overflow: hidden;
   background: #000;
   cursor: pointer;
+  touch-action: manipulation;
 }
 
 .stream-tile canvas {
@@ -164,14 +168,37 @@ body {
   color: #999;
 }
 
+/* ── Control bar ────────────────────────────────────────────── */
 #controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  background: #1a1a1a;
+  border-top: 1px solid #333;
+  flex-shrink: 0;
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.control-primary {
   display: flex;
   align-items: center;
   gap: 16px;
   padding: 8px 16px;
-  background: #1a1a1a;
-  border-top: 1px solid #333;
-  flex-shrink: 0;
+  padding-left: max(16px, env(safe-area-inset-left, 16px));
+  padding-right: max(16px, env(safe-area-inset-right, 16px));
+  flex-wrap: wrap;
+}
+
+.control-secondary {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  padding-left: max(16px, env(safe-area-inset-left, 16px));
+  padding-right: max(16px, env(safe-area-inset-right, 16px));
+  border-top: 1px solid #222;
+  flex-wrap: wrap;
 }
 
 .control-group {
@@ -183,6 +210,19 @@ body {
 .control-group label {
   font-size: 13px;
   color: #999;
+}
+
+/* "More" toggle button — hidden on wide screens */
+.btn-more {
+  display: none;
+}
+
+/* Fullscreen button — hidden on wide screens by default */
+.btn-fullscreen {
+  display: none;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 10px;
 }
 
 button {
@@ -475,3 +515,93 @@ button.active {
 .smo-green { color: #4caf50; }
 .smo-yellow { color: #ff9800; }
 .smo-red { color: #f44336; }
+
+/* ── Touch-friendly targets (coarse pointer = touch device) ──── */
+@media (pointer: coarse) {
+  button {
+    min-height: 44px;
+    min-width: 44px;
+    padding: 10px 16px;
+    font-size: 15px;
+  }
+
+  .tile-pause-btn {
+    width: 44px;
+    height: 44px;
+    font-size: 18px;
+    opacity: 1;  /* Always visible on touch — no hover */
+  }
+
+  .tile-reset-zoom {
+    padding: 8px 14px;
+    font-size: 14px;
+  }
+
+  #upscale-select {
+    min-height: 44px;
+    font-size: 15px;
+    padding: 10px 14px;
+  }
+
+  .btn-fullscreen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* ── Narrow screen (mobile phones) ─────────────────────────────── */
+@media (max-width: 640px) {
+  .control-primary {
+    gap: 8px;
+    padding: 6px 10px;
+    padding-left: max(10px, env(safe-area-inset-left, 10px));
+    padding-right: max(10px, env(safe-area-inset-right, 10px));
+  }
+
+  .control-secondary {
+    gap: 8px;
+    padding: 6px 10px;
+    padding-left: max(10px, env(safe-area-inset-left, 10px));
+    padding-right: max(10px, env(safe-area-inset-right, 10px));
+  }
+
+  .control-group {
+    gap: 4px;
+  }
+
+  .upscale-info {
+    display: none;
+  }
+
+  /* "More" toggle visible on narrow screens */
+  .btn-more {
+    display: inline-flex;
+    align-items: center;
+    margin-left: auto;
+  }
+
+  /* Secondary controls hidden by default on mobile */
+  .control-secondary {
+    display: none;
+  }
+
+  .control-secondary.visible {
+    display: flex;
+  }
+
+  /* Dashboard anchored to bottom on mobile */
+  .dashboard {
+    position: fixed;
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    border-radius: 6px 6px 0 0;
+    max-height: 40dvh;
+    max-height: 40vh;
+    min-width: unset;
+  }
+}

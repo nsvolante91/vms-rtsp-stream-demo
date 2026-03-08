@@ -13,6 +13,8 @@ export interface InitMessage {
   type: 'init';
   wtUrl: string;
   certHashUrl: string;
+  /** GPU adapter power preference (defaults to 'high-performance' if absent) */
+  gpuPowerPreference?: GPUPowerPreference;
 }
 
 /** Add a stream: transfer an OffscreenCanvas and start decode+render */

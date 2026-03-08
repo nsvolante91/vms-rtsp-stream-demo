@@ -173,18 +173,13 @@ async function discoverStreams(): Promise<void> {
   if (!isLocalMediaMTX) {
     // Direct camera URL — probe and add as a single stream
     console.log(`[Discovery] Probing direct RTSP URL: ${RTSP_BASE_URL}`);
-    const available = true; // await probeRTSPStream(RTSP_BASE_URL, 10000);
-    if (available) {
-      const id = nextStreamId++;
-      try {
-        await streamManager.addStream(id, RTSP_BASE_URL);
-        console.log(`[Discovery] Added direct stream as ID ${id}`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error';
-        console.error(`[Discovery] Failed to add direct stream: ${message}`);
-      }
-    } else {
-      console.error(`[Discovery] Could not connect to ${RTSP_BASE_URL}`);
+    const id = nextStreamId++;
+    try {
+      await streamManager.addStream(id, RTSP_BASE_URL);
+      console.log(`[Discovery] Added direct stream as ID ${id}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[Discovery] Failed to add direct stream: ${message}`);
     }
     return;
   }

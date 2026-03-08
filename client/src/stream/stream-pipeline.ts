@@ -309,11 +309,12 @@ export class StreamPipeline {
       if (this._frameIntervals.length > StreamPipeline.FRAME_INTERVAL_WINDOW) {
         this._frameIntervals.shift();
       }
-      // Stutter detection: interval > 2× median
+      // Stutter detection: interval > 2× running average
       if (this._frameIntervals.length >= 5) {
-        const sorted = [...this._frameIntervals].sort((a, b) => a - b);
-        const median = sorted[Math.floor(sorted.length / 2)];
-        if (interval > median * 2) {
+        let sum = 0;
+        for (let i = 0; i < this._frameIntervals.length; i++) sum += this._frameIntervals[i];
+        const avg = sum / this._frameIntervals.length;
+        if (interval > avg * 2) {
           this._stutterCount++;
         }
       }
