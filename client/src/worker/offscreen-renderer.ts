@@ -106,19 +106,35 @@ const UNIFORM_BUFFER_SIZE = 48;
  * @param onDeviceLost - Optional callback invoked when the GPU device is lost
  * @returns WorkerGPU resources, or null if WebGPU is unavailable
  */
+/** Reason why WebGPU initialization failed */
+export type GPUFailReason =
+  | 'navigator.gpu missing'
+  | 'requestAdapter returned null'
+  | 'getContext webgpu failed'
+  | string;
+
+/** Result of initWorkerGPU — either success or a failure reason */
+export type InitGPUResult =
+  | { ok: true; gpu: WorkerGPU }
+  | { ok: false; reason: GPUFailReason };
+
 export async function initWorkerGPU(
   onDeviceLost?: (info: GPUDeviceLostInfo) => void,
   gpuPowerPreference?: GPUPowerPreference
-): Promise<WorkerGPU | null> {
+): Promise<InitGPUResult> {
   if (typeof navigator === 'undefined' || !navigator.gpu) {
-    return null;
+    return { ok: false, reason: 'navigator.gpu missing' };
   }
 
-  const adapter = await navigator.gpu.requestAdapter({
+  // Try with preferred power hint first, then without any options as fallback
+  let adapter = await navigator.gpu.requestAdapter({
     powerPreference: gpuPowerPreference ?? 'high-performance',
   });
+  if (!adapter && gpuPowerPreference) {
+    adapter = await navigator.gpu.requestAdapter();
+  }
   if (!adapter) {
-    return null;
+    return { ok: false, reason: `requestAdapter returned null (tried '${gpuPowerPreference ?? 'high-performance'}' and default)` };
   }
 
   const device = await adapter.requestDevice();
@@ -190,7 +206,7 @@ export async function initWorkerGPU(
     viewportBufferPool.push(buf);
   }
 
-  return { device, format, pipeline, copyPipeline, sampler, bindGroupLayout, copyBindGroupLayout, viewportBufferPool };
+  return { ok: true, gpu: { device, format, pipeline, copyPipeline, sampler, bindGroupLayout, copyBindGroupLayout, viewportBufferPool } };
 }
 
 /**
@@ -446,6 +462,9 @@ export class OffscreenRenderer {
   private lastDlssW = 0;
   private lastDlssH = 0;
 
+  /** Canvas2D fallback context (used when WebGPU is unavailable) */
+  private ctx2d: OffscreenCanvasRenderingContext2D | null = null;
+
   constructor(
     readonly streamId: number,
     canvas: OffscreenCanvas
@@ -496,6 +515,33 @@ export class OffscreenRenderer {
       this.log.warn('WebGPU init failed on OffscreenCanvas', e);
       return false;
     }
+  }
+
+  /**
+   * Initialize Canvas2D fallback rendering on this OffscreenCanvas.
+   * Used when WebGPU is unavailable (e.g. on some mobile devices).
+   *
+   * @returns true if Canvas2D was initialized successfully
+   */
+  initCanvas2D(): boolean {
+    try {
+      const ctx = this.canvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+      if (!ctx) {
+        this.log.warn('Failed to get 2d context on OffscreenCanvas');
+        return false;
+      }
+      this.ctx2d = ctx;
+      this.log.info('Canvas2D fallback initialized');
+      return true;
+    } catch (e) {
+      this.log.warn('Canvas2D init failed on OffscreenCanvas', e);
+      return false;
+    }
+  }
+
+  /** Whether this renderer is using Canvas2D fallback */
+  get isCanvas2D(): boolean {
+    return this.ctx2d !== null;
   }
 
   /**
@@ -588,6 +634,43 @@ export class OffscreenRenderer {
    * @returns GPUCommandBuffer if encoding succeeded, null otherwise
    */
   encodeFrame(frame: VideoFrame): GPUCommandBuffer | null {
+      // Canvas2D fallback path — draw immediately, no command buffer needed
+      if (this.ctx2d) {
+        const ctx = this.ctx2d;
+        const cw = this.canvas.width;
+        const ch = this.canvas.height;
+        ctx.clearRect(0, 0, cw, ch);
+
+        // Aspect-ratio-correct letterboxing
+        const videoAR = frame.displayWidth / frame.displayHeight;
+        const canvasAR = cw / ch;
+        let dw: number, dh: number, dx: number, dy: number;
+        if (videoAR > canvasAR) {
+          dw = cw;
+          dh = cw / videoAR;
+          dx = 0;
+          dy = (ch - dh) / 2;
+        } else {
+          dh = ch;
+          dw = ch * videoAR;
+          dx = (cw - dw) / 2;
+          dy = 0;
+        }
+
+        // Apply zoom crop if set
+        if (this.zoomCrop) {
+          const sx = frame.displayWidth * this.zoomCrop.x;
+          const sy = frame.displayHeight * this.zoomCrop.y;
+          const sw = frame.displayWidth * this.zoomCrop.w;
+          const sh = frame.displayHeight * this.zoomCrop.h;
+          ctx.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);
+        } else {
+          ctx.drawImage(frame, dx, dy, dw, dh);
+        }
+
+        return null;
+      }
+
       if (!this.gpu || !this.gpuContext || !this.viewportBuffer) {
         return null;
       }
@@ -2004,6 +2087,7 @@ export class OffscreenRenderer {
     this.lastDlssW = 0;
     this.lastDlssH = 0;
 
+    this.ctx2d = null;
     this.gpu = null;
     this.log.info('Destroyed');
   }

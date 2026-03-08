@@ -33,7 +33,7 @@ function deriveServerUrls(): { apiUrl: string; wtUrl: string } {
   const serverHost = isLocalhost ? '127.0.0.1' : host;
 
   return {
-    apiUrl: `http://${serverHost}:9000`,
+    apiUrl: '/api',
     wtUrl: `https://${serverHost}:9001/streams`,
   };
 }
@@ -131,14 +131,33 @@ class VMSApp {
   async init(): Promise<void> {
     log.info('Initializing VMS Prototype (worker mode)');
 
-    // Feature detection
+    // Feature detection — distinguish insecure context from missing API
     if (typeof VideoDecoder === 'undefined') {
-      this.showError('Missing WebCodecs (VideoDecoder). Please use Chrome 113+ or Safari 17+.');
+      if (!window.isSecureContext) {
+        this.showError(
+          'Insecure context — WebCodecs requires HTTPS.\n\n' +
+          'You are accessing this page over plain HTTP. ' +
+          'WebCodecs (VideoDecoder) is only available in secure contexts (HTTPS or localhost).\n\n' +
+          'Access via https:// and accept the self-signed certificate warning.'
+        );
+      } else {
+        this.showError(
+          'Missing WebCodecs (VideoDecoder).\n\n' +
+          'Your browser does not support the WebCodecs API. ' +
+          'Please use Chrome 113+, Edge 113+, or Safari 17+.'
+        );
+      }
       return;
     }
 
     // Spawn worker and wait for WebTransport connection
-    await this.initWorker();
+    try {
+      await this.initWorker();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.showError(`Connection failed: ${msg}`);
+      return;
+    }
 
     this.gridContainer = document.getElementById('video-grid') as HTMLDivElement | null;
     if (!this.gridContainer) {
@@ -271,6 +290,15 @@ class VMSApp {
           log.error(`Worker error: ${msg.message}`);
         }
         break;
+
+      case 'streamReady': {
+        const entry = this.streams.get(msg.streamId);
+        if (entry) {
+          entry.tile.setWorkerRenderer(msg.renderer, msg.gpuFailReason);
+          log.info(`Stream ${msg.streamId} renderer: ${msg.renderer}${msg.gpuFailReason ? ` (WebGPU failed: ${msg.gpuFailReason})` : ''}`);
+        }
+        break;
+      }
 
       case 'metrics':
         // Update cached worker metrics and feed into MetricsCollector

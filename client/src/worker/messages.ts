@@ -151,7 +151,20 @@ export interface MetricsMessage {
   streams: StreamMetricsUpdate[];
 }
 
+/** Renderer type used for a stream */
+export type RendererType = 'webgpu' | 'canvas2d';
+
+/** Stream rendering started (confirms which renderer backend is in use) */
+export interface StreamReadyMessage {
+  type: 'streamReady';
+  streamId: number;
+  renderer: RendererType;
+  /** If Canvas2D fallback, why WebGPU failed */
+  gpuFailReason?: string;
+}
+
 export type WorkerToMainMessage =
   | ConnectedMessage
   | ErrorMessage
-  | MetricsMessage;
+  | MetricsMessage
+  | StreamReadyMessage;

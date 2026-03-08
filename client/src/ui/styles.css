@@ -64,10 +64,10 @@ body {
   pointer-events: none;
 }
 
-/* ── Pause button (top-right corner) ────────────────────────── */
+/* ── Pause button (bottom-right corner, above stream label) ── */
 .tile-pause-btn {
   position: absolute;
-  top: 6px;
+  bottom: 30px;
   right: 6px;
   width: 28px;
   height: 28px;
