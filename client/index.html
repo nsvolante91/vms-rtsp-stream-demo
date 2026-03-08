@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <title>VMS Prototype — WebCodecs</title>
   <link rel="stylesheet" href="/src/ui/styles.css" />
 </head>
@@ -10,38 +13,46 @@
   <div id="app">
     <div id="video-grid"></div>
     <div id="controls">
-      <div class="control-group">
-        <label>Layout:</label>
-        <button data-layout="1" class="layout-btn active">1×1</button>
-        <button data-layout="2" class="layout-btn">2×2</button>
-        <button data-layout="3" class="layout-btn">3×3</button>
-        <button data-layout="4" class="layout-btn">4×4</button>
+      <div class="control-primary">
+        <div class="control-group">
+          <label>Layout:</label>
+          <button data-layout="1" class="layout-btn active">1×1</button>
+          <button data-layout="2" class="layout-btn">2×2</button>
+          <button data-layout="3" class="layout-btn">3×3</button>
+          <button data-layout="4" class="layout-btn">4×4</button>
+        </div>
+        <div class="control-group">
+          <button id="btn-add-stream">+ Stream</button>
+          <button id="btn-remove-stream">− Stream</button>
+        </div>
+        <div class="control-group">
+          <select id="upscale-select" title="GPU Upscaling — enhances video sharpness and detail using GPU shader techniques.">
+            <option value="off">Off — No upscaling</option>
+            <option value="cas">CAS — Contrast Adaptive Sharpening</option>
+            <option value="fsr">FSR — FidelityFX Super Resolution</option>
+            <option value="a4k">A4K — Anime4K Neural Upscale</option>
+            <option value="tsr">TSR — Temporal Super Resolution</option>
+            <option value="spec">SPEC — Spectral Frequency Hallucination</option>
+            <option value="vqsr">VQSR — Vector-Quantized Texture Lookup</option>
+            <option value="gen">GEN — Compact ESRGAN Generator</option>
+            <option value="dlss">DLSS — 4K Upscale (Temporal+Spatial)</option>
+          </select>
+          <span id="upscale-info" class="upscale-info">No upscaling — raw bilinear filtering</span>
+        </div>
+        <button id="btn-more" class="btn-more" title="More controls">More ▾</button>
+        <button id="btn-fullscreen" class="btn-fullscreen" title="Toggle fullscreen">⛶</button>
       </div>
-      <div class="control-group">
-        <button id="btn-add-stream">+ Stream</button>
-        <button id="btn-remove-stream">− Stream</button>
-      </div>
-      <div class="control-group">
-        <button id="btn-benchmark">Run Benchmark</button>
-        <button id="btn-export">Export Metrics</button>
-        <button id="btn-reset-metrics" title="Reset all metrics and analytics">↺ Reset</button>
-        <button id="btn-metrics-overlay" title="Toggle per-stream metrics overlay (M)">📊</button>
-      </div>
-      <div class="control-group">
-        <button id="btn-cpu-hog" title="CPU Hogger — blocks main thread ~100ms every 1s">🌶️</button>
-        <button id="btn-compare" title="Compare Mode — show original vs upscaled side by side">⚖️ Compare</button>
-        <select id="upscale-select" title="GPU Upscaling — enhances video sharpness and detail using GPU shader techniques.">
-          <option value="off">Off — No upscaling</option>
-          <option value="cas">CAS — Contrast Adaptive Sharpening</option>
-          <option value="fsr">FSR — FidelityFX Super Resolution</option>
-          <option value="a4k">A4K — Anime4K Neural Upscale</option>
-          <option value="tsr">TSR — Temporal Super Resolution</option>
-          <option value="spec">SPEC — Spectral Frequency Hallucination</option>
-          <option value="vqsr">VQSR — Vector-Quantized Texture Lookup</option>
-          <option value="gen">GEN — Compact ESRGAN Generator</option>
-          <option value="dlss">DLSS — 4K Upscale (Temporal+Spatial)</option>
-        </select>
-        <span id="upscale-info" class="upscale-info">No upscaling — raw bilinear filtering</span>
+      <div class="control-secondary">
+        <div class="control-group">
+          <button id="btn-benchmark">Run Benchmark</button>
+          <button id="btn-export">Export Metrics</button>
+          <button id="btn-reset-metrics" title="Reset all metrics and analytics">↺ Reset</button>
+          <button id="btn-metrics-overlay" title="Toggle per-stream metrics overlay (M)">📊</button>
+        </div>
+        <div class="control-group">
+          <button id="btn-cpu-hog" title="CPU Hogger — blocks main thread ~100ms every 1s">🌶️</button>
+          <button id="btn-compare" title="Compare Mode — show original vs upscaled side by side">⚖️ Compare</button>
+        </div>
       </div>
     </div>
     <div id="dashboard" class="dashboard hidden"></div>

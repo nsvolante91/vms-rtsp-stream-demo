@@ -16,7 +16,7 @@
  * WebSocket frames are sent raw (native message boundaries).
  */
 
-import type { WebSocket as WSSocket } from 'ws';
+import { WebSocket as WSSocket } from 'ws';
 import { RTSPClient, type NALUEvent } from './rtsp-client.js';
 import { frameLengthPrefixed, readLengthPrefixed, writeLengthPrefixed } from './framing.js';
 import {
@@ -519,7 +519,7 @@ export class StreamManager {
         const bytes = textEncoder.encode(JSON.stringify(message));
         await writeLengthPrefixed(client.controlWriter, bytes);
       } else {
-        if (client.ws.readyState === 1 /* OPEN */) {
+        if (client.ws.readyState === WSSocket.OPEN) {
           client.ws.send(JSON.stringify(message));
         }
       }
@@ -583,7 +583,7 @@ export class StreamManager {
         subscription = {
           clientId: client.id,
           send: (frame: Buffer) => {
-            if (ws.readyState === 1 /* OPEN */) {
+            if (ws.readyState === WSSocket.OPEN) {
               ws.send(frame);
             }
           },

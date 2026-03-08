@@ -18,6 +18,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import * as net from 'net';
 import { Http3Server } from '@fails-components/webtransport';
 import { StreamManager } from './stream-manager.js';
 import { probeRTSPStream } from './rtsp-client.js';
@@ -27,7 +28,7 @@ import { attachWebSocketServer } from './ws-handler.js';
 const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
 const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
 const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://localhost:8554';
-const MAX_DISCOVER_STREAMS = 1;
+const MAX_DISCOVER_STREAMS = parseInt(process.env.MAX_DISCOVER_STREAMS ?? '16', 10);
 
 const streamManager = new StreamManager();
 let nextStreamId = 1;
@@ -159,10 +160,37 @@ async function handleRequest(
 }
 
 /**
+ * Check if a TCP host:port is reachable within a timeout.
+ *
+ * @param host - Hostname or IP to connect to
+ * @param port - TCP port number
+ * @param timeoutMs - Connection timeout in milliseconds
+ * @returns true if the connection succeeded, false otherwise
+ */
+function checkTcpReachable(host: string, port: number, timeoutMs = 3000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    socket.setTimeout(timeoutMs);
+    socket.on('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+    socket.on('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
+/**
  * Auto-discover active RTSP streams.
  *
  * If RTSP_BASE_URL looks like a MediaMTX local server (contains localhost or
- * 127.0.0.1), probes stream1..stream16 as sub-paths. Otherwise, treats the
+ * 127.0.0.1), probes stream1..streamN as sub-paths. Otherwise, treats the
  * base URL as a single direct RTSP stream (e.g. a real IP camera).
  */
 async function discoverStreams(): Promise<void> {
@@ -173,25 +201,41 @@ async function discoverStreams(): Promise<void> {
   if (!isLocalMediaMTX) {
     // Direct camera URL — probe and add as a single stream
     console.log(`[Discovery] Probing direct RTSP URL: ${RTSP_BASE_URL}`);
-    const available = true; // await probeRTSPStream(RTSP_BASE_URL, 10000);
-    if (available) {
-      const id = nextStreamId++;
-      try {
-        await streamManager.addStream(id, RTSP_BASE_URL);
-        console.log(`[Discovery] Added direct stream as ID ${id}`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error';
-        console.error(`[Discovery] Failed to add direct stream: ${message}`);
-      }
-    } else {
-      console.error(`[Discovery] Could not connect to ${RTSP_BASE_URL}`);
+    const id = nextStreamId++;
+    try {
+      await streamManager.addStream(id, RTSP_BASE_URL);
+      console.log(`[Discovery] Added direct stream as ID ${id}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[Discovery] Failed to add direct stream: ${message}`);
     }
     return;
   }
 
-  // MediaMTX local server — probe stream
+  // Extract host and port from RTSP_BASE_URL for reachability check
+  let rtspHost = 'localhost';
+  let rtspPort = 8554;
+  try {
+    const parsed = new URL(RTSP_BASE_URL);
+    rtspHost = parsed.hostname;
+    rtspPort = parsed.port ? parseInt(parsed.port, 10) : 8554;
+  } catch {
+    // Fall back to defaults if URL parsing fails
+  }
+
+  // Check if the RTSP server is reachable before spawning ffprobe processes
+  const reachable = await checkTcpReachable(rtspHost, rtspPort);
+  if (!reachable) {
+    console.error(
+      `[Discovery] Cannot reach RTSP server at ${rtspHost}:${rtspPort}. ` +
+      `Is MediaMTX running? Try: docker compose -f docker/docker-compose.yml up -d`
+    );
+    return;
+  }
+
+  // MediaMTX local server — probe stream1..streamN
   console.log(
-    `[Discovery] Probing ${RTSP_BASE_URL}`
+    `[Discovery] Probing ${RTSP_BASE_URL} for up to ${MAX_DISCOVER_STREAMS} streams`
   );
 
   const probePromises: Promise<{ index: number; available: boolean }>[] = [];

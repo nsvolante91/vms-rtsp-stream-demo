@@ -94,7 +94,9 @@ Set `RTSP_BASE_URL` to any RTSP URL. The bridge will treat it as a single direct
 npm run dev
 ```
 
-Open **Chrome** at `http://localhost:5173`. The client auto-fetches the certificate hash, connects via WebTransport, and begins playing streams.
+Open **Chrome** at `https://localhost:5173` (note: HTTPS). Accept the self-signed certificate warning. The client auto-fetches the certificate hash, connects via WebTransport, and begins playing streams.
+
+**Mobile access**: Open `https://<your-LAN-IP>:5173` on your phone (same network). Accept the certificate warning. The dev server serves over HTTPS so WebCodecs is available in the secure context.
 
 ## Usage
 
@@ -102,7 +104,8 @@ Open **Chrome** at `http://localhost:5173`. The client auto-fetches the certific
 - **Add/Remove streams**: Use the + Stream / - Stream buttons
 - **Upscale mode**: Select from 9 GPU upscaling modes in the dropdown — bilinear, Lanczos, FSR, DLSS, spectral, temporal, VQSR, generative, compute
 - **Comparison mode**: Toggle to show upscaled vs. original side-by-side for each stream
-- **Zoom**: Click any stream tile to focus it; the GPU shader crops and pans
+- **Zoom (desktop)**: Drag a rectangle on any tile to zoom into that area; double-click to reset
+- **Zoom (mobile)**: Pinch-to-zoom with two fingers; one-finger pan when zoomed; double-tap to zoom 2x or reset
 - **Stream overlay**: Per-tile overlay shows FPS, resolution, bitrate, decode time, and frame drops
 - **Dashboard**: Toggle the global performance overlay
 - **Benchmark**: Click "Run Benchmark" to auto-test stream scaling limits
@@ -169,7 +172,8 @@ docker compose -f docker/docker-compose.yml down
 │   │   │   ├── stream-overlay.ts       # Per-tile metrics overlay
 │   │   │   └── styles.css              # Global styles
 │   │   └── utils/
-│   │       └── logger.ts               # Tagged debug logging
+│   │       ├── logger.ts               # Tagged debug logging
+│   │       └── device.ts               # Mobile/desktop device detection
 │   └── tests/
 ├── docker/                     # Docker Compose + MediaMTX config
 │   ├── docker-compose.yml
@@ -204,14 +208,33 @@ npm run typecheck        # TypeScript type checking (both packages)
 
 ## Browser Support
 
+### Desktop
+
 | Browser | WebTransport | WebGPU | WebCodecs | Status |
 |---------|-------------|--------|-----------|--------|
 | Chrome 114+ | Yes | Yes | Yes | **Full support** |
 | Edge 114+ | Yes | Yes | Yes | **Full support** |
-| Firefox | Behind flag | Behind flag | Yes | Not supported |
-| Safari | No | Partial | Yes | Not supported |
+| Firefox 133+ | Yes | Yes | Yes | Functional (not primary target) |
+| Safari 18+ | Behind flag | Partial | Yes | Not supported |
 
-The client includes a WebSocket fallback for transport and Canvas2D fallback for rendering, but the full feature set (upscaling, zero-copy GPU rendering) requires Chrome or Edge 114+.
+### Mobile
+
+| Browser | WebTransport | WebGPU | WebCodecs | Status |
+|---------|-------------|--------|-----------|--------|
+| Chrome Android 123+ | Yes | Yes | Yes | **Full support** (Android 12+, Qualcomm/ARM GPU) |
+| Edge Android 113+ | Yes | Yes | Yes | **Full support** (same engine as Chrome) |
+| Samsung Internet 25+ | Yes | Yes | Yes | **Full support** (Chromium-based) |
+| Safari iOS 26+ | Behind flag | Yes | Yes | **Partial** — WebSocket fallback works, WebTransport experimental |
+| Firefox Android | No | No | No | Not supported |
+
+### Notes
+
+- **Chrome Android** is the primary mobile target — the only mobile browser where all three APIs (WebTransport + WebGPU + WebCodecs) are stable. Requires Android 12+ with a Qualcomm or ARM GPU for WebGPU.
+- **WebGPU GPU blocklist**: Some mobile GPUs (e.g. Samsung Xclipse 920 / Exynos 2200) are on Chrome's adapter blocklist even though the hardware is capable. The app automatically falls back to Canvas2D rendering with a diagnostic badge. To force WebGPU, enable `chrome://flags/#enable-unsafe-webgpu` and restart Chrome.
+- **Safari iOS 26** (released 2025) adds WebGPU with `importExternalTexture` support and WebCodecs `VideoDecoder`. WebTransport remains experimental (behind a flag), but the client's WebSocket fallback enables video playback. GPU upscaling and zero-copy rendering work fully.
+- **Samsung Internet / Edge Android** are Chromium-based and inherit Chrome's API support, subject to the same Android 12+ / GPU hardware requirements for WebGPU.
+- The client includes a **WebSocket fallback** for transport and **Canvas2D fallback** for rendering, so basic playback works on browsers missing WebTransport or WebGPU. The full feature set (GPU upscaling, zero-copy rendering, QUIC streaming) requires Chrome or Edge 114+ (desktop) or Chrome Android 123+ (mobile).
+- **HTTPS required**: The Vite dev server uses `@vitejs/plugin-basic-ssl` to serve over HTTPS. This is necessary because WebCodecs (`VideoDecoder`) is only available in secure contexts. On `localhost`, plain HTTP works (implicit secure context), but LAN access from mobile devices requires HTTPS. REST API calls are proxied through Vite's `/api` route to avoid mixed-content errors.
 
 ## License
 

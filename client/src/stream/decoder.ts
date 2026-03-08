@@ -109,27 +109,7 @@ export class VideoStreamDecoder {
     this._softwareFallback = false;
 
     this.decoder = new VideoDecoder({
-      output: (frame: VideoFrame) => {
-        this._decodedFrames++;
-        this._lastDecodeTime = performance.now();
-        // Record decode time from oldest pending submit
-        if (this._decodeSubmitTimes.length > 0) {
-          const submitTime = this._decodeSubmitTimes.shift()!;
-          const dt = this._lastDecodeTime - submitTime;
-          this._decodeTimeSamples.push(dt);
-          if (this._decodeTimeSamples.length > VideoStreamDecoder.MAX_DECODE_SAMPLES) {
-            this._decodeTimeSamples.shift();
-          }
-        }
-        if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
-          this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
-        }
-        try {
-          this.onFrame(frame);
-        } catch {
-          try { frame.close(); } catch { /* already closed */ }
-        }
-      },
+      output: (frame: VideoFrame) => this.handleDecoderOutput(frame),
       error: (error: DOMException) => {
         this.log.error('Decoder error', error);
         // On first error, try software decoding before reporting to pipeline
@@ -152,6 +132,29 @@ export class VideoStreamDecoder {
     this.decoder.configure(config);
   }
 
+  /** Shared output handler for decoded VideoFrames. */
+  private handleDecoderOutput(frame: VideoFrame): void {
+    this._decodedFrames++;
+    this._lastDecodeTime = performance.now();
+    // Record decode time from oldest pending submit
+    if (this._decodeSubmitTimes.length > 0) {
+      const submitTime = this._decodeSubmitTimes.shift()!;
+      const dt = this._lastDecodeTime - submitTime;
+      this._decodeTimeSamples.push(dt);
+      if (this._decodeTimeSamples.length > VideoStreamDecoder.MAX_DECODE_SAMPLES) {
+        this._decodeTimeSamples.shift();
+      }
+    }
+    if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
+      this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
+    }
+    try {
+      this.onFrame(frame);
+    } catch {
+      try { frame.close(); } catch { /* already closed */ }
+    }
+  }
+
   /**
    * Direct configure without diagnostics (used by software fallback).
    */
@@ -170,27 +173,7 @@ export class VideoStreamDecoder {
     this._waitingForKeyframe = true;
 
     this.decoder = new VideoDecoder({
-      output: (frame: VideoFrame) => {
-        this._decodedFrames++;
-        this._lastDecodeTime = performance.now();
-        // Record decode time from oldest pending submit
-        if (this._decodeSubmitTimes.length > 0) {
-          const submitTime = this._decodeSubmitTimes.shift()!;
-          const dt = this._lastDecodeTime - submitTime;
-          this._decodeTimeSamples.push(dt);
-          if (this._decodeTimeSamples.length > VideoStreamDecoder.MAX_DECODE_SAMPLES) {
-            this._decodeTimeSamples.shift();
-          }
-        }
-        if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
-          this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
-        }
-        try {
-          this.onFrame(frame);
-        } catch {
-          try { frame.close(); } catch { /* already closed */ }
-        }
-      },
+      output: (frame: VideoFrame) => this.handleDecoderOutput(frame),
       error: (error: DOMException) => {
         this.log.error('Decoder error (fallback)', error);
         this.onError(new Error(`Decoder error: ${error.message}`));

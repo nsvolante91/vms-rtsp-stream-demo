@@ -19,6 +19,7 @@ import {
   OffscreenRenderer,
   initWorkerGPU,
   type WorkerGPU,
+  type GPUFailReason,
 } from './offscreen-renderer';
 import type {
   MainToWorkerMessage,
@@ -33,9 +34,10 @@ const log = new Logger('StreamWorker');
 
 let receiver: StreamReceiver | null = null;
 let workerGPU: WorkerGPU | null = null;
+let gpuFailReason: GPUFailReason | null = null;
 
 interface StreamEntry {
-  pipeline: StreamPipeline;
+  pipeline: StreamPipeline | null;
   renderer: OffscreenRenderer;
 }
 
@@ -164,19 +166,19 @@ async function handleDeviceLost(info: GPUDeviceLostInfo): Promise<void> {
   log.warn(`GPU device lost (reason: ${info.reason}), attempting recovery...`);
 
   try {
-    const newGPU = await initWorkerGPU(handleDeviceLost);
-    if (!newGPU) {
-      log.error('GPU recovery failed: could not re-initialize WebGPU');
+    const result = await initWorkerGPU(handleDeviceLost);
+    if (!result.ok) {
+      log.error(`GPU recovery failed: ${result.reason}`);
       postMsg({ type: 'error', message: 'GPU device lost and recovery failed' });
       return;
     }
 
-    workerGPU = newGPU;
+    workerGPU = result.gpu;
 
     // Re-initialize all active renderers with the new GPU resources
     let recovered = 0;
     for (const [streamId, entry] of streams) {
-      if (entry.renderer.reinitGPU(newGPU)) {
+      if (entry.renderer.reinitGPU(result.gpu)) {
         recovered++;
       } else {
         log.warn(`Failed to recover renderer for stream ${streamId}`);
@@ -202,7 +204,7 @@ function startMetricsReporter(): void {
     const updates: StreamMetricsUpdate[] = [];
     for (const [streamId, entry] of streams) {
       // Skip companion renderers — they have no decode pipeline
-      if (companionSet.has(streamId)) continue;
+      if (companionSet.has(streamId) || !entry.pipeline) continue;
       const m = entry.pipeline.metrics;
       const prev = lastDecodedFrames.get(streamId) ?? 0;
       const fps = m.decodedFrames - prev;
@@ -241,17 +243,17 @@ function stopMetricsReporter(): void {
 
 // ─── Message Handlers ──────────────────────────────────────────
 
-async function handleInit(wtUrl: string, certHashUrl: string): Promise<void> {
+async function handleInit(wtUrl: string, certHashUrl: string, gpuPowerPreference?: GPUPowerPreference): Promise<void> {
   log.info('Initializing worker pipeline...');
 
-  // 1. WebGPU
-  workerGPU = await initWorkerGPU(handleDeviceLost);
-  if (workerGPU) {
+  // 1. WebGPU (optional — Canvas2D fallback used if unavailable)
+  const gpuResult = await initWorkerGPU(handleDeviceLost, gpuPowerPreference);
+  if (gpuResult.ok) {
+    workerGPU = gpuResult.gpu;
     log.info('WorkerGPU initialized');
   } else {
-    log.warn('WebGPU unavailable in worker');
-    postMsg({ type: 'error', message: 'WebGPU not available in worker' });
-    return;
+    gpuFailReason = gpuResult.reason;
+    log.warn(`WebGPU unavailable in worker (${gpuFailReason}) — will use Canvas2D fallback`);
   }
 
   // 2. WebTransport
@@ -279,7 +281,7 @@ function handleAddStream(
   width: number,
   height: number
 ): void {
-  if (!receiver || !workerGPU) {
+  if (!receiver) {
     log.warn(`Cannot add stream ${streamId}: worker not initialized`);
     postMsg({ type: 'error', streamId, message: 'Worker not initialized' });
     return;
@@ -290,14 +292,25 @@ function handleAddStream(
     return;
   }
 
-  // Create renderer
+  // Create renderer — try WebGPU first, fall back to Canvas2D
   const renderer = new OffscreenRenderer(streamId, canvas);
   renderer.resize(width, height);
   renderer.setUpscaleMode(currentUpscaleMode);
-  const gpuOk = renderer.initGPU(workerGPU);
-  if (!gpuOk) {
-    postMsg({ type: 'error', streamId, message: 'Failed to init WebGPU on OffscreenCanvas' });
-    return;
+
+  let renderOk = false;
+  let streamGpuFailReason = gpuFailReason;
+  if (workerGPU) {
+    renderOk = renderer.initGPU(workerGPU);
+    if (!renderOk) {
+      streamGpuFailReason = 'getContext webgpu failed';
+    }
+  }
+  if (!renderOk) {
+    renderOk = renderer.initCanvas2D();
+    if (!renderOk) {
+      postMsg({ type: 'error', streamId, message: 'Failed to init rendering (WebGPU and Canvas2D both failed)' });
+      return;
+    }
   }
 
   // Create pipeline — decoded frames are queued for rAF-gated rendering
@@ -313,7 +326,12 @@ function handleAddStream(
   pipeline.start();
 
   streams.set(streamId, { pipeline, renderer });
-  log.info(`Stream ${streamId} added (${width}x${height})`);
+  postMsg({
+    type: 'streamReady', streamId,
+    renderer: renderer.isCanvas2D ? 'canvas2d' : 'webgpu',
+    gpuFailReason: renderer.isCanvas2D ? (streamGpuFailReason ?? 'unknown') : undefined,
+  });
+  log.info(`Stream ${streamId} added (${width}x${height}, ${renderer.isCanvas2D ? 'Canvas2D' : 'WebGPU'})`);
 }
 
 function handleRemoveStream(streamId: number): void {
@@ -326,7 +344,7 @@ function handleRemoveStream(streamId: number): void {
     handleRemoveCompanion(companionId);
   }
 
-  entry.pipeline.stop();
+  entry.pipeline?.stop();
   entry.renderer.destroy();
   streams.delete(streamId);
   lastDecodedFrames.delete(streamId);
@@ -357,7 +375,7 @@ function handleShutdown(): void {
   pendingFrames.clear();
   for (const [streamId, entry] of streams) {
     if (!companionSet.has(streamId)) {
-      entry.pipeline.stop();
+      entry.pipeline?.stop();
     }
     entry.renderer.destroy();
     log.info(`Stream ${streamId} cleaned up`);
@@ -378,7 +396,7 @@ self.onmessage = (e: MessageEvent<MainToWorkerMessage>) => {
 
   switch (msg.type) {
     case 'init':
-      handleInit(msg.wtUrl, msg.certHashUrl).catch((err) => {
+      handleInit(msg.wtUrl, msg.certHashUrl, msg.gpuPowerPreference).catch((err) => {
         log.error('Init failed', err);
         postMsg({ type: 'error', message: `Init failed: ${err}` });
       });
@@ -456,11 +474,6 @@ function handleAddCompanion(
   width: number,
   height: number
 ): void {
-  if (!workerGPU) {
-    log.warn(`Cannot add companion ${companionStreamId}: worker not initialized`);
-    return;
-  }
-
   if (streams.has(companionStreamId)) {
     log.warn(`Companion ${companionStreamId} already exists`);
     return;
@@ -470,17 +483,25 @@ function handleAddCompanion(
   const renderer = new OffscreenRenderer(companionStreamId, canvas);
   renderer.resize(width, height);
   renderer.setUpscaleMode('off');
-  const gpuOk = renderer.initGPU(workerGPU);
-  if (!gpuOk) {
-    postMsg({ type: 'error', streamId: companionStreamId, message: 'Failed to init WebGPU for companion' });
-    return;
+
+  let renderOk = false;
+  if (workerGPU) {
+    renderOk = renderer.initGPU(workerGPU);
+  }
+  if (!renderOk) {
+    renderOk = renderer.initCanvas2D();
+    if (!renderOk) {
+      postMsg({ type: 'error', streamId: companionStreamId, message: 'Failed to init rendering for companion' });
+      return;
+    }
   }
 
   // Companion has no pipeline — it receives cloned frames via queueFrame
   // Store with a null pipeline sentinel
-  streams.set(companionStreamId, { pipeline: null as unknown as StreamPipeline, renderer });
+  streams.set(companionStreamId, { pipeline: null, renderer });
   companionMap.set(primaryStreamId, companionStreamId);
   companionSet.add(companionStreamId);
+  postMsg({ type: 'streamReady', streamId: companionStreamId, renderer: renderer.isCanvas2D ? 'canvas2d' : 'webgpu' });
   log.info(`Companion ${companionStreamId} added for primary ${primaryStreamId} (${width}x${height})`);
 }
 

@@ -14,7 +14,8 @@
       "Task(*)",
       "ExitPlanMode",
       "AskUserQuestion",
-      "DeleteFile(*)"
+      "DeleteFile(*)",
+      "WebSearch"
     ]
   }
 }

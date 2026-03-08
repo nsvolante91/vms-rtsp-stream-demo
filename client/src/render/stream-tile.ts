@@ -28,6 +28,8 @@ export interface SharedGPU {
   pipeline: GPURenderPipeline;
   /** Linear-filtering sampler (shared across tiles) */
   sampler: GPUSampler;
+  /** Cached bind group layout from the pipeline */
+  bindGroupLayout: GPUBindGroupLayout;
 }
 
 /**
@@ -82,7 +84,9 @@ export async function initSharedGPU(): Promise<SharedGPU | null> {
     console.error(`[SharedGPU] Device lost: ${info.reason}`, info.message);
   });
 
-  return { device, format, shaderModule, pipeline, sampler };
+  const bindGroupLayout = pipeline.getBindGroupLayout(0);
+
+  return { device, format, shaderModule, pipeline, sampler, bindGroupLayout };
 }
 
 /**
@@ -137,8 +141,33 @@ export class StreamTile {
   private readonly pausedOverlay: HTMLDivElement;
   private _escHandler: ((e: KeyboardEvent) => void) | null = null;
 
+  // ── Double-tap detection (touch) ───────────────────────────
+  private _lastTapTime = 0;
+  private _lastTapX = 0;
+  private _lastTapY = 0;
+
+  // ── Pinch-to-zoom (touch) ─────────────────────────────────
+  private readonly _activePointers = new Map<number, { x: number; y: number }>();
+  private _isPinching = false;
+  private _initialPinchDist = 0;
+  private _initialPinchMidX = 0;
+  private _initialPinchMidY = 0;
+  private _pinchStartCrop: ZoomCrop | null = null;
+
+  // ── One-finger pan (touch, when zoomed) ────────────────────
+  private _isPanning = false;
+  private _panLastX = 0;
+  private _panLastY = 0;
+
+  // ── DPR cap for mobile ─────────────────────────────────────
+  private _maxDPR = 0; // 0 = no cap
+
   // ── Comparison mode ───────────────────────────────────────────
   private _comparisonLabel: string | null = null;
+
+  // ── Worker renderer type ────────────────────────────────────
+  private _workerRenderer: 'webgpu' | 'canvas2d' | null = null;
+  private _rendererBadge: HTMLDivElement | null = null;
 
   constructor(readonly streamId: number) {
     this.log = new Logger(`Tile[${streamId}]`);
@@ -199,11 +228,18 @@ export class StreamTile {
     });
     this.element.appendChild(this.resetZoomBtn);
 
-    // ── Zoom drag handlers ───────────────────────────────────
-    this.element.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-    this.element.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-    this.element.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-    this.element.addEventListener('mouseleave', () => this.cancelDrag());
+    // ── Zoom drag handlers (Pointer Events — unifies mouse + touch + stylus) ──
+    this.element.addEventListener('pointerdown', (e) => this.handlePointerDown(e));
+    this.element.addEventListener('pointermove', (e) => this.handlePointerMove(e));
+    this.element.addEventListener('pointerup', (e) => this.handlePointerUp(e));
+    this.element.addEventListener('pointercancel', (e) => {
+      this._activePointers.delete(e.pointerId);
+      this.cancelDrag();
+    });
+    // Only cancel on pointerleave for mouse — touch uses pointer capture
+    this.element.addEventListener('pointerleave', (e) => {
+      if (e.pointerType !== 'touch') this.cancelDrag();
+    });
     this.element.addEventListener('dblclick', (e) => {
       e.stopPropagation();
       if (this._zoomCrop) {
@@ -222,7 +258,10 @@ export class StreamTile {
     // Keep canvas backing store matched to CSS display size
     this.resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        const dpr = window.devicePixelRatio || 1;
+        let dpr = window.devicePixelRatio || 1;
+        if (this._maxDPR > 0 && dpr > this._maxDPR) {
+          dpr = this._maxDPR;
+        }
         const w = entry.contentRect.width;
         const h = entry.contentRect.height;
         if (w > 0 && h > 0) {
@@ -329,7 +368,7 @@ export class StreamTile {
    * ratio changes to maintain square pixel aspect ratio (letterbox/pillarbox).
    */
   private drawFrameGPU(frame: VideoFrame): void {
-    const { device, pipeline, sampler } = this.gpu!;
+    const { device, pipeline, sampler, bindGroupLayout } = this.gpu!;
 
     try {
       // Update viewport uniform for aspect-ratio-correct rendering
@@ -363,7 +402,7 @@ export class StreamTile {
       });
 
       const bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
+        layout: bindGroupLayout,
         entries: [
           { binding: 0, resource: sampler },
           { binding: 1, resource: externalTexture },
@@ -460,7 +499,10 @@ export class StreamTile {
     if (this._transferred) {
       throw new Error(`Tile ${this.streamId}: canvas already transferred`);
     }
-    const dpr = window.devicePixelRatio || 1;
+    let dpr = window.devicePixelRatio || 1;
+    if (this._maxDPR > 0 && dpr > this._maxDPR) {
+      dpr = this._maxDPR;
+    }
     const rect = this.canvas.getBoundingClientRect();
     const width = Math.round(rect.width * dpr) || 640;
     const height = Math.round(rect.height * dpr) || 360;
@@ -498,24 +540,142 @@ export class StreamTile {
     return this._dragMoved;
   }
 
-  // ── Zoom drag interaction ──────────────────────────────────
+  /** Set maximum DPR cap for ResizeObserver (0 = no cap). */
+  setMaxDPR(maxDPR: number): void {
+    this._maxDPR = maxDPR;
+  }
 
-  private handleMouseDown(e: MouseEvent): void {
-    // Only left button, ignore if clicking on buttons
+  // ── Zoom interaction (Pointer Events) ───────────────────────
+  //
+  // Mouse: drag-to-select rectangle → zoom into that area
+  // Touch: pinch-to-zoom + one-finger pan when zoomed + double-tap reset/2x
+
+  private handlePointerDown(e: PointerEvent): void {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     if (target.closest('.tile-pause-btn') || target.closest('.tile-reset-zoom') || target.closest('.stream-label')) return;
 
-    this._isDragging = true;
-    this._dragMoved = false;
-    const rect = this.element.getBoundingClientRect();
-    this._dragStartX = e.clientX - rect.left;
-    this._dragStartY = e.clientY - rect.top;
+    this.element.setPointerCapture(e.pointerId);
 
-    this.selectionOverlay.style.display = 'none';
+    if (e.pointerType === 'touch') {
+      // ── Touch path: track active pointers for pinch/pan ──
+      const rect = this.element.getBoundingClientRect();
+      this._activePointers.set(e.pointerId, {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      });
+
+      if (this._activePointers.size === 2) {
+        // Two fingers down → start pinch
+        this._isPinching = true;
+        this._isPanning = false;
+        this._dragMoved = true; // suppress click handler
+        this.element.style.touchAction = 'none';
+
+        const pts = Array.from(this._activePointers.values());
+        this._initialPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        this._initialPinchMidX = (pts[0].x + pts[1].x) / 2;
+        this._initialPinchMidY = (pts[0].y + pts[1].y) / 2;
+        this._pinchStartCrop = this._zoomCrop
+          ? { ...this._zoomCrop }
+          : { x: 0, y: 0, w: 1, h: 1 };
+      } else if (this._activePointers.size === 1) {
+        // One finger down — start pan if already zoomed, otherwise just track for tap
+        this._dragMoved = false;
+        if (this._zoomCrop) {
+          this._isPanning = true;
+          this.element.style.touchAction = 'none';
+          this._panLastX = e.clientX - rect.left;
+          this._panLastY = e.clientY - rect.top;
+        }
+      }
+    } else {
+      // ── Mouse path: rectangle selection (unchanged) ──
+      this.element.style.touchAction = 'none';
+      this._isDragging = true;
+      this._dragMoved = false;
+      const rect = this.element.getBoundingClientRect();
+      this._dragStartX = e.clientX - rect.left;
+      this._dragStartY = e.clientY - rect.top;
+      this.selectionOverlay.style.display = 'none';
+    }
   }
 
-  private handleMouseMove(e: MouseEvent): void {
+  private handlePointerMove(e: PointerEvent): void {
+    if (e.pointerType === 'touch') {
+      const rect = this.element.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+      this._activePointers.set(e.pointerId, { x: px, y: py });
+
+      if (this._isPinching && this._activePointers.size >= 2 && this._pinchStartCrop) {
+        // ── Pinch-to-zoom ──
+        const pts = Array.from(this._activePointers.values());
+        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        const midX = (pts[0].x + pts[1].x) / 2;
+        const midY = (pts[0].y + pts[1].y) / 2;
+
+        if (this._initialPinchDist < 1) return;
+        const scale = dist / this._initialPinchDist;
+
+        const sc = this._pinchStartCrop;
+        // New crop size — clamped to [0.05, 1]
+        const newW = Math.min(1, Math.max(0.05, sc.w / scale));
+        const newH = Math.min(1, Math.max(0.05, sc.h / scale));
+
+        // Zoom centered on initial midpoint (in UV space)
+        const midU = sc.x + (this._initialPinchMidX / rect.width) * sc.w;
+        const midV = sc.y + (this._initialPinchMidY / rect.height) * sc.h;
+
+        // Also pan based on midpoint movement
+        const panDU = ((this._initialPinchMidX - midX) / rect.width) * newW;
+        const panDV = ((this._initialPinchMidY - midY) / rect.height) * newH;
+
+        let newX = midU - newW / 2 + panDU;
+        let newY = midV - newH / 2 + panDV;
+
+        // Clamp to [0, 1-size]
+        newX = Math.max(0, Math.min(1 - newW, newX));
+        newY = Math.max(0, Math.min(1 - newH, newY));
+
+        // If zoomed out to full view, reset
+        if (newW >= 0.99 && newH >= 0.99) {
+          this._zoomCrop = null;
+        } else {
+          this._zoomCrop = { x: newX, y: newY, w: newW, h: newH };
+        }
+        this.updateZoomUI();
+        this._zoomCallback?.(this.streamId, this._zoomCrop);
+
+      } else if (this._isPanning && this._zoomCrop && this._activePointers.size === 1) {
+        // ── One-finger pan ──
+        const dx = px - this._panLastX;
+        const dy = py - this._panLastY;
+
+        // Convert pixel movement to UV delta (invert: drag right → shift crop left)
+        const du = (-dx / rect.width) * this._zoomCrop.w;
+        const dv = (-dy / rect.height) * this._zoomCrop.h;
+
+        if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+          this._dragMoved = true;
+        }
+
+        let newX = this._zoomCrop.x + du;
+        let newY = this._zoomCrop.y + dv;
+        newX = Math.max(0, Math.min(1 - this._zoomCrop.w, newX));
+        newY = Math.max(0, Math.min(1 - this._zoomCrop.h, newY));
+
+        this._zoomCrop = { ...this._zoomCrop, x: newX, y: newY };
+        this._zoomCallback?.(this.streamId, this._zoomCrop);
+
+        this._panLastX = px;
+        this._panLastY = py;
+      }
+
+      return;
+    }
+
+    // ── Mouse rectangle selection ──
     if (!this._isDragging) return;
 
     const rect = this.element.getBoundingClientRect();
@@ -525,7 +685,6 @@ export class StreamTile {
     const dx = Math.abs(currentX - this._dragStartX);
     const dy = Math.abs(currentY - this._dragStartY);
 
-    // Require minimum 5px movement to distinguish from click
     if (dx < 5 && dy < 5) return;
     this._dragMoved = true;
 
@@ -541,27 +700,89 @@ export class StreamTile {
     this.selectionOverlay.style.height = `${height}px`;
   }
 
-  private handleMouseUp(e: MouseEvent): void {
+  private handlePointerUp(e: PointerEvent): void {
+    if (e.pointerType === 'touch') {
+      this._activePointers.delete(e.pointerId);
+
+      // If we were pinching and a finger lifts, stop pinching
+      if (this._isPinching) {
+        if (this._activePointers.size < 2) {
+          this._isPinching = false;
+          this._pinchStartCrop = null;
+          // If one finger remains, transition to pan
+          if (this._activePointers.size === 1 && this._zoomCrop) {
+            this._isPanning = true;
+            const remaining = Array.from(this._activePointers.values())[0];
+            this._panLastX = remaining.x;
+            this._panLastY = remaining.y;
+          }
+        }
+        return;
+      }
+
+      // End of pan
+      if (this._isPanning) {
+        this._isPanning = false;
+        this.element.style.touchAction = 'manipulation';
+      }
+
+      // Double-tap detection (reset zoom or zoom 2x)
+      if (!this._dragMoved) {
+        const now = performance.now();
+        const dt = now - this._lastTapTime;
+        const tapDx = Math.abs(e.clientX - this._lastTapX);
+        const tapDy = Math.abs(e.clientY - this._lastTapY);
+
+        if (dt < 300 && tapDx < 30 && tapDy < 30) {
+          if (this._zoomCrop) {
+            // Double-tap when zoomed → reset
+            this.resetZoom();
+          } else {
+            // Double-tap when not zoomed → zoom 2x centered on tap
+            const rect = this.element.getBoundingClientRect();
+            const tapU = (e.clientX - rect.left) / rect.width;
+            const tapV = (e.clientY - rect.top) / rect.height;
+            const w = 0.5, h = 0.5;
+            const x = Math.max(0, Math.min(1 - w, tapU - w / 2));
+            const y = Math.max(0, Math.min(1 - h, tapV - h / 2));
+            this._zoomCrop = { x, y, w, h };
+            this.updateZoomUI();
+            this._zoomCallback?.(this.streamId, this._zoomCrop);
+          }
+          this._lastTapTime = 0;
+          return;
+        }
+
+        this._lastTapTime = now;
+        this._lastTapX = e.clientX;
+        this._lastTapY = e.clientY;
+      }
+
+      if (this._activePointers.size === 0) {
+        this.element.style.touchAction = 'manipulation';
+      }
+      return;
+    }
+
+    // ── Mouse rectangle selection end ──
     if (!this._isDragging) return;
     this._isDragging = false;
     this.selectionOverlay.style.display = 'none';
+    this.element.style.touchAction = 'manipulation';
 
-    if (!this._dragMoved) return; // Was just a click, not a drag
+    if (!this._dragMoved) return;
 
     const rect = this.element.getBoundingClientRect();
     const currentX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
     const currentY = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
 
-    // Calculate normalized crop rect (0..1 relative to tile element)
     const left = Math.min(this._dragStartX, currentX);
     const top = Math.min(this._dragStartY, currentY);
     const width = Math.abs(currentX - this._dragStartX);
     const height = Math.abs(currentY - this._dragStartY);
 
-    // Minimum selection size (10px)
     if (width < 10 || height < 10) return;
 
-    // Convert from tile-element-relative pixels to 0..1 UV coordinates
     const crop: ZoomCrop = {
       x: left / rect.width,
       y: top / rect.height,
@@ -578,6 +799,14 @@ export class StreamTile {
     if (this._isDragging) {
       this._isDragging = false;
       this.selectionOverlay.style.display = 'none';
+      this.element.style.touchAction = 'manipulation';
+    }
+    if (this._isPinching || this._isPanning) {
+      this._isPinching = false;
+      this._isPanning = false;
+      this._pinchStartCrop = null;
+      this._activePointers.clear();
+      this.element.style.touchAction = 'manipulation';
     }
   }
 
@@ -601,9 +830,39 @@ export class StreamTile {
 
   /** Update the label overlay text. */
   updateLabel(resolution: string, fps: number): void {
-    const renderer = this._transferred ? 'WebGPU Worker' : this.useWebGPU ? 'WebGPU' : 'Canvas2D';
+    let renderer: string;
+    if (this._transferred && this._workerRenderer) {
+      renderer = this._workerRenderer === 'webgpu' ? 'WebGPU Worker' : 'Canvas2D Worker';
+    } else if (this._transferred) {
+      renderer = 'Worker';
+    } else {
+      renderer = this.useWebGPU ? 'WebGPU' : 'Canvas2D';
+    }
     const prefix = this._comparisonLabel ? `${this._comparisonLabel} | ` : '';
     this.label.textContent = `${prefix}Stream ${this.streamId > 10000 ? this.streamId - 10000 : this.streamId} | ${resolution} | ${fps} fps | ${renderer}`;
+  }
+
+  /**
+   * Set the actual renderer type reported by the worker.
+   * Shows a red warning badge when Canvas2D fallback is active,
+   * including the reason WebGPU failed.
+   */
+  setWorkerRenderer(renderer: 'webgpu' | 'canvas2d', gpuFailReason?: string): void {
+    this._workerRenderer = renderer;
+
+    if (renderer === 'canvas2d' && !this._rendererBadge) {
+      const badge = document.createElement('div');
+      const reason = gpuFailReason ?? 'unknown';
+      badge.innerHTML = reason.includes('requestAdapter')
+        ? 'Canvas2D fallback — GPU blocklisted.<br>Try chrome://flags/#enable-unsafe-webgpu'
+        : `Canvas2D fallback — WebGPU failed: ${reason}`;
+      badge.style.cssText =
+        'position:absolute;top:4px;right:4px;background:rgba(220,38,38,0.85);' +
+        'color:#fff;font-size:11px;padding:2px 8px;border-radius:4px;' +
+        'pointer-events:none;z-index:10;font-family:monospace;';
+      this.element.appendChild(badge);
+      this._rendererBadge = badge;
+    }
   }
 
   /** Set a comparison mode label prefix (e.g. 'Original' or 'Upscaled'). Null clears it. */
@@ -614,16 +873,7 @@ export class StreamTile {
   /** Set zoom crop externally (for syncing between companion and primary tiles). */
   setZoomExternal(crop: ZoomCrop | null): void {
     this._zoomCrop = crop;
-    // Update the visual indicators (zoom level label, reset button)
-    if (this._zoomCrop) {
-      const zoomX = 1 / this._zoomCrop.w;
-      const zoomY = 1 / this._zoomCrop.h;
-      const effectiveZoom = Math.min(zoomX, zoomY);
-      this.zoomLevelLabel.textContent = `${effectiveZoom.toFixed(1)}×`;
-      this.resetZoomBtn.classList.add('visible');
-    } else {
-      this.resetZoomBtn.classList.remove('visible');
-    }
+    this.updateZoomUI();
   }
 
   /** Remove from DOM and clean up. */
@@ -647,6 +897,8 @@ export class StreamTile {
     }
 
     this.gpu = null;
+    this._rendererBadge?.remove();
+    this._rendererBadge = null;
     this.element.remove();
     this.log.info('Destroyed');
   }

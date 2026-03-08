@@ -14,6 +14,39 @@ import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { createHash } from 'crypto';
 import { join } from 'path';
 
+/**
+ * Resolve the openssl binary path.
+ * On Windows, openssl may not be in the system PATH but is typically
+ * bundled with Git for Windows. Falls back to bare 'openssl' for
+ * systems where it's already in PATH (Linux, macOS).
+ */
+function resolveOpenssl(): string {
+  // Try bare openssl first
+  try {
+    execSync('openssl version', { stdio: 'pipe' });
+    return 'openssl';
+  } catch {
+    // Not in PATH
+  }
+
+  // On Windows, check common Git for Windows locations
+  if (process.platform === 'win32') {
+    const candidates = [
+      join('C:', 'Program Files', 'Git', 'mingw64', 'bin', 'openssl.exe'),
+      join('C:', 'Program Files', 'Git', 'usr', 'bin', 'openssl.exe'),
+      join('C:', 'Program Files (x86)', 'Git', 'mingw64', 'bin', 'openssl.exe'),
+    ];
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        return `"${candidate}"`;
+      }
+    }
+  }
+
+  // Fall back and let it fail with a clear error
+  return 'openssl';
+}
+
 /** Generated certificate material */
 export interface CertMaterial {
   /** PEM-encoded certificate */
@@ -50,12 +83,14 @@ export function generateCertificate(): CertMaterial {
   const certPath = join(CERT_DIR, 'cert.pem');
   const keyPath = join(CERT_DIR, 'key.pem');
 
+  const openssl = resolveOpenssl();
+
   // Generate ECDSA P-256 self-signed cert valid for 13 days
   // CRITICAL: basicConstraints=CA:FALSE is required for Chrome's WebTransport
   // certificate hash validation. OpenSSL's `req -x509` defaults to CA:TRUE
   // which Chrome rejects per the WebTransport spec.
   execSync(
-    `openssl req -new -x509 -nodes ` +
+    `${openssl} req -new -x509 -nodes ` +
       `-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
       `-keyout "${keyPath}" -out "${certPath}" ` +
       `-days 13 -subj "/CN=localhost" ` +
@@ -88,9 +123,13 @@ export function generateCertificate(): CertMaterial {
  * @returns SHA-256 hash as Uint8Array
  */
 function computeCertHash(certPath: string): Uint8Array {
-  const der = execSync(`openssl x509 -in "${certPath}" -outform DER`, {
-    encoding: 'buffer',
-  });
+  // Convert PEM to DER in pure Node.js (no openssl needed)
+  const pem = readFileSync(certPath, 'utf-8');
+  const b64 = pem
+    .replace(/-----BEGIN CERTIFICATE-----/, '')
+    .replace(/-----END CERTIFICATE-----/, '')
+    .replace(/\s/g, '');
+  const der = Buffer.from(b64, 'base64');
 
   const hash = createHash('sha256').update(der).digest();
   return new Uint8Array(hash);

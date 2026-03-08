@@ -8,6 +8,8 @@
  */
 
 import { Logger } from './utils/logger';
+import { detectDevice, isUpscaleModeAllowed, getHeavyUpscaleModes } from './utils/device';
+import type { DeviceProfile } from './utils/device';
 import { StreamTile } from './render/stream-tile';
 import { MetricsCollector } from './perf/metrics-collector';
 import { Dashboard } from './perf/dashboard';
@@ -15,22 +17,28 @@ import { BenchmarkRunner } from './perf/benchmark-runner';
 import type { BenchmarkReport } from './perf/benchmark-runner';
 import { Controls } from './ui/controls';
 import { StreamOverlay } from './ui/stream-overlay';
+import { suggestColumns } from './render/grid-layout';
 import type { WorkerToMainMessage, MainToWorkerMessage } from './worker/messages';
 
 /**
- * REST API base URL.
- * Uses 127.0.0.1 instead of 'localhost' because macOS resolves localhost
- * to IPv6 (::1) first, but the QUIC/UDP server binds to IPv4 (0.0.0.0).
- * Chrome's Happy Eyeballs prefers IPv6 and fails when no UDP listener exists on ::1.
+ * Derive server URLs based on the current hostname.
+ *
+ * When running on localhost/127.0.0.1, use the hardcoded 127.0.0.1 addresses
+ * to avoid the macOS IPv6 issue. When accessed from another device on the LAN
+ * (e.g. a phone), use the current hostname so the phone can reach the bridge server.
  */
-const API_URL = 'http://127.0.0.1:9000';
+function deriveServerUrls(): { apiUrl: string; wtUrl: string } {
+  const host = window.location.hostname;
+  const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  const serverHost = isLocalhost ? '127.0.0.1' : host;
 
-/**
- * WebTransport bridge server URL.
- * Must use 127.0.0.1 to match the server's IPv4 UDP socket binding.
- * The server's TLS certificate includes IP:127.0.0.1 in its SAN.
- */
-const WT_URL = 'https://127.0.0.1:9001/streams';
+  return {
+    apiUrl: '/api',
+    wtUrl: `https://${serverHost}:9001/streams`,
+  };
+}
+
+const { apiUrl: API_URL, wtUrl: WT_URL } = deriveServerUrls();
 
 /** REST endpoint for certificate hash (for WebTransport pinning) */
 const CERT_HASH_URL = `${API_URL}/cert-hash`;
@@ -86,6 +94,10 @@ class VMSApp {
   private metricsInterval = 0;
   private metricsOverlayEnabled = false;
 
+  // ── Device detection ──────────────────────────────────────────
+  private readonly deviceProfile: DeviceProfile;
+  private orientationQuery: MediaQueryList | null = null;
+
   // ── Comparison mode state ─────────────────────────────────────
   private compareMode = false;
   /** Offset added to primary streamId to derive companion streamId */
@@ -97,12 +109,17 @@ class VMSApp {
 
   constructor() {
     this.metrics = new MetricsCollector();
+    this.deviceProfile = detectDevice();
 
     const dashboardEl = document.getElementById('dashboard');
     if (!dashboardEl) {
       throw new Error('Dashboard element not found');
     }
     this.dashboard = new Dashboard(dashboardEl, this.metrics);
+
+    if (this.deviceProfile.isMobile) {
+      log.info(`Mobile device detected (maxStreams=${this.deviceProfile.maxStreams}, maxDPR=${this.deviceProfile.maxDPR}, gpu=${this.deviceProfile.gpuPowerPreference})`);
+    }
   }
 
   /**
@@ -114,14 +131,33 @@ class VMSApp {
   async init(): Promise<void> {
     log.info('Initializing VMS Prototype (worker mode)');
 
-    // Feature detection
+    // Feature detection — distinguish insecure context from missing API
     if (typeof VideoDecoder === 'undefined') {
-      this.showError('Missing WebCodecs (VideoDecoder). Please use Chrome 113+ or Safari 17+.');
+      if (!window.isSecureContext) {
+        this.showError(
+          'Insecure context — WebCodecs requires HTTPS.\n\n' +
+          'You are accessing this page over plain HTTP. ' +
+          'WebCodecs (VideoDecoder) is only available in secure contexts (HTTPS or localhost).\n\n' +
+          'Access via https:// and accept the self-signed certificate warning.'
+        );
+      } else {
+        this.showError(
+          'Missing WebCodecs (VideoDecoder).\n\n' +
+          'Your browser does not support the WebCodecs API. ' +
+          'Please use Chrome 113+, Edge 113+, or Safari 17+.'
+        );
+      }
       return;
     }
 
     // Spawn worker and wait for WebTransport connection
-    await this.initWorker();
+    try {
+      await this.initWorker();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.showError(`Connection failed: ${msg}`);
+      return;
+    }
 
     this.gridContainer = document.getElementById('video-grid') as HTMLDivElement | null;
     if (!this.gridContainer) {
@@ -138,15 +174,41 @@ class VMSApp {
       () => this.runBenchmark(),
       () => this.exportMetrics(),
       () => this.dashboard.toggle(),
-      (mode) => this.postWorker({ type: 'setUpscale', mode }),
+      (mode) => {
+        if (!isUpscaleModeAllowed(mode, this.deviceProfile.isMobile)) {
+          log.warn(`Upscale mode "${mode}" too heavy for mobile — ignoring`);
+          return;
+        }
+        this.postWorker({ type: 'setUpscale', mode });
+      },
       () => this.toggleMetricsOverlay(),
       () => this.resetMetrics(),
       () => this.toggleCompareMode(),
     );
     this.controls.init();
 
+    // Disable heavy upscale options on mobile
+    if (this.deviceProfile.isMobile) {
+      const upscaleSelect = document.getElementById('upscale-select') as HTMLSelectElement | null;
+      if (upscaleSelect) {
+        const heavyModes = getHeavyUpscaleModes();
+        for (const option of Array.from(upscaleSelect.options)) {
+          if (heavyModes.has(option.value)) {
+            option.disabled = true;
+            option.textContent += ' (mobile: too heavy)';
+          }
+        }
+      }
+    }
+
     // Start dashboard
     this.dashboard.start();
+
+    // Orientation change listener (auto-adjust columns on mobile)
+    if (this.deviceProfile.isMobile) {
+      this.orientationQuery = window.matchMedia('(orientation: portrait)');
+      this.orientationQuery.addEventListener('change', () => this.handleOrientationChange());
+    }
 
     // 1Hz polling for tile label updates (uses cached worker metrics)
     this.metricsInterval = window.setInterval(() => this.updateMetrics(), 1000);
@@ -201,7 +263,12 @@ class VMSApp {
       reject = (e) => { initDone(); origReject(e); };
 
       // Send init message to worker
-      this.postWorker({ type: 'init', wtUrl: WT_URL, certHashUrl: CERT_HASH_URL });
+      this.postWorker({
+        type: 'init',
+        wtUrl: WT_URL,
+        certHashUrl: CERT_HASH_URL,
+        gpuPowerPreference: this.deviceProfile.gpuPowerPreference,
+      });
     });
   }
 
@@ -223,6 +290,15 @@ class VMSApp {
           log.error(`Worker error: ${msg.message}`);
         }
         break;
+
+      case 'streamReady': {
+        const entry = this.streams.get(msg.streamId);
+        if (entry) {
+          entry.tile.setWorkerRenderer(msg.renderer, msg.gpuFailReason);
+          log.info(`Stream ${msg.streamId} renderer: ${msg.renderer}${msg.gpuFailReason ? ` (WebGPU failed: ${msg.gpuFailReason})` : ''}`);
+        }
+        break;
+      }
 
       case 'metrics':
         // Update cached worker metrics and feed into MetricsCollector
@@ -293,10 +369,22 @@ class VMSApp {
       return;
     }
 
+    // Enforce max streams on mobile
+    if (this.streams.size >= this.deviceProfile.maxStreams) {
+      log.warn(`Max streams (${this.deviceProfile.maxStreams}) reached`);
+      return;
+    }
+
     const streamId = this.nextStreamId++;
     log.info(`Adding stream ${streamId}`);
 
     const tile = new StreamTile(streamId);
+
+    // Cap DPR on mobile to reduce GPU fill rate
+    if (this.deviceProfile.maxDPR < (window.devicePixelRatio || 1)) {
+      tile.setMaxDPR(this.deviceProfile.maxDPR);
+    }
+
     this.gridContainer.appendChild(tile.element);
 
     // Click to toggle focus (only if it wasn't a drag-to-zoom)
@@ -410,6 +498,22 @@ class VMSApp {
     this.updateGridCSS();
     this.applyFocus();
     log.info(`Layout set to ${columns} columns`);
+  }
+
+  /**
+   * Handle orientation change on mobile devices.
+   * Auto-adjusts column count based on portrait/landscape.
+   */
+  private handleOrientationChange(): void {
+    if (!this.deviceProfile.isMobile || !this.gridContainer) return;
+
+    const containerAspect = this.gridContainer.clientWidth / this.gridContainer.clientHeight;
+    const suggested = suggestColumns(this.streams.size, containerAspect, true);
+    if (suggested !== null && suggested !== this.columns) {
+      this.columns = suggested;
+      this.updateGridCSS();
+      log.info(`Orientation change → ${suggested} column(s)`);
+    }
   }
 
   /**
