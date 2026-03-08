@@ -6,3 +6,7 @@ test-videos/
 .env
 *.log
 .DS_Store
+# ORT WASM files copied from node_modules (see client/public/)
+client/public/ort-wasm-*
+# YOLO model files
+client/public/models/*.onnx

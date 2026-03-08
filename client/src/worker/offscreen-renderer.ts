@@ -17,6 +17,9 @@ import spectralShaderCode from '../render/spectral-shaders.wgsl?raw';
 import vqsrShaderCode from '../render/vqsr-shaders.wgsl?raw';
 import genShaderCode from '../render/gen-shaders.wgsl?raw';
 import dlssShaderCode from '../render/dlss-shaders.wgsl?raw';
+import motionShaderCode from '../render/motion-shaders.wgsl?raw';
+import lowlightShaderCode from '../render/lowlight-shaders.wgsl?raw';
+import hdrShaderCode from '../render/hdr-shaders.wgsl?raw';
 import { CNNVL, CNNM } from 'anime4k-webgpu';
 import type { Anime4KPipeline } from 'anime4k-webgpu';
 
@@ -68,6 +71,28 @@ export interface DLSSPipelines {
   shaderModule: GPUShaderModule;
 }
 
+/** Lazy-initialized compute pipelines for motion detection */
+export interface MotionPipelines {
+  frameDiff: GPUComputePipeline;
+  zoneReduce: GPUComputePipeline;
+  shaderModule: GPUShaderModule;
+}
+
+/** Lazy-initialized compute pipelines for low-light enhancement */
+export interface LowLightPipelines {
+  luminance: GPUComputePipeline;
+  denoise: GPUComputePipeline;
+  enhance: GPUComputePipeline;
+  shaderModule: GPUShaderModule;
+}
+
+/** Lazy-initialized compute pipelines for HDR tone mapping */
+export interface HDRPipelines {
+  histogram: GPUComputePipeline;
+  tonemap: GPUComputePipeline;
+  shaderModule: GPUShaderModule;
+}
+
 /** Shared GPU state initialized once per worker, reused by all renderers */
 export interface WorkerGPU {
   device: GPUDevice;
@@ -92,6 +117,12 @@ export interface WorkerGPU {
   gen?: GENPipelines;
   /** Lazy DLSS compute pipelines — created on first use */
   dlss?: DLSSPipelines;
+  /** Lazy motion detection compute pipelines — created on first use */
+  motion?: MotionPipelines;
+  /** Lazy low-light enhancement compute pipelines — created on first use */
+  lowlight?: LowLightPipelines;
+  /** Lazy HDR tone mapping compute pipelines — created on first use */
+  hdr?: HDRPipelines;
 }
 
 /** Maximum number of pre-allocated viewport uniform buffers */
@@ -388,6 +419,77 @@ export function ensureDLSSPipelines(gpu: WorkerGPU): DLSSPipelines {
 }
 
 /**
+ * Lazily initialize motion detection compute pipelines.
+ */
+export function ensureMotionPipelines(gpu: WorkerGPU): MotionPipelines {
+  if (gpu.motion) return gpu.motion;
+
+  const shaderModule = gpu.device.createShaderModule({ code: motionShaderCode });
+
+  const frameDiff = gpu.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shaderModule, entryPoint: 'motion_frame_diff' },
+  });
+
+  const zoneReduce = gpu.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shaderModule, entryPoint: 'motion_zone_reduce' },
+  });
+
+  gpu.motion = { frameDiff, zoneReduce, shaderModule };
+  return gpu.motion;
+}
+
+/**
+ * Lazily initialize low-light enhancement compute pipelines.
+ */
+export function ensureLowLightPipelines(gpu: WorkerGPU): LowLightPipelines {
+  if (gpu.lowlight) return gpu.lowlight;
+
+  const shaderModule = gpu.device.createShaderModule({ code: lowlightShaderCode });
+
+  const luminance = gpu.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shaderModule, entryPoint: 'lowlight_luminance' },
+  });
+
+  const denoise = gpu.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shaderModule, entryPoint: 'lowlight_denoise' },
+  });
+
+  const enhance = gpu.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shaderModule, entryPoint: 'lowlight_enhance' },
+  });
+
+  gpu.lowlight = { luminance, denoise, enhance, shaderModule };
+  return gpu.lowlight;
+}
+
+/**
+ * Lazily initialize HDR tone mapping compute pipelines.
+ */
+export function ensureHDRPipelines(gpu: WorkerGPU): HDRPipelines {
+  if (gpu.hdr) return gpu.hdr;
+
+  const shaderModule = gpu.device.createShaderModule({ code: hdrShaderCode });
+
+  const histogram = gpu.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shaderModule, entryPoint: 'hdr_histogram' },
+  });
+
+  const tonemap = gpu.device.createComputePipeline({
+    layout: 'auto',
+    compute: { module: shaderModule, entryPoint: 'hdr_tonemap' },
+  });
+
+  gpu.hdr = { histogram, tonemap, shaderModule };
+  return gpu.hdr;
+}
+
+/**
  * Renders VideoFrames to an OffscreenCanvas via WebGPU.
  *
  * CRITICAL: drawFrame() calls frame.close() after rendering.
@@ -504,6 +606,43 @@ export class OffscreenRenderer {
   private dlssFrameCount = 0;
   private lastDlssW = 0;
   private lastDlssH = 0;
+
+  // ── Motion detection state (Demo 1) ──────────────────────────
+  private prevMotionFrameTex: GPUTexture | null = null;
+  private motionMaskTex: GPUTexture | null = null;
+  private motionUniformBuffer: GPUBuffer | null = null;
+  private readonly motionUniformData = new Float32Array(8);
+  private motionZoneBuffer: GPUBuffer | null = null;
+  private motionZoneResultBuffer: GPUBuffer | null = null;
+  private motionZoneResultReadBuffer: GPUBuffer | null = null;
+  private motionZoneUniformBuffer: GPUBuffer | null = null;
+  private motionEnabled = false;
+  private motionZones: import('./messages').AlertZoneRect[] = [];
+  private motionReadbackPending = false;
+  private lastMotionW = 0;
+  private lastMotionH = 0;
+  /** Callback for motion alert results */
+  motionAlertCallback: ((zones: Map<number, number>) => void) | null = null;
+
+  // ── Low-light enhancement state (Demo 2) ────────────────────
+  private lowlightLumaTex: GPUTexture | null = null;
+  private lowlightLumaStatsBuf: GPUBuffer | null = null;
+  private lowlightDenoisedTex: GPUTexture | null = null;
+  private lowlightHistoryTex: GPUTexture | null = null;
+  private lowlightOutputTex: GPUTexture | null = null;
+  private lowlightUniformBuffer: GPUBuffer | null = null;
+  private readonly lowlightUniformData = new Float32Array(8);
+  private lowlightFrameCount = 0;
+  private lastLowlightW = 0;
+  private lastLowlightH = 0;
+
+  // ── HDR tone mapping state (Demo 2) ─────────────────────────
+  private hdrHistogramBuf: GPUBuffer | null = null;
+  private hdrOutputTex: GPUTexture | null = null;
+  private hdrUniformBuffer: GPUBuffer | null = null;
+  private readonly hdrUniformData = new Float32Array(8);
+  private lastHdrW = 0;
+  private lastHdrH = 0;
 
   /** Canvas2D fallback context (used when WebGPU is unavailable) */
   private ctx2d: OffscreenCanvasRenderingContext2D | null = null;
@@ -628,7 +767,7 @@ export class OffscreenRenderer {
 
   /** Set GPU upscale mode for this renderer */
   setUpscaleMode(mode: UpscaleMode): void {
-    const modeMap: Record<UpscaleMode, number> = { off: 0, cas: 1, fsr: 2, a4k: 3, tsr: 4, spec: 5, vqsr: 6, gen: 7, dlss: 8, 'a4k-fast': 9 };
+    const modeMap: Record<UpscaleMode, number> = { off: 0, cas: 1, fsr: 2, a4k: 3, tsr: 4, spec: 5, vqsr: 6, gen: 7, dlss: 8, 'a4k-fast': 9, lowlight: 10, hdr: 11 };
     const prev = this.upscaleModeValue;
     this.upscaleModeValue = modeMap[mode];
     this.uniformsDirty = true;
@@ -650,6 +789,14 @@ export class OffscreenRenderer {
       this.dlssFrameCount = 0;
     }
 
+    // Reset low-light temporal denoise when entering/leaving
+    if (prev === 10 && this.upscaleModeValue !== 10) {
+      this.lowlightFrameCount = 0;
+    }
+    if (prev !== 10 && this.upscaleModeValue === 10) {
+      this.lowlightFrameCount = 0;
+    }
+
     // Lazy-init compute/blit pipelines
     if (this.gpu) {
       if (this.upscaleModeValue === 3 || this.upscaleModeValue === 9) ensureBlitPipeline(this.gpu);
@@ -658,6 +805,8 @@ export class OffscreenRenderer {
       if (this.upscaleModeValue === 6) ensureVQSRPipelines(this.gpu);
       if (this.upscaleModeValue === 7) ensureGENPipelines(this.gpu);
       if (this.upscaleModeValue === 8) ensureDLSSPipelines(this.gpu);
+      if (this.upscaleModeValue === 10) ensureLowLightPipelines(this.gpu);
+      if (this.upscaleModeValue === 11) ensureHDRPipelines(this.gpu);
     }
   }
 
@@ -797,6 +946,16 @@ export class OffscreenRenderer {
           return this.encodeDLSS(device, externalTexture, sampler, videoW, videoH);
         }
 
+        // ── Low-light compute path ───────────────────────────
+        if (this.upscaleModeValue === 10) {
+          return this.encodeLowLight(device, externalTexture, sampler, videoW, videoH);
+        }
+
+        // ── HDR compute path ─────────────────────────────────
+        if (this.upscaleModeValue === 11) {
+          return this.encodeHDR(device, externalTexture, sampler, videoW, videoH);
+        }
+
         // ── Standard render path (off/cas/fsr) ───────────────
         // Reuse pre-allocated bind group descriptor, mutating only the texture entry
         if (!this.bindGroupDesc) {
@@ -830,6 +989,38 @@ export class OffscreenRenderer {
         renderPass.setBindGroup(0, bindGroup);
         renderPass.draw(4);
         renderPass.end();
+
+        // Motion detection: capture frame into sourceCopyTex and run compute passes
+        if (this.motionEnabled && this.gpu.motion && this.motionZones.length > 0) {
+          const cw = this.canvas.width;
+          const ch = this.canvas.height;
+          this.ensureIntermediateTextures(device, cw, ch);
+          if (this.sourceCopyTex && this.copyViewportBuffer) {
+            const { copyPipeline, copyBindGroupLayout } = this.gpu;
+            this.writeCopyViewport(device, frame.displayWidth, frame.displayHeight);
+            const motionCopyBG = device.createBindGroup({
+              layout: copyBindGroupLayout,
+              entries: [
+                { binding: 0, resource: sampler },
+                { binding: 1, resource: externalTexture },
+                { binding: 2, resource: { buffer: this.copyViewportBuffer } },
+              ],
+            });
+            const motionCopyPass = commandEncoder.beginRenderPass({
+              colorAttachments: [{
+                view: this.sourceCopyTex.createView(),
+                clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                loadOp: 'clear',
+                storeOp: 'store',
+              }],
+            });
+            motionCopyPass.setPipeline(copyPipeline);
+            motionCopyPass.setBindGroup(0, motionCopyBG);
+            motionCopyPass.draw(4);
+            motionCopyPass.end();
+            this.encodeMotionDetection(device, commandEncoder);
+          }
+        }
 
         return commandEncoder.finish();
       } catch (e) {
@@ -1067,6 +1258,7 @@ export class OffscreenRenderer {
     blitPass.draw(4);
     blitPass.end();
 
+    this.encodeMotionDetection(device, commandEncoder);
     return commandEncoder.finish();
   }
 
@@ -1233,6 +1425,7 @@ export class OffscreenRenderer {
 
     this.tsrFrameCount++;
 
+    this.encodeMotionDetection(device, commandEncoder);
     return commandEncoder.finish();
   }
 
@@ -1463,6 +1656,7 @@ export class OffscreenRenderer {
     idctPass.dispatchWorkgroups(wg8X, wg8Y);
     idctPass.end();
 
+    this.encodeMotionDetection(device, commandEncoder);
     return commandEncoder.finish();
   }
 
@@ -1606,6 +1800,7 @@ export class OffscreenRenderer {
     blndPass.dispatchWorkgroups(wgFullX, wgFullY);
     blndPass.end();
 
+    this.encodeMotionDetection(device, commandEncoder);
     return commandEncoder.finish();
   }
 
@@ -1801,6 +1996,7 @@ export class OffscreenRenderer {
     blendPass.dispatchWorkgroups(wg8X, wg8Y);
     blendPass.end();
 
+    this.encodeMotionDetection(device, commandEncoder);
     return commandEncoder.finish();
   }
 
@@ -2061,6 +2257,7 @@ export class OffscreenRenderer {
 
     this.dlssFrameCount++;
 
+    this.encodeMotionDetection(device, commandEncoder);
     return commandEncoder.finish();
   }
 
@@ -2076,6 +2273,562 @@ export class OffscreenRenderer {
       this.gpu.device.queue.submit([cmdBuf]);
     }
     try { frame.close(); } catch { /* already closed */ }
+  }
+
+  // ── Motion Detection (Demo 1) ─────────────────────────────
+
+  /** Enable or disable motion detection for this renderer */
+  setMotionDetection(enabled: boolean): void {
+    this.motionEnabled = enabled;
+    if (enabled && this.gpu) {
+      ensureMotionPipelines(this.gpu);
+    }
+  }
+
+  /** Add an alert zone for motion detection */
+  addMotionZone(zone: import('./messages').AlertZoneRect): void {
+    this.motionZones.push(zone);
+  }
+
+  /** Remove an alert zone */
+  removeMotionZone(zoneId: number): void {
+    this.motionZones = this.motionZones.filter(z => z.id !== zoneId);
+  }
+
+  /**
+   * Encode motion detection compute pass (called after render).
+   * Runs frame diff + zone reduction and triggers async readback at 1Hz.
+   */
+  encodeMotionDetection(device: GPUDevice, commandEncoder: GPUCommandEncoder): void {
+    if (!this.motionEnabled || !this.gpu?.motion || this.motionZones.length === 0) return;
+    if (!this.sourceCopyTex) return;
+
+    const w = this.sourceCopyTex.width;
+    const h = this.sourceCopyTex.height;
+    const pipelines = this.gpu.motion;
+
+    // Ensure motion textures
+    if (this.lastMotionW !== w || this.lastMotionH !== h || !this.prevMotionFrameTex) {
+      this.prevMotionFrameTex?.destroy();
+      this.motionMaskTex?.destroy();
+
+      const texUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING |
+                       GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC;
+
+      this.prevMotionFrameTex = device.createTexture({
+        size: { width: w, height: h },
+        format: 'rgba8unorm',
+        usage: texUsage,
+      });
+
+      this.motionMaskTex = device.createTexture({
+        size: { width: w, height: h },
+        format: 'r32float',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+      });
+
+      if (!this.motionUniformBuffer) {
+        this.motionUniformBuffer = device.createBuffer({
+          size: 32,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+      }
+
+      this.lastMotionW = w;
+      this.lastMotionH = h;
+    }
+
+    // Update uniforms
+    this.motionUniformData[0] = 1.0 / w;
+    this.motionUniformData[1] = 1.0 / h;
+    this.motionUniformData[2] = w;
+    this.motionUniformData[3] = h;
+    this.motionUniformData[4] = 0.04; // threshold
+    device.queue.writeBuffer(this.motionUniformBuffer!, 0, this.motionUniformData);
+
+    // Pass 1: Frame Diff
+    const diffBG0 = device.createBindGroup({
+      layout: pipelines.frameDiff.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sourceCopyTex.createView() },
+        { binding: 1, resource: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }) },
+        { binding: 2, resource: { buffer: this.motionUniformBuffer! } },
+      ],
+    });
+    const diffBG1 = device.createBindGroup({
+      layout: pipelines.frameDiff.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: this.prevMotionFrameTex!.createView() },
+        { binding: 1, resource: this.motionMaskTex!.createView() },
+      ],
+    });
+
+    const wgX = Math.ceil(w / 8);
+    const wgY = Math.ceil(h / 8);
+
+    const pass1 = commandEncoder.beginComputePass();
+    pass1.setPipeline(pipelines.frameDiff);
+    pass1.setBindGroup(0, diffBG0);
+    pass1.setBindGroup(1, diffBG1);
+    pass1.dispatchWorkgroups(wgX, wgY);
+    pass1.end();
+
+    // Pass 2: Zone Reduction
+    const zoneCount = this.motionZones.length;
+    const zoneDataSize = zoneCount * 16; // 4 floats × 4 bytes each
+    const resultSize = zoneCount * 2 * 4; // 2 u32 per zone
+
+    // Recreate zone buffers if needed
+    if (!this.motionZoneBuffer || this.motionZoneBuffer.size < zoneDataSize) {
+      this.motionZoneBuffer?.destroy();
+      this.motionZoneBuffer = device.createBuffer({
+        size: Math.max(zoneDataSize, 16),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+    }
+    if (!this.motionZoneResultBuffer || this.motionZoneResultBuffer.size < resultSize) {
+      this.motionZoneResultBuffer?.destroy();
+      this.motionZoneResultReadBuffer?.destroy();
+      this.motionZoneResultBuffer = device.createBuffer({
+        size: Math.max(resultSize, 8),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+      });
+      this.motionZoneResultReadBuffer = device.createBuffer({
+        size: Math.max(resultSize, 8),
+        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      });
+    }
+    if (!this.motionZoneUniformBuffer) {
+      this.motionZoneUniformBuffer = device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    // Write zone data
+    const zoneData = new Float32Array(zoneCount * 4);
+    for (let i = 0; i < zoneCount; i++) {
+      const z = this.motionZones[i];
+      zoneData[i * 4] = z.x;
+      zoneData[i * 4 + 1] = z.y;
+      zoneData[i * 4 + 2] = z.w;
+      zoneData[i * 4 + 3] = z.h;
+    }
+    device.queue.writeBuffer(this.motionZoneBuffer!, 0, zoneData);
+
+    // Clear results buffer (zero out)
+    const zeroData = new Uint32Array(zoneCount * 2);
+    device.queue.writeBuffer(this.motionZoneResultBuffer!, 0, zeroData);
+
+    // Write zone uniforms
+    const zoneUniforms = new Float32Array(4);
+    zoneUniforms[0] = w;
+    zoneUniforms[1] = h;
+    const zoneUniformsU32 = new Uint32Array(zoneUniforms.buffer);
+    zoneUniformsU32[2] = zoneCount;
+    device.queue.writeBuffer(this.motionZoneUniformBuffer!, 0, zoneUniforms);
+
+    const reduceBG2 = device.createBindGroup({
+      layout: pipelines.zoneReduce.getBindGroupLayout(2),
+      entries: [
+        { binding: 0, resource: this.motionMaskTex!.createView() },
+        { binding: 1, resource: { buffer: this.motionZoneBuffer! } },
+        { binding: 2, resource: { buffer: this.motionZoneResultBuffer! } },
+        { binding: 3, resource: { buffer: this.motionZoneUniformBuffer! } },
+      ],
+    });
+
+    const pass2 = commandEncoder.beginComputePass();
+    pass2.setPipeline(pipelines.zoneReduce);
+    pass2.setBindGroup(2, reduceBG2);
+    pass2.dispatchWorkgroups(wgX, wgY);
+    pass2.end();
+
+    // Copy current frame to previous for next comparison
+    commandEncoder.copyTextureToTexture(
+      { texture: this.sourceCopyTex },
+      { texture: this.prevMotionFrameTex! },
+      { width: w, height: h },
+    );
+
+    // Copy results for readback
+    commandEncoder.copyBufferToBuffer(
+      this.motionZoneResultBuffer!, 0,
+      this.motionZoneResultReadBuffer!, 0,
+      resultSize,
+    );
+
+    // Schedule async readback (if not already pending)
+    if (!this.motionReadbackPending) {
+      this.motionReadbackPending = true;
+      // Readback after submit — schedule via microtask
+      queueMicrotask(() => {
+        this.readMotionResults(zoneCount);
+      });
+    }
+  }
+
+  /** Read back motion detection results from GPU */
+  private async readMotionResults(zoneCount: number): Promise<void> {
+    if (!this.motionZoneResultReadBuffer) {
+      this.motionReadbackPending = false;
+      return;
+    }
+
+    try {
+      await this.motionZoneResultReadBuffer.mapAsync(GPUMapMode.READ);
+      const data = new Uint32Array(this.motionZoneResultReadBuffer.getMappedRange());
+      const results = new Map<number, number>();
+
+      for (let i = 0; i < zoneCount && i < this.motionZones.length; i++) {
+        const motionPixels = data[i * 2];
+        const totalPixels = data[i * 2 + 1];
+        const score = totalPixels > 0 ? motionPixels / totalPixels : 0;
+        results.set(this.motionZones[i].id, score);
+      }
+
+      this.motionZoneResultReadBuffer.unmap();
+      this.motionAlertCallback?.(results);
+    } catch {
+      // Buffer may have been destroyed
+    }
+    this.motionReadbackPending = false;
+  }
+
+  // ── Low-Light Enhancement (Demo 2) ──────────────────────────
+
+  /** Ensure low-light textures exist at the right size */
+  private ensureLowLightTextures(device: GPUDevice, w: number, h: number): void {
+    if (this.lastLowlightW === w && this.lastLowlightH === h && this.lowlightLumaTex) return;
+
+    this.lowlightLumaTex?.destroy();
+    this.lowlightLumaStatsBuf?.destroy();
+    this.lowlightDenoisedTex?.destroy();
+    this.lowlightHistoryTex?.destroy();
+    this.lowlightOutputTex?.destroy();
+
+    const texUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
+
+    this.lowlightLumaTex = device.createTexture({
+      size: { width: w, height: h },
+      format: 'r32float',
+      usage: texUsage,
+    });
+
+    this.lowlightDenoisedTex = device.createTexture({
+      size: { width: w, height: h },
+      format: 'rgba8unorm',
+      usage: texUsage | GPUTextureUsage.COPY_SRC,
+    });
+
+    this.lowlightHistoryTex = device.createTexture({
+      size: { width: w, height: h },
+      format: 'rgba8unorm',
+      usage: texUsage | GPUTextureUsage.COPY_DST,
+    });
+
+    this.lowlightOutputTex = device.createTexture({
+      size: { width: w, height: h },
+      format: 'rgba8unorm',
+      usage: texUsage | GPUTextureUsage.COPY_SRC,
+    });
+
+    // 2 u32 values: sum, count
+    this.lowlightLumaStatsBuf = device.createBuffer({
+      size: 8,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    if (!this.lowlightUniformBuffer) {
+      this.lowlightUniformBuffer = device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    this.lastLowlightW = w;
+    this.lastLowlightH = h;
+    this.lowlightFrameCount = 0;
+  }
+
+  /** Encode low-light enhancement passes */
+  private encodeLowLight(
+    device: GPUDevice,
+    externalTexture: GPUExternalTexture,
+    sampler: GPUSampler,
+    videoW: number,
+    videoH: number,
+  ): GPUCommandBuffer | null {
+    if (!this.gpu?.lowlight || !this.gpuContext) return null;
+    const { copyPipeline, copyBindGroupLayout } = this.gpu;
+    const pipelines = this.gpu.lowlight;
+    const cw = this.canvas.width;
+    const ch = this.canvas.height;
+
+    this.ensureIntermediateTextures(device, cw, ch);
+    this.ensureLowLightTextures(device, cw, ch);
+    this.writeCopyViewport(device, videoW, videoH);
+
+    // Update uniforms
+    this.lowlightUniformData[0] = 1.0 / cw;
+    this.lowlightUniformData[1] = 1.0 / ch;
+    this.lowlightUniformData[2] = cw;
+    this.lowlightUniformData[3] = ch;
+    this.lowlightUniformData[4] = this.lowlightFrameCount;
+    this.lowlightUniformData[5] = 0.8; // strength
+    this.lowlightUniformData[6] = 0.6; // denoise weight
+    device.queue.writeBuffer(this.lowlightUniformBuffer!, 0, this.lowlightUniformData);
+
+    // Clear luma stats
+    device.queue.writeBuffer(this.lowlightLumaStatsBuf!, 0, new Uint32Array([0, 0]));
+
+    const commandEncoder = device.createCommandEncoder();
+
+    // Step 0: Copy external texture to sourceCopyTex
+    const copyBG = device.createBindGroup({
+      layout: copyBindGroupLayout,
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: externalTexture },
+        { binding: 2, resource: { buffer: this.copyViewportBuffer! } },
+      ],
+    });
+    const copyPass = commandEncoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.sourceCopyTex!.createView(),
+        loadOp: 'clear', storeOp: 'store',
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    copyPass.setPipeline(copyPipeline);
+    copyPass.setBindGroup(0, copyBG);
+    copyPass.draw(4);
+    copyPass.end();
+
+    const wgX = Math.ceil(cw / 8);
+    const wgY = Math.ceil(ch / 8);
+
+    // Pass 1: Luminance analysis
+    const lumaBG0 = device.createBindGroup({
+      layout: pipelines.luminance.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sourceCopyTex!.createView() },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: { buffer: this.lowlightUniformBuffer! } },
+      ],
+    });
+    const lumaBG1 = device.createBindGroup({
+      layout: pipelines.luminance.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: this.lowlightLumaTex!.createView() },
+        { binding: 1, resource: { buffer: this.lowlightLumaStatsBuf! } },
+      ],
+    });
+    const p1 = commandEncoder.beginComputePass();
+    p1.setPipeline(pipelines.luminance);
+    p1.setBindGroup(0, lumaBG0);
+    p1.setBindGroup(1, lumaBG1);
+    p1.dispatchWorkgroups(wgX, wgY);
+    p1.end();
+
+    // Pass 2: Temporal denoise
+    const denoiseBG0 = device.createBindGroup({
+      layout: pipelines.denoise.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sourceCopyTex!.createView() },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: { buffer: this.lowlightUniformBuffer! } },
+      ],
+    });
+    const denoiseBG1 = device.createBindGroup({
+      layout: pipelines.denoise.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: this.lowlightHistoryTex!.createView() },
+        { binding: 1, resource: this.lowlightDenoisedTex!.createView() },
+      ],
+    });
+    const p2 = commandEncoder.beginComputePass();
+    p2.setPipeline(pipelines.denoise);
+    p2.setBindGroup(0, denoiseBG0);
+    p2.setBindGroup(1, denoiseBG1);
+    p2.dispatchWorkgroups(wgX, wgY);
+    p2.end();
+
+    // Pass 3: Enhancement → canvas output
+    const canvasTex = this.gpuContext.getCurrentTexture();
+    const enhanceBG0 = device.createBindGroup({
+      layout: pipelines.enhance.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sourceCopyTex!.createView() },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: { buffer: this.lowlightUniformBuffer! } },
+      ],
+    });
+    const enhanceBG1 = device.createBindGroup({
+      layout: pipelines.enhance.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: this.lowlightDenoisedTex!.createView() },
+        { binding: 1, resource: this.lowlightLumaTex!.createView() },
+        { binding: 2, resource: { buffer: this.lowlightLumaStatsBuf! } },
+        { binding: 3, resource: canvasTex.createView() },
+      ],
+    });
+    const p3 = commandEncoder.beginComputePass();
+    p3.setPipeline(pipelines.enhance);
+    p3.setBindGroup(0, enhanceBG0);
+    p3.setBindGroup(1, enhanceBG1);
+    p3.dispatchWorkgroups(wgX, wgY);
+    p3.end();
+
+    // Copy denoised to history for next frame
+    commandEncoder.copyTextureToTexture(
+      { texture: this.lowlightDenoisedTex! },
+      { texture: this.lowlightHistoryTex! },
+      { width: cw, height: ch },
+    );
+
+    this.lowlightFrameCount++;
+    this.encodeMotionDetection(device, commandEncoder);
+    return commandEncoder.finish();
+  }
+
+  // ── HDR Tone Mapping (Demo 2) ───────────────────────────────
+
+  /** Ensure HDR textures exist at the right size */
+  private ensureHDRTextures(device: GPUDevice, w: number, h: number): void {
+    if (this.lastHdrW === w && this.lastHdrH === h && this.hdrOutputTex) return;
+
+    this.hdrOutputTex?.destroy();
+    this.hdrHistogramBuf?.destroy();
+
+    this.hdrOutputTex = device.createTexture({
+      size: { width: w, height: h },
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    });
+
+    // 258 u32 values: 256 histogram bins + sum + count
+    this.hdrHistogramBuf = device.createBuffer({
+      size: 258 * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    if (!this.hdrUniformBuffer) {
+      this.hdrUniformBuffer = device.createBuffer({
+        size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    this.lastHdrW = w;
+    this.lastHdrH = h;
+  }
+
+  /** Encode HDR tone mapping passes */
+  private encodeHDR(
+    device: GPUDevice,
+    externalTexture: GPUExternalTexture,
+    sampler: GPUSampler,
+    videoW: number,
+    videoH: number,
+  ): GPUCommandBuffer | null {
+    if (!this.gpu?.hdr || !this.gpuContext) return null;
+    const { copyPipeline, copyBindGroupLayout } = this.gpu;
+    const pipelines = this.gpu.hdr;
+    const cw = this.canvas.width;
+    const ch = this.canvas.height;
+
+    this.ensureIntermediateTextures(device, cw, ch);
+    this.ensureHDRTextures(device, cw, ch);
+    this.writeCopyViewport(device, videoW, videoH);
+
+    // Update uniforms
+    this.hdrUniformData[0] = 1.0 / cw;
+    this.hdrUniformData[1] = 1.0 / ch;
+    this.hdrUniformData[2] = cw;
+    this.hdrUniformData[3] = ch;
+    this.hdrUniformData[4] = 1.0; // exposure
+    this.hdrUniformData[5] = 1.15; // saturation
+    this.hdrUniformData[6] = 1.1; // contrast
+    device.queue.writeBuffer(this.hdrUniformBuffer!, 0, this.hdrUniformData);
+
+    // Clear histogram
+    device.queue.writeBuffer(this.hdrHistogramBuf!, 0, new Uint32Array(258));
+
+    const commandEncoder = device.createCommandEncoder();
+
+    // Step 0: Copy external texture to sourceCopyTex
+    const copyBG = device.createBindGroup({
+      layout: copyBindGroupLayout,
+      entries: [
+        { binding: 0, resource: sampler },
+        { binding: 1, resource: externalTexture },
+        { binding: 2, resource: { buffer: this.copyViewportBuffer! } },
+      ],
+    });
+    const copyPass = commandEncoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.sourceCopyTex!.createView(),
+        loadOp: 'clear', storeOp: 'store',
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    copyPass.setPipeline(copyPipeline);
+    copyPass.setBindGroup(0, copyBG);
+    copyPass.draw(4);
+    copyPass.end();
+
+    const wgX = Math.ceil(cw / 8);
+    const wgY = Math.ceil(ch / 8);
+
+    // Pass 1: Histogram
+    const histBG0 = device.createBindGroup({
+      layout: pipelines.histogram.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sourceCopyTex!.createView() },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: { buffer: this.hdrUniformBuffer! } },
+      ],
+    });
+    const histBG1 = device.createBindGroup({
+      layout: pipelines.histogram.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: { buffer: this.hdrHistogramBuf! } },
+      ],
+    });
+    const p1 = commandEncoder.beginComputePass();
+    p1.setPipeline(pipelines.histogram);
+    p1.setBindGroup(0, histBG0);
+    p1.setBindGroup(1, histBG1);
+    p1.dispatchWorkgroups(wgX, wgY);
+    p1.end();
+
+    // Pass 2: Tone mapping → canvas
+    const canvasTex = this.gpuContext.getCurrentTexture();
+    const tmBG0 = device.createBindGroup({
+      layout: pipelines.tonemap.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.sourceCopyTex!.createView() },
+        { binding: 1, resource: sampler },
+        { binding: 2, resource: { buffer: this.hdrUniformBuffer! } },
+      ],
+    });
+    const tmBG1 = device.createBindGroup({
+      layout: pipelines.tonemap.getBindGroupLayout(1),
+      entries: [
+        { binding: 0, resource: { buffer: this.hdrHistogramBuf! } },
+        { binding: 1, resource: canvasTex.createView() },
+      ],
+    });
+    const p2 = commandEncoder.beginComputePass();
+    p2.setPipeline(pipelines.tonemap);
+    p2.setBindGroup(0, tmBG0);
+    p2.setBindGroup(1, tmBG1);
+    p2.dispatchWorkgroups(wgX, wgY);
+    p2.end();
+
+    this.encodeMotionDetection(device, commandEncoder);
+    return commandEncoder.finish();
   }
 
   /** Release GPU resources, returning pooled buffers */
@@ -2168,6 +2921,51 @@ export class OffscreenRenderer {
     this.dlssFrameCount = 0;
     this.lastDlssW = 0;
     this.lastDlssH = 0;
+
+    // Destroy motion detection textures
+    this.prevMotionFrameTex?.destroy();
+    this.motionMaskTex?.destroy();
+    this.motionUniformBuffer?.destroy();
+    this.motionZoneBuffer?.destroy();
+    this.motionZoneResultBuffer?.destroy();
+    this.motionZoneResultReadBuffer?.destroy();
+    this.motionZoneUniformBuffer?.destroy();
+    this.prevMotionFrameTex = null;
+    this.motionMaskTex = null;
+    this.motionUniformBuffer = null;
+    this.motionZoneBuffer = null;
+    this.motionZoneResultBuffer = null;
+    this.motionZoneResultReadBuffer = null;
+    this.motionZoneUniformBuffer = null;
+    this.lastMotionW = 0;
+    this.lastMotionH = 0;
+
+    // Destroy low-light textures
+    this.lowlightLumaTex?.destroy();
+    this.lowlightLumaStatsBuf?.destroy();
+    this.lowlightDenoisedTex?.destroy();
+    this.lowlightHistoryTex?.destroy();
+    this.lowlightOutputTex?.destroy();
+    this.lowlightUniformBuffer?.destroy();
+    this.lowlightLumaTex = null;
+    this.lowlightLumaStatsBuf = null;
+    this.lowlightDenoisedTex = null;
+    this.lowlightHistoryTex = null;
+    this.lowlightOutputTex = null;
+    this.lowlightUniformBuffer = null;
+    this.lowlightFrameCount = 0;
+    this.lastLowlightW = 0;
+    this.lastLowlightH = 0;
+
+    // Destroy HDR textures
+    this.hdrOutputTex?.destroy();
+    this.hdrHistogramBuf?.destroy();
+    this.hdrUniformBuffer?.destroy();
+    this.hdrOutputTex = null;
+    this.hdrHistogramBuf = null;
+    this.hdrUniformBuffer = null;
+    this.lastHdrW = 0;
+    this.lastHdrH = 0;
 
     this.ctx2d = null;
     this.gpu = null;

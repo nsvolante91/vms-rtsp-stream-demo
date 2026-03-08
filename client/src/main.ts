@@ -19,6 +19,11 @@ import { Controls } from './ui/controls';
 import { StreamOverlay } from './ui/stream-overlay';
 import { suggestColumns } from './render/grid-layout';
 import type { WorkerToMainMessage, MainToWorkerMessage } from './worker/messages';
+import { AlertManager } from './ai/alert-manager';
+import { ZoneOverlay, AlertLog } from './ai/zone-overlay';
+import { DetectionOverlay } from './ai/detection-overlay';
+import { LatencyDashboard } from './perf/latency-dashboard';
+import { QUICVisualizer } from './perf/quic-visualizer';
 
 /**
  * Derive server URLs based on the current hostname.
@@ -55,6 +60,8 @@ const log = new Logger('VMSApp');
 interface StreamEntry {
   tile: StreamTile;
   overlay: StreamOverlay;
+  zoneOverlay: ZoneOverlay;
+  detectionOverlay: DetectionOverlay;
 }
 
 /** Cached per-stream metrics from the worker's 1Hz updates */
@@ -106,6 +113,21 @@ class VMSApp {
   private readonly companions: Map<number, { companionId: number; tile: StreamTile; overlay: StreamOverlay }> = new Map();
   /** Saved column count to restore when exiting comparison mode */
   private savedColumns = 1;
+
+  // ── Demo 1: Motion Detection + Zone Alerting ──────────────
+  private readonly alertManager = new AlertManager();
+  private alertLog: AlertLog | null = null;
+  private alertZoneMode = false;
+
+  // ── Demo 3: Latency Dashboard ─────────────────────────────
+  private latencyDashboard: LatencyDashboard | null = null;
+  private quicVisualizer: QUICVisualizer | null = null;
+
+  // ── Demo 4: YOLO Inference ────────────────────────────────
+  private inferenceEnabled = false;
+  private inferenceWorker: Worker | null = null;
+  private inferenceFrameCounts = new Map<number, number>();
+  private lastInferenceTimes = new Map<number, number[]>();
 
   constructor() {
     this.metrics = new MetricsCollector();
@@ -184,6 +206,9 @@ class VMSApp {
       () => this.toggleMetricsOverlay(),
       () => this.resetMetrics(),
       () => this.toggleCompareMode(),
+      () => this.toggleAlertZoneMode(),
+      () => this.toggleInference(),
+      () => this.toggleLatencyDashboard(),
     );
     this.controls.init();
 
@@ -336,8 +361,70 @@ class VMSApp {
             update.frameIntervalJitterMs,
             update.stutterCount
           );
+
+          // Update latency dashboard (Demo 3)
+          if (this.latencyDashboard && update.latency) {
+            this.latencyDashboard.update(update.streamId, update.latency);
+          }
+          // Synthesize latency breakdown from available metrics
+          if (this.latencyDashboard) {
+            this.latencyDashboard.update(update.streamId, {
+              transportMs: update.frameIntervalJitterMs * 0.5,
+              decodeMs: update.decodeTimeMs,
+              queueMs: update.queueSize * update.frameIntervalMs / 30,
+              renderMs: Math.max(1, update.frameIntervalMs - update.decodeTimeMs),
+              totalMs: update.frameIntervalMs,
+              jitterMs: update.frameIntervalJitterMs,
+            });
+          }
+
+          // Update QUIC visualizer (Demo 3)
+          if (this.quicVisualizer) {
+            this.quicVisualizer.updateStream(update.streamId, update.bitrateKbps);
+          }
         }
         break;
+
+      // ── Demo 1: Motion Alerts ──────────────────────────────
+      case 'motionAlert': {
+        const zoneScores = new Map<number, number>();
+        zoneScores.set(msg.zoneId, msg.score);
+        this.alertManager.processMotionResults(msg.streamId, zoneScores);
+
+        // Update zone overlay
+        const alertEntry = this.streams.get(msg.streamId);
+        if (alertEntry) {
+          const isActive = msg.score >= 0.05; // default threshold
+          alertEntry.zoneOverlay.setAlert(msg.zoneId, isActive, msg.score);
+          if (isActive) {
+            const zones = this.alertManager.getZonesForStream(msg.streamId);
+            const zone = zones.find(z => z.id === msg.zoneId);
+            if (zone) {
+              this.alertLog?.addEntry(zone.label, msg.streamId, msg.score);
+            }
+          }
+        }
+        break;
+      }
+
+      // ── Demo 4: YOLO Detection Results ─────────────────────
+      case 'detectionResult': {
+        const detEntry = this.streams.get(msg.streamId);
+        if (detEntry) {
+          detEntry.detectionOverlay.setDetections(msg.detections);
+          // Track inference FPS
+          const times = this.lastInferenceTimes.get(msg.streamId) ?? [];
+          times.push(performance.now());
+          if (times.length > 10) times.shift();
+          this.lastInferenceTimes.set(msg.streamId, times);
+          if (times.length >= 2) {
+            const dt = (times[times.length - 1] - times[0]) / (times.length - 1);
+            const fps = Math.round(1000 / dt);
+            detEntry.detectionOverlay.updateFPS(fps);
+          }
+        }
+        break;
+      }
     }
   }
 
@@ -430,7 +517,15 @@ class VMSApp {
       overlay.show();
     }
 
-    this.streams.set(streamId, { tile, overlay });
+    // Create zone and detection overlays (Demos 1 & 4)
+    const zoneOverlay = new ZoneOverlay(tile.element);
+    const detectionOverlay = new DetectionOverlay(tile.element);
+    if (this.inferenceEnabled) {
+      detectionOverlay.enable();
+      this.postWorker({ type: 'enableInference', streamId, enabled: true });
+    }
+
+    this.streams.set(streamId, { tile, overlay, zoneOverlay, detectionOverlay });
     this.applyFocus();
 
     // If comparison mode is active, also create a companion tile
@@ -457,7 +552,10 @@ class VMSApp {
 
       this.postWorker({ type: 'removeStream', streamId: removeId });
       entry.overlay.destroy();
+      entry.zoneOverlay.destroy();
+      entry.detectionOverlay.destroy();
       entry.tile.destroy();
+      this.alertManager.clearStream(removeId);
       this.streams.delete(removeId);
       this.workerMetrics.delete(removeId);
       this.metrics.removeStream(removeId);
@@ -479,11 +577,14 @@ class VMSApp {
       this.removeCompanionForStream(streamId);
       this.postWorker({ type: 'removeStream', streamId });
       entry.overlay.destroy();
+      entry.zoneOverlay.destroy();
+      entry.detectionOverlay.destroy();
       entry.tile.destroy();
       this.workerMetrics.delete(streamId);
       this.metrics.removeStream(streamId);
     }
     this.streams.clear();
+    this.alertManager.clear();
     this.focusId = null;
     log.info('All streams removed');
   }
@@ -760,6 +861,140 @@ class VMSApp {
     }
 
     log.info(`Companion tile ${companion.companionId} removed for stream ${primaryId}`);
+  }
+
+  // ── Demo 1: Alert Zone Mode ───────────────────────────────
+
+  /**
+   * Toggle alert zone drawing mode.
+   * When enabled, dragging on a tile creates an alert zone instead of zooming.
+   */
+  private toggleAlertZoneMode(): void {
+    this.alertZoneMode = !this.alertZoneMode;
+
+    if (this.alertZoneMode) {
+      if (!this.alertLog) {
+        this.alertLog = new AlertLog();
+      }
+      this.alertLog.show();
+
+      // Set up alert callbacks
+      this.alertManager.onAlert((streamId, zoneId, active, score) => {
+        const entry = this.streams.get(streamId);
+        if (entry) {
+          entry.zoneOverlay.setAlert(zoneId, active, score);
+        }
+      });
+
+      // Create demo zones on all existing streams (center 50%)
+      for (const [streamId, entry] of this.streams) {
+        const zone = this.alertManager.addZone(streamId, 0.25, 0.25, 0.5, 0.5);
+        entry.zoneOverlay.setZone(zone);
+        this.postWorker({
+          type: 'addAlertZone',
+          streamId,
+          zone: { id: zone.id, x: zone.x, y: zone.y, w: zone.w, h: zone.h, threshold: zone.threshold },
+        });
+        this.postWorker({ type: 'enableMotionDetection', streamId, enabled: true });
+      }
+      log.info('Alert zone mode enabled — demo zones created');
+    } else {
+      // Disable motion detection and remove zones
+      for (const [streamId, entry] of this.streams) {
+        this.postWorker({ type: 'enableMotionDetection', streamId, enabled: false });
+        const zones = this.alertManager.getZonesForStream(streamId);
+        for (const zone of zones) {
+          this.postWorker({ type: 'removeAlertZone', streamId, zoneId: zone.id });
+        }
+        entry.zoneOverlay.clear();
+      }
+      this.alertManager.clear();
+      this.alertLog?.hide();
+      log.info('Alert zone mode disabled');
+    }
+  }
+
+  // ── Demo 3: Latency Dashboard ─────────────────────────────
+
+  /**
+   * Toggle the latency dashboard panel.
+   */
+  private toggleLatencyDashboard(): void {
+    if (!this.latencyDashboard) {
+      this.latencyDashboard = new LatencyDashboard();
+      this.quicVisualizer = new QUICVisualizer();
+    }
+    this.latencyDashboard.toggle();
+    this.quicVisualizer!.toggle();
+    log.info('Latency dashboard toggled');
+  }
+
+  // ── Demo 4: YOLO Inference ────────────────────────────────
+
+  /**
+   * Toggle YOLO inference on all active streams.
+   */
+  private toggleInference(): void {
+    this.inferenceEnabled = !this.inferenceEnabled;
+
+    if (this.inferenceEnabled && !this.inferenceWorker) {
+      // Spawn inference worker from main thread (Vite transforms work here)
+      this.inferenceWorker = new Worker(
+        new URL('./worker/inference-worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+
+      this.inferenceWorker.onmessage = (ev) => {
+        const imsg = ev.data;
+        if (imsg.type === 'ready') {
+          log.info(`Inference worker ready (backend: ${imsg.backend})`);
+        } else if (imsg.type === 'error') {
+          log.error(`Inference worker error: ${imsg.message}`);
+          this.inferenceWorker?.terminate();
+          this.inferenceWorker = null;
+        }
+        // 'result' messages go through the stream worker's port
+      };
+
+      this.inferenceWorker.onerror = (ev) => {
+        log.error(`Inference worker crashed: ${ev.message}`);
+        this.inferenceWorker?.terminate();
+        this.inferenceWorker = null;
+      };
+
+      // Create a MessageChannel: port1 → stream worker, port2 → inference worker
+      const channel = new MessageChannel();
+
+      // Transfer port1 to stream worker so it can send frames directly
+      this.worker?.postMessage({ type: 'setInferencePort' } as any, [channel.port1]);
+
+      // Transfer port2 to inference worker for receiving frames
+      this.inferenceWorker.postMessage({ type: 'setPort' }, [channel.port2]);
+
+      // Init the model
+      this.inferenceWorker.postMessage({
+        type: 'init',
+        modelUrl: '/models/yolov12n.onnx',
+      });
+    }
+
+    for (const [streamId, entry] of this.streams) {
+      if (this.inferenceEnabled) {
+        entry.detectionOverlay.enable();
+        this.postWorker({ type: 'enableInference', streamId, enabled: true });
+      } else {
+        entry.detectionOverlay.disable();
+        this.postWorker({ type: 'enableInference', streamId, enabled: false });
+      }
+    }
+
+    if (!this.inferenceEnabled && this.inferenceWorker) {
+      this.inferenceWorker.postMessage({ type: 'stop' });
+      this.inferenceWorker.terminate();
+      this.inferenceWorker = null;
+    }
+
+    log.info(`Inference ${this.inferenceEnabled ? 'enabled' : 'disabled'}`);
   }
 
   /**

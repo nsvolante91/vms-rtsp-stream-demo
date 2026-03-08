@@ -45,8 +45,8 @@ export interface ShutdownMessage {
   type: 'shutdown';
 }
 
-/** Upscale mode: off (bilinear), cas (sharpen), fsr (edge-adaptive), a4k (CNN full), a4k-fast (CNN lite), tsr (temporal), spec (spectral), vqsr (vector-quantized), gen (ESRGAN), dlss (4K temporal+spatial) */
-export type UpscaleMode = 'off' | 'cas' | 'fsr' | 'a4k' | 'a4k-fast' | 'tsr' | 'spec' | 'vqsr' | 'gen' | 'dlss';
+/** Upscale mode: off (bilinear), cas (sharpen), fsr (edge-adaptive), a4k (CNN full), a4k-fast (CNN lite), tsr (temporal), spec (spectral), vqsr (vector-quantized), gen (ESRGAN), dlss (4K temporal+spatial), lowlight (low-light enhancement), hdr (HDR tone mapping) */
+export type UpscaleMode = 'off' | 'cas' | 'fsr' | 'a4k' | 'a4k-fast' | 'tsr' | 'spec' | 'vqsr' | 'gen' | 'dlss' | 'lowlight' | 'hdr';
 
 /** Set GPU upscaling mode for all streams */
 export interface SetUpscaleMessage {
@@ -98,6 +98,53 @@ export interface RemoveCompanionMessage {
   companionStreamId: number;
 }
 
+// ─── Demo 1: Motion Detection + Zone Alerting ──────────────────
+
+/** Alert zone rectangle in normalized [0,1] UV coordinates */
+export interface AlertZoneRect {
+  id: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  threshold: number;
+}
+
+/** Add an alert zone for motion detection on a stream */
+export interface AddAlertZoneMessage {
+  type: 'addAlertZone';
+  streamId: number;
+  zone: AlertZoneRect;
+}
+
+/** Remove an alert zone */
+export interface RemoveAlertZoneMessage {
+  type: 'removeAlertZone';
+  streamId: number;
+  zoneId: number;
+}
+
+/** Enable or disable motion detection for a stream */
+export interface EnableMotionDetectionMessage {
+  type: 'enableMotionDetection';
+  streamId: number;
+  enabled: boolean;
+}
+
+// ─── Demo 4: YOLO Object Detection ────────────────────────────
+
+/** Enable or disable AI inference for a stream */
+export interface EnableInferenceMessage {
+  type: 'enableInference';
+  streamId: number;
+  enabled: boolean;
+}
+
+/** Transfer inference worker port to stream worker */
+export interface SetInferencePortMessage {
+  type: 'setInferencePort';
+}
+
 export type MainToWorkerMessage =
   | InitMessage
   | AddStreamMessage
@@ -109,7 +156,12 @@ export type MainToWorkerMessage =
   | PauseStreamMessage
   | SetCompareModeMessage
   | AddCompanionMessage
-  | RemoveCompanionMessage;
+  | RemoveCompanionMessage
+  | AddAlertZoneMessage
+  | RemoveAlertZoneMessage
+  | EnableMotionDetectionMessage
+  | EnableInferenceMessage
+  | SetInferencePortMessage;
 
 // ─── Worker → Main ─────────────────────────────────────────────
 
@@ -123,6 +175,22 @@ export interface ErrorMessage {
   type: 'error';
   streamId?: number;
   message: string;
+}
+
+/** Per-stream latency breakdown */
+export interface LatencyBreakdown {
+  /** Estimated transport latency (ms) */
+  transportMs: number;
+  /** Decode time (ms) */
+  decodeMs: number;
+  /** Queue wait time (ms) */
+  queueMs: number;
+  /** Render time (ms) */
+  renderMs: number;
+  /** Total end-to-end (ms) */
+  totalMs: number;
+  /** Frame jitter (ms) */
+  jitterMs: number;
 }
 
 /** Per-stream metrics snapshot */
@@ -143,6 +211,8 @@ export interface StreamMetricsUpdate {
   stutterCount: number;
   /** Estimated bitrate in kilobits per second */
   bitrateKbps: number;
+  /** Latency breakdown (available when protocol v2 timestamps present) */
+  latency?: LatencyBreakdown;
 }
 
 /** Periodic metrics update for all active streams */
@@ -163,8 +233,42 @@ export interface StreamReadyMessage {
   gpuFailReason?: string;
 }
 
+// ─── Demo 1: Motion Alert from Worker ──────────────────────────
+
+/** Motion alert triggered in a zone */
+export interface MotionAlertMessage {
+  type: 'motionAlert';
+  streamId: number;
+  zoneId: number;
+  /** Fraction of zone pixels with motion (0..1) */
+  score: number;
+}
+
+// ─── Demo 4: Detection Results from Worker ─────────────────────
+
+/** A single detected object */
+export interface DetectionResult {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  classId: number;
+  className: string;
+  confidence: number;
+}
+
+/** YOLO detection results for a stream */
+export interface DetectionResultMessage {
+  type: 'detectionResult';
+  streamId: number;
+  detections: DetectionResult[];
+  inferenceTimeMs: number;
+}
+
 export type WorkerToMainMessage =
   | ConnectedMessage
   | ErrorMessage
   | MetricsMessage
-  | StreamReadyMessage;
+  | StreamReadyMessage
+  | MotionAlertMessage
+  | DetectionResultMessage;

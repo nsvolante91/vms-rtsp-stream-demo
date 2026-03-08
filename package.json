@@ -16,6 +16,7 @@
     "test": "npm run test:bridge && npm run test:client",
     "test:bridge": "npm test -w bridge-server",
     "test:client": "npm test -w client",
-    "typecheck": "npm run typecheck -w bridge-server && npm run typecheck -w client"
+    "typecheck": "npm run typecheck -w bridge-server && npm run typecheck -w client",
+    "postinstall": "node -e \"const fs=require('fs'),p='node_modules/onnxruntime-web/dist/',d='client/public/';fs.readdirSync(p).filter(f=>f.startsWith('ort-wasm')&&f.endsWith('.wasm')).forEach(f=>fs.copyFileSync(p+f,d+f));console.log('Copied ORT WASM files to client/public/')\""
   }
 }

@@ -26,6 +26,7 @@ import type {
   StreamMetricsUpdate,
   UpscaleMode,
   ZoomCrop,
+  AlertZoneRect,
 } from './messages';
 
 const log = new Logger('StreamWorker');
@@ -49,6 +50,15 @@ let currentUpscaleMode: UpscaleMode = 'off';
 
 /** Set of paused stream IDs */
 const pausedStreams = new Set<number>();
+
+// ─── Inference State (Demo 4) ──────────────────────────────────
+
+/** MessagePort to inference worker (transferred from main thread) */
+let inferencePort: MessagePort | null = null;
+/** Set of stream IDs with inference enabled */
+const inferenceStreams = new Set<number>();
+/** Frame counter per stream for 1-in-5 frame sampling */
+const inferenceFrameCounters = new Map<number, number>();
 
 // ─── Comparison Mode State ─────────────────────────────────────
 
@@ -98,6 +108,10 @@ function renderLoop(): void {
   for (const frame of framesToClose) {
     try { frame.close(); } catch { /* already closed */ }
   }
+
+  // Motion detection compute passes are encoded inside each renderer's encodeFrame()
+  // method when motionEnabled is true. GPU readback is self-throttled via
+  // motionReadbackPending flag — only one readback in flight at a time.
 }
 
 /** Schedule a rAF tick if not already scheduled */
@@ -125,6 +139,32 @@ function queueFrame(streamId: number, frame: VideoFrame): void {
       prevCompanion.close();
     }
     pendingFrames.set(companionId, clone);
+  }
+
+  // Clone frame for inference worker (every 5th frame)
+  if (inferencePort && inferenceStreams.has(streamId)) {
+    const counter = (inferenceFrameCounters.get(streamId) ?? 0) + 1;
+    inferenceFrameCounters.set(streamId, counter);
+    if (counter % 5 === 0) {
+      let clone: VideoFrame | null = null;
+      try {
+        clone = frame.clone();
+        inferencePort.postMessage(
+          {
+            type: 'frame',
+            streamId,
+            frame: clone,
+            frameWidth: frame.displayWidth,
+            frameHeight: frame.displayHeight,
+          },
+          [clone as any]
+        );
+        clone = null; // transferred successfully, inference worker owns it now
+      } catch {
+        // Close leaked clone if postMessage failed
+        try { clone?.close(); } catch { /* already closed */ }
+      }
+    }
   }
 
   // Close previous un-rendered frame (superseded by this newer one)
@@ -459,6 +499,83 @@ self.onmessage = (e: MessageEvent<MainToWorkerMessage>) => {
       // State is managed on the main thread; worker just receives
       // addCompanion/removeCompanion messages. This is a no-op.
       break;
+
+    // ─── Demo 1: Motion Detection ────────────────────────────
+    case 'enableMotionDetection': {
+      const mdEntry = streams.get(msg.streamId);
+      if (mdEntry) {
+        mdEntry.renderer.setMotionDetection(msg.enabled);
+        if (msg.enabled) {
+          // Set up motion alert callback to forward to main thread
+          mdEntry.renderer.motionAlertCallback = (zones) => {
+            for (const [zoneId, score] of zones) {
+              postMsg({ type: 'motionAlert', streamId: msg.streamId, zoneId, score });
+            }
+          };
+        } else {
+          mdEntry.renderer.motionAlertCallback = null;
+        }
+        log.info(`Motion detection ${msg.enabled ? 'enabled' : 'disabled'} for stream ${msg.streamId}`);
+      }
+      break;
+    }
+
+    case 'addAlertZone': {
+      const azEntry = streams.get(msg.streamId);
+      if (azEntry) {
+        azEntry.renderer.addMotionZone(msg.zone);
+        log.info(`Alert zone ${msg.zone.id} added for stream ${msg.streamId}`);
+      }
+      break;
+    }
+
+    case 'removeAlertZone': {
+      const rzEntry = streams.get(msg.streamId);
+      if (rzEntry) {
+        rzEntry.renderer.removeMotionZone(msg.zoneId);
+        log.info(`Alert zone ${msg.zoneId} removed from stream ${msg.streamId}`);
+      }
+      break;
+    }
+
+    // ─── Demo 4: Inference ───────────────────────────────────
+    case 'setInferencePort': {
+      // Main thread transfers a MessagePort connected to the inference worker
+      const port = (e as MessageEvent).ports[0];
+      if (port) {
+        inferencePort = port;
+        // Forward inference results back to main thread
+        inferencePort.onmessage = (ev) => {
+          const imsg = ev.data;
+          if (imsg.type === 'result') {
+            postMsg({
+              type: 'detectionResult',
+              streamId: imsg.streamId,
+              detections: imsg.detections,
+              inferenceTimeMs: imsg.inferenceTimeMs,
+            });
+          }
+        };
+        log.info('Inference port received from main thread');
+      }
+      break;
+    }
+
+    case 'enableInference': {
+      if (msg.enabled) {
+        inferenceStreams.add(msg.streamId);
+        inferenceFrameCounters.set(msg.streamId, 0);
+        log.info(`Inference enabled for stream ${msg.streamId}`);
+      } else {
+        inferenceStreams.delete(msg.streamId);
+        inferenceFrameCounters.delete(msg.streamId);
+        if (inferenceStreams.size === 0) {
+          inferencePort?.postMessage({ type: 'stop' });
+        }
+        log.info(`Inference disabled for stream ${msg.streamId}`);
+      }
+      break;
+    }
 
     default:
       log.warn('Unknown message type', msg);

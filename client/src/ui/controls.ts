@@ -42,7 +42,10 @@ export class Controls {
     private readonly onUpscaleChange?: (mode: UpscaleMode) => void,
     private readonly onToggleMetricsOverlay?: () => void,
     private readonly onResetMetrics?: () => void,
-    private readonly onToggleCompare?: () => void
+    private readonly onToggleCompare?: () => void,
+    private readonly onToggleAlertZones?: () => void,
+    private readonly onToggleInference?: () => void,
+    private readonly onToggleLatencyDashboard?: () => void,
   ) {}
 
   /**
@@ -213,6 +216,33 @@ export class Controls {
       });
     }
 
+    // Alert zone toggle button
+    const alertZoneBtn = document.getElementById('btn-alert-zones');
+    if (alertZoneBtn) {
+      alertZoneBtn.addEventListener('click', () => {
+        alertZoneBtn.classList.toggle('active');
+        this.onToggleAlertZones?.();
+      });
+    }
+
+    // Inference toggle button
+    const inferenceBtn = document.getElementById('btn-inference');
+    if (inferenceBtn) {
+      inferenceBtn.addEventListener('click', () => {
+        inferenceBtn.classList.toggle('active');
+        this.onToggleInference?.();
+      });
+    }
+
+    // Latency dashboard toggle button
+    const latencyBtn = document.getElementById('btn-latency');
+    if (latencyBtn) {
+      latencyBtn.addEventListener('click', () => {
+        latencyBtn.classList.toggle('active');
+        this.onToggleLatencyDashboard?.();
+      });
+    }
+
     // Keyboard shortcuts
     document.addEventListener('keydown', (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
@@ -224,6 +254,8 @@ export class Controls {
         const btn = document.getElementById('btn-metrics-overlay');
         btn?.classList.toggle('active');
         this.onToggleMetricsOverlay?.();
+      } else if (e.key === 'l' || e.key === 'L') {
+        this.onToggleLatencyDashboard?.();
       }
     });
   }
@@ -256,7 +288,7 @@ export class Controls {
     }, 1000);
   }
 
-  private static readonly UPSCALE_MODES = ['off', 'cas', 'fsr', 'a4k', 'a4k-fast', 'tsr', 'spec', 'vqsr', 'gen', 'dlss'] as const;
+  private static readonly UPSCALE_MODES = ['off', 'cas', 'fsr', 'a4k', 'a4k-fast', 'tsr', 'spec', 'vqsr', 'gen', 'dlss', 'lowlight', 'hdr'] as const;
   private static readonly UPSCALE_DESCRIPTIONS: Record<string, string> = {
     off: 'No upscaling — raw bilinear filtering',
     cas: 'Contrast Adaptive Sharpening — sharpens soft/blurry areas while leaving edges intact. Minimal GPU cost (~1% overhead). Based on AMD FidelityFX CAS.',
@@ -268,6 +300,8 @@ export class Controls {
     vqsr: 'Vector-Quantized Texture Lookup — encodes 4×4 patches into 8D feature vectors, finds nearest match in 512-entry HF texture codebook, pastes high-res detail. Moderate GPU cost (~6-10%).',
     gen: 'Compact ESRGAN Generator — 4-block RRDB neural network that invents texture detail from nothing. 16-channel width, ~30K parameters baked into shader. Highest quality, highest GPU cost (~15-25%).',
     dlss: '4K Upscale (DLSS-style) — Combines temporal accumulation with spatial super-resolution and detail hallucination. Motion-compensated history blending builds sub-pixel detail over frames; edge-directed interpolation + contrast-adaptive detail synthesis enhance spatial quality; anti-ringing prevents artifacts. Mac-compatible. GPU cost (~12-18%).',
+    lowlight: 'Low-Light Enhancement — Adaptive gamma correction with temporal denoising. Brightens dark scenes while suppressing noise via multi-frame averaging. Scene-adaptive — avoids over-brightening well-lit areas. GPU cost (~3-5%).',
+    hdr: 'HDR Tone Mapping — ACES filmic tone mapping with histogram-based auto-exposure. Compresses dynamic range while preserving highlight detail. Color grading adds warmth. GPU cost (~2-4%).',
   };
 
   /** Inline descriptions shown in the control bar (desktop) */
@@ -282,6 +316,8 @@ export class Controls {
     vqsr: 'Matches image patches to a high-detail texture library — ~6-10% GPU',
     gen: 'Neural network invents new texture detail from scratch — ~15-25% GPU',
     dlss: 'Combines temporal and spatial super-resolution — ~12-18% GPU',
+    lowlight: 'Brightens dark scenes with temporal denoising — ~3-5% GPU',
+    hdr: 'ACES tone mapping with auto-exposure — ~2-4% GPU',
   };
 
   /** Ultra-short descriptions for mobile screens */
@@ -296,5 +332,7 @@ export class Controls {
     vqsr: 'Texture match · ~6-10%',
     gen: 'AI generate · ~15-25%',
     dlss: 'Temporal+spatial · ~12-18%',
+    lowlight: 'Low-light · ~3-5%',
+    hdr: 'HDR tone map · ~2-4%',
   };
 }

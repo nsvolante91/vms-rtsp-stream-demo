@@ -35,12 +35,17 @@
           <option value="vqsr">VQSR</option>
           <option value="gen">GEN</option>
           <option value="dlss">DLSS</option>
+          <option value="lowlight">Low-Light</option>
+          <option value="hdr">HDR</option>
         </select>
       </div>
       <span id="upscale-desc" class="upscale-desc">Raw bilinear upscale — no GPU cost</span>
       <div class="control-group cg-toggles">
         <button id="btn-metrics-overlay" title="Toggle per-stream metrics overlay (M)">📊</button>
         <button id="btn-compare" title="Compare Mode — show original vs upscaled side by side">⚖️</button>
+        <button id="btn-alert-zones" title="Alert Zones — draw motion detection zones">🔔</button>
+        <button id="btn-inference" title="AI Detection — YOLO object detection on live feeds">🤖</button>
+        <button id="btn-latency" title="Latency Dashboard — per-stream latency breakdown (L)">⏱️</button>
       </div>
       <button id="btn-overflow" class="btn-overflow" title="More actions">⋮</button>
       <button id="btn-fullscreen" class="btn-fullscreen" title="Toggle fullscreen">⛶</button>

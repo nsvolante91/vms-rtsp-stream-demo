@@ -27,8 +27,8 @@ import {
   type SPSInfo,
 } from './h264-parser.js';
 
-/** Protocol version for the binary frame header */
-const PROTOCOL_VERSION = 0x01;
+/** Protocol version for the binary frame header (v2 adds server send timestamp) */
+const PROTOCOL_VERSION = 0x02;
 
 /** Flag bit indicating the payload contains a keyframe */
 const FLAG_KEYFRAME = 0x01;
@@ -160,18 +160,33 @@ interface ClientMessage {
  * @param payload - H.264 NAL unit data
  * @returns Binary frame as Buffer
  */
+/**
+ * Build a binary frame for the streaming protocol (v2).
+ *
+ * Wire format (v2 — 20 bytes header):
+ * ```
+ * +---------+----------+-----------+----------+---------------+-------------+
+ * | Version | StreamID | Timestamp | Flags    | ServerSendTS  | Payload     |
+ * | 1 byte  | 2 bytes  | 8 bytes   | 1 byte   | 8 bytes       | Variable    |
+ * | (0x02)  | uint16BE | uint64BE  |          | uint64BE (us) | H.264 NALUs |
+ * +---------+----------+-----------+----------+---------------+-------------+
+ * ```
+ */
 function buildFrame(
   streamId: number,
   timestamp: bigint,
   flags: number,
   payload: Uint8Array
 ): Buffer {
-  const frame = Buffer.allocUnsafe(12 + payload.length);
+  const frame = Buffer.allocUnsafe(20 + payload.length);
   frame[0] = PROTOCOL_VERSION;
   frame.writeUInt16BE(streamId, 1);
   frame.writeBigUInt64BE(timestamp, 3);
   frame[11] = flags;
-  frame.set(payload, 12);
+  // Server send timestamp (microseconds since epoch)
+  const serverSendUs = BigInt(Math.round(performance.now() * 1000));
+  frame.writeBigUInt64BE(serverSendUs, 12);
+  frame.set(payload, 20);
   return frame;
 }
 

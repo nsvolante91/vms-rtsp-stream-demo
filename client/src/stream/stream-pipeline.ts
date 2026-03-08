@@ -280,6 +280,8 @@ export class StreamPipeline {
     this._pooledSmoothedFrame.isKeyframe = frame.isKeyframe;
     this._pooledSmoothedFrame.isConfig = frame.isConfig;
     this._pooledSmoothedFrame.data = frame.data;
+    this._pooledSmoothedFrame.serverSendTimestampUs = frame.serverSendTimestampUs;
+    this._pooledSmoothedFrame.clientReceiveTimeMs = frame.clientReceiveTimeMs;
     return this._pooledSmoothedFrame;
   }
 
@@ -290,6 +292,8 @@ export class StreamPipeline {
     isKeyframe: false,
     isConfig: false,
     data: new Uint8Array(0),
+    serverSendTimestampUs: 0n,
+    clientReceiveTimeMs: 0,
   };
 
   /**

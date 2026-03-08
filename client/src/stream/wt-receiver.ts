@@ -28,6 +28,10 @@ export interface ReceivedFrame {
   isConfig: boolean;
   /** Raw H.264 Annex B payload data */
   data: Uint8Array;
+  /** Server send timestamp in microseconds (v2 protocol only, 0 for v1) */
+  serverSendTimestampUs: bigint;
+  /** Client receive timestamp (performance.now() in ms) */
+  clientReceiveTimeMs: number;
 }
 
 /** Callback invoked when a frame is received for a subscribed stream */
@@ -36,14 +40,20 @@ export type FrameCallback = (frame: ReceivedFrame) => void;
 /**
  * Binary protocol header layout:
  *
+ * V1 (12 bytes):
  * - Version:   1 byte  (0x01)
  * - StreamID:  2 bytes (uint16 big-endian)
  * - Timestamp: 8 bytes (uint64 big-endian, microseconds)
  * - Flags:     1 byte  (bit 0 = keyframe, bit 1 = config/SPS+PPS)
  * - Payload:   remaining bytes (H.264 Annex B)
+ *
+ * V2 (20 bytes):
+ * - Same as V1 + ServerSendTimestamp: 8 bytes (uint64 big-endian, microseconds)
  */
-const HEADER_SIZE = 12;
-const PROTOCOL_VERSION = 0x01;
+const HEADER_SIZE_V1 = 12;
+const HEADER_SIZE_V2 = 20;
+const PROTOCOL_VERSION_V1 = 0x01;
+const PROTOCOL_VERSION_V2 = 0x02;
 
 /** Maximum reconnection delay in milliseconds */
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -272,6 +282,8 @@ export class WTReceiver {
     isKeyframe: false,
     isConfig: false,
     data: new Uint8Array(0),
+    serverSendTimestampUs: 0n,
+    clientReceiveTimeMs: 0,
   };
 
   /**
@@ -522,15 +534,13 @@ export class WTReceiver {
    * @param buffer - Raw frame bytes (12-byte header + payload)
    */
   private parseBinaryFrame(buffer: Uint8Array): void {
-    if (buffer.byteLength < HEADER_SIZE) {
+    if (buffer.byteLength < HEADER_SIZE_V1) {
       this.log.warn(`Frame too short: ${buffer.byteLength} bytes`);
       return;
     }
 
-    // Uint8Array indexing already accounts for byteOffset internally,
-    // so always use 0-based indices on the view.
     const version = buffer[0];
-    if (version !== PROTOCOL_VERSION) {
+    if (version !== PROTOCOL_VERSION_V1 && version !== PROTOCOL_VERSION_V2) {
       this.log.warn(`Unknown protocol version: ${version}`);
       return;
     }
@@ -545,17 +555,29 @@ export class WTReceiver {
     const flags = buffer[11];
     const isKeyframe = (flags & 0x01) !== 0;
     const isConfig = (flags & 0x02) !== 0;
-    const data = buffer.subarray(HEADER_SIZE);
+
+    // V2: read server send timestamp (8 additional bytes)
+    let serverSendTimestampUs = 0n;
+    let headerSize = HEADER_SIZE_V1;
+    if (version === PROTOCOL_VERSION_V2 && buffer.byteLength >= HEADER_SIZE_V2) {
+      const shi = ((buffer[12] << 24) | (buffer[13] << 16) | (buffer[14] << 8) | buffer[15]) >>> 0;
+      const slo = ((buffer[16] << 24) | (buffer[17] << 16) | (buffer[18] << 8) | buffer[19]) >>> 0;
+      serverSendTimestampUs = (BigInt(shi) << 32n) | BigInt(slo);
+      headerSize = HEADER_SIZE_V2;
+    }
+
+    const data = buffer.subarray(headerSize);
+    const clientReceiveTimeMs = performance.now();
 
     const callback = this.callbacks.get(streamId);
     if (callback) {
-      // Reuse pooled frame object to avoid per-frame allocation.
-      // Safe because callbacks process synchronously.
       this._pooledFrame.streamId = streamId;
       this._pooledFrame.timestamp = timestamp;
       this._pooledFrame.isKeyframe = isKeyframe;
       this._pooledFrame.isConfig = isConfig;
       this._pooledFrame.data = data;
+      this._pooledFrame.serverSendTimestampUs = serverSendTimestampUs;
+      this._pooledFrame.clientReceiveTimeMs = clientReceiveTimeMs;
       callback(this._pooledFrame);
     }
   }
