@@ -16,5 +16,8 @@
     "typescript": "^5.3.3",
     "vite": "^5.0.12",
     "vitest": "^1.2.0"
+  },
+  "dependencies": {
+    "anime4k-webgpu": "^1.0.0"
   }
 }

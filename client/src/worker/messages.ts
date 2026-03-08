@@ -45,8 +45,8 @@ export interface ShutdownMessage {
   type: 'shutdown';
 }
 
-/** Upscale mode: off (bilinear), cas (sharpen), fsr (edge-adaptive), a4k (CNN), tsr (temporal), spec (spectral), vqsr (vector-quantized), gen (ESRGAN), dlss (4K temporal+spatial) */
-export type UpscaleMode = 'off' | 'cas' | 'fsr' | 'a4k' | 'tsr' | 'spec' | 'vqsr' | 'gen' | 'dlss';
+/** Upscale mode: off (bilinear), cas (sharpen), fsr (edge-adaptive), a4k (CNN full), a4k-fast (CNN lite), tsr (temporal), spec (spectral), vqsr (vector-quantized), gen (ESRGAN), dlss (4K temporal+spatial) */
+export type UpscaleMode = 'off' | 'cas' | 'fsr' | 'a4k' | 'a4k-fast' | 'tsr' | 'spec' | 'vqsr' | 'gen' | 'dlss';
 
 /** Set GPU upscaling mode for all streams */
 export interface SetUpscaleMessage {
