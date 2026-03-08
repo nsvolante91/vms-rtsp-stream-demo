@@ -121,13 +121,26 @@ export class Controls {
       });
     }
 
-    // Upscale dropdown
+    // Upscale dropdown + inline description
     const upscaleSelect = document.getElementById('upscale-select') as HTMLSelectElement | null;
+    const upscaleDesc = document.getElementById('upscale-desc');
     if (upscaleSelect) {
+      const mobileQuery = window.matchMedia('(max-width: 640px)');
+      const updateDesc = () => {
+        const mode = upscaleSelect.value;
+        if (upscaleDesc) {
+          upscaleDesc.textContent = mobileQuery.matches
+            ? Controls.UPSCALE_SHORT_DESCS[mode]
+            : Controls.UPSCALE_INLINE_DESCS[mode];
+        }
+      };
+      mobileQuery.addEventListener('change', updateDesc);
+
       upscaleSelect.addEventListener('change', () => {
         const mode = upscaleSelect.value as typeof Controls.UPSCALE_MODES[number];
         upscaleSelect.title = Controls.UPSCALE_DESCRIPTIONS[mode];
         upscaleSelect.dataset.mode = mode;
+        updateDesc();
         console.log(`[Upscale] Mode: ${mode}`);
         this.onUpscaleChange?.(mode);
       });
@@ -255,5 +268,33 @@ export class Controls {
     vqsr: 'Vector-Quantized Texture Lookup — encodes 4×4 patches into 8D feature vectors, finds nearest match in 512-entry HF texture codebook, pastes high-res detail. Moderate GPU cost (~6-10%).',
     gen: 'Compact ESRGAN Generator — 4-block RRDB neural network that invents texture detail from nothing. 16-channel width, ~30K parameters baked into shader. Highest quality, highest GPU cost (~15-25%).',
     dlss: '4K Upscale (DLSS-style) — Combines temporal accumulation with spatial super-resolution and detail hallucination. Motion-compensated history blending builds sub-pixel detail over frames; edge-directed interpolation + contrast-adaptive detail synthesis enhance spatial quality; anti-ringing prevents artifacts. Mac-compatible. GPU cost (~12-18%).',
+  };
+
+  /** Inline descriptions shown in the control bar (desktop) */
+  private static readonly UPSCALE_INLINE_DESCS: Record<string, string> = {
+    off: 'Raw bilinear upscale — no GPU cost',
+    cas: 'Sharpens soft areas while preserving edges — ~1% GPU',
+    fsr: 'Detects and sharpens edges without halos — ~2% GPU',
+    a4k: 'AI neural network restores detail (17 passes) — ~5-8% GPU',
+    'a4k-fast': 'AI neural network restores detail (8 passes) — ~2-4% GPU',
+    tsr: 'Accumulates detail from multiple frames over time — ~8-12% GPU',
+    spec: 'Fills in missing detail using frequency analysis — ~4-6% GPU',
+    vqsr: 'Matches image patches to a high-detail texture library — ~6-10% GPU',
+    gen: 'Neural network invents new texture detail from scratch — ~15-25% GPU',
+    dlss: 'Combines temporal and spatial super-resolution — ~12-18% GPU',
+  };
+
+  /** Ultra-short descriptions for mobile screens */
+  private static readonly UPSCALE_SHORT_DESCS: Record<string, string> = {
+    off: 'No processing',
+    cas: 'Sharpen · ~1%',
+    fsr: 'Edge sharpen · ~2%',
+    a4k: 'AI 17-pass · ~5-8%',
+    'a4k-fast': 'AI 8-pass · ~2-4%',
+    tsr: 'Temporal · ~8-12%',
+    spec: 'Freq. fill · ~4-6%',
+    vqsr: 'Texture match · ~6-10%',
+    gen: 'AI generate · ~15-25%',
+    dlss: 'Temporal+spatial · ~12-18%',
   };
 }

@@ -197,8 +197,16 @@ body {
   padding-left: 6px;
 }
 
-.control-spacer {
+.upscale-desc {
   flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: #777;
+  padding: 0 8px;
+  user-select: none;
 }
 
 .btn-fullscreen {
