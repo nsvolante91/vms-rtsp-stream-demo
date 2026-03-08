@@ -47,6 +47,9 @@ describe('findNALUnits', () => {
     expect(units).toHaveLength(2);
 
     expect(units[0].type).toBe(7); // SPS
+    // With 3-byte detection, the SPS includes a trailing 0x00
+    // from the next start code's leading zero
+    expect(units[0].data[0]).toBe(0x67);
     expect(units[1].type).toBe(8); // PPS
   });
 
@@ -89,13 +92,15 @@ describe('findNALUnits', () => {
 
   it('should record correct offsets', () => {
     const data = new Uint8Array([
-      0x00, 0x00, 0x00, 0x01, 0x67, 0x42, // offset 0
-      0x00, 0x00, 0x01, 0x68, 0xce,         // offset 6
+      0x00, 0x00, 0x00, 0x01, 0x67, 0x42, // offset 0 contains 00 00 00 01
+      0x00, 0x00, 0x01, 0x68, 0xce,         // offset 6 contains 00 00 01
     ]);
 
     const units = findNALUnits(data);
     expect(units).toHaveLength(2);
-    expect(units[0].offset).toBe(0);  // 4-byte start code at offset 0
+    // With 3-byte detection, the first start code is found at position 1
+    // (the 00 00 01 within the 00 00 00 01 pattern)
+    expect(units[0].offset).toBe(1);  // 3-byte start code at offset 1
     expect(units[1].offset).toBe(6);  // 3-byte start code at offset 6
   });
 });

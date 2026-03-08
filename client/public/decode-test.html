@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head><title>WebCodecs Decode Test</title></head>
+<body>
+<h2>WebCodecs H.264 Decode Test</h2>
+<pre id="log"></pre>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += msg + '\n';
+  console.log(msg);
+}
+
+async function test() {
+  // SPS and PPS from the camera
+  const spsHex = '67640028acd940780227e5c04400020854007a12023c60c658';
+  const ppsHex = '68ebe3cb22c0';
+  
+  const sps = hexToBytes(spsHex);
+  const pps = hexToBytes(ppsHex);
+  
+  log(`SPS: ${sps.length} bytes`);
+  log(`PPS: ${pps.length} bytes`);
+  
+  // Build avcC
+  const avcC = buildAvcC(sps, pps);
+  log(`avcC: ${avcC.length} bytes`);
+  log(`avcC hex: ${bytesToHex(avcC)}`);
+  
+  const config = {
+    codec: 'avc1.640028',
+    codedWidth: 1920,
+    codedHeight: 1080,
+    description: avcC,
+    hardwareAcceleration: 'prefer-hardware',
+    optimizeForLatency: true,
+  };
+  
+  // Test isConfigSupported
+  try {
+    const support = await VideoDecoder.isConfigSupported(config);
+    log(`isConfigSupported: ${JSON.stringify(support.supported)}`);
+    log(`Supported config: ${JSON.stringify(support.config)}`);
+  } catch(e) {
+    log(`isConfigSupported error: ${e.message}`);
+  }
+  
+  // Try decoding with a simple test
+  let decodeResult = 'pending';
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      log(`SUCCESS: Decoded frame ${frame.displayWidth}x${frame.displayHeight}`);
+      decodeResult = 'success';
+      frame.close();
+    },
+    error: (e) => {
+      log(`DECODE ERROR: ${e.message}`);
+      decodeResult = 'error: ' + e.message;
+    }
+  });
+  
+  try {
+    decoder.configure(config);
+    log(`Decoder state after configure: ${decoder.state}`);
+  } catch(e) {
+    log(`Configure error: ${e.message}`);
+    return;
+  }
+  
+  // Fetch a keyframe from the bridge WebSocket
+  log('\nConnecting to bridge WebSocket...');
+  const ws = new WebSocket('ws://127.0.0.1:9000/ws');
+  
+  ws.binaryType = 'arraybuffer';
+  
+  ws.onopen = () => {
+    log('Connected, subscribing to stream 1');
+    ws.send(JSON.stringify({ type: 'subscribe', streamId: 1 }));
+  };
+  
+  let configured = false;
+  let receivedSps = null;
+  let receivedPps = null;
+  
+  ws.onmessage = async (evt) => {
+    if (typeof evt.data === 'string') {
+      log(`Control: ${evt.data.substring(0, 100)}`);
+      return;
+    }
+    
+    const buf = new Uint8Array(evt.data);
+    if (buf.length < 12) return;
+    
+    const view = new DataView(buf.buffer);
+    const flags = view.getUint8(11);
+    const isKeyframe = (flags & 0x01) !== 0;
+    const isConfig = (flags & 0x02) !== 0;
+    const payload = buf.subarray(12);
+    
+    if (isConfig) {
+      const nalus = findNALUnits(payload);
+      for (const nalu of nalus) {
+        const t = nalu.data[0] & 0x1f;
+        if (t === 7) { receivedSps = new Uint8Array(nalu.data); log(`Received SPS: ${receivedSps.length} bytes`); }
+        if (t === 8) { receivedPps = new Uint8Array(nalu.data); log(`Received PPS: ${receivedPps.length} bytes`); }
+      }
+      
+      if (receivedSps && receivedPps && !configured) {
+        configured = true;
+        const desc = buildAvcC(receivedSps, receivedPps);
+        const cfg = {
+          codec: 'avc1.640028',
+          codedWidth: 1920,
+          codedHeight: 1080,
+          description: desc,
+          hardwareAcceleration: 'prefer-hardware',
+          optimizeForLatency: true,
+        };
+        try {
+          decoder.configure(cfg);
+          log(`Reconfigured decoder, state: ${decoder.state}`);
+        } catch(e) {
+          log(`Reconfigure error: ${e.message}`);
+        }
+      }
+      return;
+    }
+    
+    if (!configured || decoder.state !== 'configured') return;
+    
+    // Only decode keyframes for this test
+    if (!isKeyframe) return;
+    
+    log(`\nReceived keyframe: ${payload.length} bytes`);
+    
+    // Show raw NAL structure
+    const nalus = findNALUnits(payload);
+    log(`NALUs in keyframe: ${nalus.length}`);
+    for (const nalu of nalus) {
+      log(`  type=${nalu.data[0] & 0x1f} size=${nalu.data.length}`);
+    }
+    
+    // Filter to VCL NALUs only and convert to AVCC
+    const vclNalus = nalus.filter(n => { const t = n.data[0] & 0x1f; return t >= 1 && t <= 5; });
+    log(`VCL NALUs: ${vclNalus.length}`);
+    
+    // Build AVCC with only VCL NALUs
+    let totalSize = 0;
+    for (const nalu of vclNalus) totalSize += 4 + nalu.data.length;
+    const avcc = new Uint8Array(totalSize);
+    const avccView = new DataView(avcc.buffer);
+    let offset = 0;
+    for (const nalu of vclNalus) {
+      avccView.setUint32(offset, nalu.data.length, false);
+      offset += 4;
+      avcc.set(nalu.data, offset);
+      offset += nalu.data.length;
+    }
+    
+    log(`AVCC data: ${avcc.length} bytes`);
+    log(`First 20 bytes: ${bytesToHex(avcc.subarray(0, 20))}`);
+    
+    const timestamp = Number(view.getBigUint64(3, false));
+    
+    try {
+      const chunk = new EncodedVideoChunk({
+        type: 'key',
+        timestamp: timestamp,
+        data: avcc,
+      });
+      log(`Created EncodedVideoChunk: type=${chunk.type} size=${chunk.byteLength} ts=${chunk.timestamp}`);
+      log(`Decoder queueSize before: ${decoder.decodeQueueSize}`);
+      decoder.decode(chunk);
+      log(`Decoder queueSize after: ${decoder.decodeQueueSize}`);
+    } catch(e) {
+      log(`Chunk creation/decode error: ${e.message}`);
+    }
+    
+    // Wait a bit for decode
+    await new Promise(r => setTimeout(r, 2000));
+    log(`\nFinal decode result: ${decodeResult}`);
+    log(`Decoder state: ${decoder.state}`);
+    ws.close();
+    decoder.close();
+  };
+  
+  ws.onerror = (e) => log(`WS error: ${e}`);
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) bytes[i/2] = parseInt(hex.substring(i, i+2), 16);
+  return bytes;
+}
+
+function bytesToHex(buf) {
+  return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+function findNALUnits(data) {
+  const units = [];
+  const startPositions = [];
+  for (let i = 0; i < data.length - 2; i++) {
+    if (data[i] === 0x00 && data[i+1] === 0x00 && data[i+2] === 0x01) {
+      startPositions.push({ offset: i, len: 3 });
+      i += 2;
+    }
+  }
+  for (let i = 0; i < startPositions.length; i++) {
+    const start = startPositions[i].offset + startPositions[i].len;
+    const end = i + 1 < startPositions.length ? startPositions[i+1].offset : data.length;
+    if (start < end) units.push({ type: (data[start] & 0x1f), data: data.subarray(start, end) });
+  }
+  return units;
+}
+
+function buildAvcC(sps, pps, chromaFormat = 1, bitDepthLuma = 0, bitDepthChroma = 0) {
+  const profileIdc = sps[1];
+  const needsExt = (profileIdc === 100 || profileIdc === 110 || profileIdc === 122 || profileIdc === 144);
+  const extSize = needsExt ? 4 : 0;
+  const size = 6 + 2 + sps.length + 1 + 2 + pps.length + extSize;
+  const buf = new Uint8Array(size);
+  const view = new DataView(buf.buffer);
+  let o = 0;
+  buf[o++] = 1;
+  buf[o++] = sps[1];
+  buf[o++] = sps[2];
+  buf[o++] = sps[3];
+  buf[o++] = 0xff;
+  buf[o++] = 0xe1;
+  view.setUint16(o, sps.length, false); o += 2;
+  buf.set(sps, o); o += sps.length;
+  buf[o++] = 1;
+  view.setUint16(o, pps.length, false); o += 2;
+  buf.set(pps, o); o += pps.length;
+  if (needsExt) {
+    buf[o++] = 0xfc | (chromaFormat & 0x03);
+    buf[o++] = 0xf8 | (bitDepthLuma & 0x07);
+    buf[o++] = 0xf8 | (bitDepthChroma & 0x07);
+    buf[o++] = 0;
+  }
+  return buf;
+}
+
+test();
+</script>
+</body>
+</html>

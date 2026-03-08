@@ -72,11 +72,30 @@ export class Canvas2DRenderer {
       const frame = frames.get(vp.streamId);
       if (!frame) continue;
 
-      // Convert normalized 0..1 coordinates to pixel coordinates
-      const dx = Math.round(vp.x * cw);
-      const dy = Math.round(vp.y * ch);
-      const dw = Math.round(vp.width * cw);
-      const dh = Math.round(vp.height * ch);
+      // Convert normalized 0..1 coordinates to pixel coordinates for the cell
+      const cellX = Math.round(vp.x * cw);
+      const cellY = Math.round(vp.y * ch);
+      const cellW = Math.round(vp.width * cw);
+      const cellH = Math.round(vp.height * ch);
+
+      // Compute letterbox/pillarbox to preserve video aspect ratio
+      const videoAR = frame.displayWidth / frame.displayHeight;
+      const cellAR = cellW / cellH;
+
+      let dw: number, dh: number, dx: number, dy: number;
+      if (videoAR > cellAR) {
+        // Video is wider than cell → fit to width, black bars top/bottom
+        dw = cellW;
+        dh = cellW / videoAR;
+        dx = cellX;
+        dy = cellY + (cellH - dh) / 2;
+      } else {
+        // Video is taller than cell → fit to height, black bars left/right
+        dh = cellH;
+        dw = cellH * videoAR;
+        dx = cellX + (cellW - dw) / 2;
+        dy = cellY;
+      }
 
       try {
         this.ctx.drawImage(frame, dx, dy, dw, dh);

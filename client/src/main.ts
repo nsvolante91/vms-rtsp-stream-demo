@@ -2,56 +2,98 @@
  * VMS Browser Prototype — Main Application Entry Point
  *
  * Bootstraps the video management system with per-stream canvas tiles
- * arranged in a CSS grid. Each stream has its own decode pipeline that
- * draws directly to its canvas via the decoder output callback.
+ * arranged in a CSS grid. The entire media pipeline (WebTransport, decode,
+ * WebGPU render) runs in a dedicated Web Worker. The main thread handles
+ * only DOM, layout, and UI.
  */
 
 import { Logger } from './utils/logger';
-import { WSReceiver } from './stream/ws-receiver';
-import { StreamPipeline } from './stream/stream-pipeline';
 import { StreamTile } from './render/stream-tile';
 import { MetricsCollector } from './perf/metrics-collector';
 import { Dashboard } from './perf/dashboard';
 import { BenchmarkRunner } from './perf/benchmark-runner';
 import type { BenchmarkReport } from './perf/benchmark-runner';
 import { Controls } from './ui/controls';
+import { StreamOverlay } from './ui/stream-overlay';
+import type { WorkerToMainMessage, MainToWorkerMessage } from './worker/messages';
 
-/** WebSocket bridge server URL */
-const WS_URL = 'ws://localhost:9000';
+/**
+ * REST API base URL.
+ * Uses 127.0.0.1 instead of 'localhost' because macOS resolves localhost
+ * to IPv6 (::1) first, but the QUIC/UDP server binds to IPv4 (0.0.0.0).
+ * Chrome's Happy Eyeballs prefers IPv6 and fails when no UDP listener exists on ::1.
+ */
+const API_URL = 'http://127.0.0.1:9000';
+
+/**
+ * WebTransport bridge server URL.
+ * Must use 127.0.0.1 to match the server's IPv4 UDP socket binding.
+ * The server's TLS certificate includes IP:127.0.0.1 in its SAN.
+ */
+const WT_URL = 'https://127.0.0.1:9001/streams';
+
+/** REST endpoint for certificate hash (for WebTransport pinning) */
+const CERT_HASH_URL = `${API_URL}/cert-hash`;
 
 /** HTTP endpoint for available streams */
-const STREAMS_URL = 'http://localhost:9000/streams';
+const STREAMS_URL = `${API_URL}/streams`;
 
 /** Maximum number of streams to auto-add on startup */
-const AUTO_ADD_MAX = 4;
+const AUTO_ADD_MAX = 1;
 
 const log = new Logger('VMSApp');
 
-/** A stream's tile and decode pipeline, managed as a pair */
+/** A stream's tile managed on the main thread */
 interface StreamEntry {
-  pipeline: StreamPipeline;
   tile: StreamTile;
+  overlay: StreamOverlay;
+}
+
+/** Cached per-stream metrics from the worker's 1Hz updates */
+interface WorkerStreamMetrics {
+  fps: number;
+  decodedFrames: number;
+  droppedFrames: number;
+  queueSize: number;
+  resolution: { width: number; height: number } | null;
+  decodeTimeMs: number;
+  frameIntervalMs: number;
+  frameIntervalJitterMs: number;
+  stutterCount: number;
+  bitrateKbps: number;
 }
 
 /**
  * Main VMS application controller.
  *
- * Manages per-stream tiles in a CSS grid layout. Each tile has its own
- * canvas and decode pipeline. No shared render loop — each decoder
- * draws directly to its canvas when a frame is decoded.
+ * Manages per-stream tiles in a CSS grid layout. The entire media pipeline
+ * (WebTransport ↔ decode ↔ WebGPU render) runs in a dedicated worker.
+ * Main thread only handles DOM manipulation and UI events.
  */
 class VMSApp {
-  private wsReceiver: WSReceiver | null = null;
+  private worker: Worker | null = null;
+  private workerReady = false;
   private readonly streams: Map<number, StreamEntry> = new Map();
+  private readonly workerMetrics: Map<number, WorkerStreamMetrics> = new Map();
   private readonly metrics: MetricsCollector;
   private readonly dashboard: Dashboard;
   private controls: Controls | null = null;
   private benchmarkRunner: BenchmarkRunner | null = null;
   private gridContainer: HTMLDivElement | null = null;
-  private columns = 2;
+  private columns = 1;
   private focusId: number | null = null;
   private nextStreamId = 1;
   private metricsInterval = 0;
+  private metricsOverlayEnabled = false;
+
+  // ── Comparison mode state ─────────────────────────────────────
+  private compareMode = false;
+  /** Offset added to primary streamId to derive companion streamId */
+  private static readonly COMPANION_ID_OFFSET = 10000;
+  /** Map primaryStreamId → { companionId, tile, overlay } */
+  private readonly companions: Map<number, { companionId: number; tile: StreamTile; overlay: StreamOverlay }> = new Map();
+  /** Saved column count to restore when exiting comparison mode */
+  private savedColumns = 1;
 
   constructor() {
     this.metrics = new MetricsCollector();
@@ -66,17 +108,20 @@ class VMSApp {
   /**
    * Initialize the application.
    *
-   * Performs feature detection, sets up the CSS grid container,
-   * connects the WebSocket, and auto-adds available streams.
+   * Spawns the media worker, waits for WebTransport to connect,
+   * sets up the CSS grid container, and auto-adds available streams.
    */
   async init(): Promise<void> {
-    log.info('Initializing VMS Prototype');
+    log.info('Initializing VMS Prototype (worker mode)');
 
     // Feature detection
     if (typeof VideoDecoder === 'undefined') {
-      this.showError('Missing WebCodecs (VideoDecoder). Please use Chrome 113+.');
+      this.showError('Missing WebCodecs (VideoDecoder). Please use Chrome 113+ or Safari 17+.');
       return;
     }
+
+    // Spawn worker and wait for WebTransport connection
+    await this.initWorker();
 
     this.gridContainer = document.getElementById('video-grid') as HTMLDivElement | null;
     if (!this.gridContainer) {
@@ -85,10 +130,6 @@ class VMSApp {
     }
     this.updateGridCSS();
 
-    // Connect WebSocket
-    this.wsReceiver = new WSReceiver(WS_URL);
-    this.wsReceiver.connect();
-
     // Set up UI controls
     this.controls = new Controls(
       (columns) => this.setLayout(columns),
@@ -96,30 +137,158 @@ class VMSApp {
       () => this.removeStream(),
       () => this.runBenchmark(),
       () => this.exportMetrics(),
-      () => this.dashboard.toggle()
+      () => this.dashboard.toggle(),
+      (mode) => this.postWorker({ type: 'setUpscale', mode }),
+      () => this.toggleMetricsOverlay(),
+      () => this.resetMetrics(),
+      () => this.toggleCompareMode(),
     );
     this.controls.init();
 
     // Start dashboard
     this.dashboard.start();
 
-    // 1Hz polling for queue size metrics and tile label updates
+    // 1Hz polling for tile label updates (uses cached worker metrics)
     this.metricsInterval = window.setInterval(() => this.updateMetrics(), 1000);
 
     // Fetch available streams and auto-add
     await this.fetchAndAutoAddStreams();
 
-    log.info('VMS Prototype initialized');
+    log.info('VMS Prototype initialized (worker mode)');
+  }
+
+  /**
+   * Spawn the stream worker and wait for WebTransport connection.
+   */
+  private initWorker(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.worker = new Worker(
+        new URL('./worker/stream-worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+
+      const onMessage = (e: MessageEvent<WorkerToMainMessage>) => {
+        const msg = e.data;
+        if (msg.type === 'connected') {
+          this.workerReady = true;
+          log.info('Worker connected (WebTransport ready)');
+          resolve();
+        } else if (msg.type === 'error') {
+          log.error(`Worker init error: ${msg.message}`);
+          reject(new Error(msg.message));
+        }
+      };
+
+      // Temporary handler for init phase
+      this.worker.addEventListener('message', onMessage);
+      this.worker.addEventListener('error', (err) => {
+        log.error('Worker error', err);
+        reject(new Error('Worker failed to load'));
+      }, { once: true });
+
+      // Switch to the steady-state handler after init completes
+      const initDone = () => {
+        this.worker?.removeEventListener('message', onMessage);
+        this.worker?.addEventListener('message', (e: MessageEvent<WorkerToMainMessage>) => {
+          this.handleWorkerMessage(e.data);
+        });
+      };
+
+      // Resolve/reject both trigger switching to steady-state
+      const origResolve = resolve;
+      const origReject = reject;
+      resolve = (v) => { initDone(); origResolve(v); };
+      reject = (e) => { initDone(); origReject(e); };
+
+      // Send init message to worker
+      this.postWorker({ type: 'init', wtUrl: WT_URL, certHashUrl: CERT_HASH_URL });
+    });
+  }
+
+  /**
+   * Handle messages from the worker (steady-state).
+   */
+  private handleWorkerMessage(msg: WorkerToMainMessage): void {
+    switch (msg.type) {
+      case 'connected':
+        // Reconnection
+        this.workerReady = true;
+        log.info('Worker reconnected');
+        break;
+
+      case 'error':
+        if (msg.streamId !== undefined) {
+          log.error(`Worker stream ${msg.streamId} error: ${msg.message}`);
+        } else {
+          log.error(`Worker error: ${msg.message}`);
+        }
+        break;
+
+      case 'metrics':
+        // Update cached worker metrics and feed into MetricsCollector
+        for (const update of msg.streams) {
+          this.workerMetrics.set(update.streamId, {
+            fps: update.fps,
+            decodedFrames: update.decodedFrames,
+            droppedFrames: update.droppedFrames,
+            queueSize: update.queueSize,
+            resolution: update.resolution,
+            decodeTimeMs: update.decodeTimeMs,
+            frameIntervalMs: update.frameIntervalMs,
+            frameIntervalJitterMs: update.frameIntervalJitterMs,
+            stutterCount: update.stutterCount,
+            bitrateKbps: update.bitrateKbps,
+          });
+
+          // Feed queue size into MetricsCollector (used by dashboard)
+          this.metrics.updateQueueSize(update.streamId, update.queueSize);
+
+          // Sync decoded/dropped frame counts
+          const data = this.metrics.getStreamMetrics(update.streamId);
+          const newFrames = update.decodedFrames - data.decodedFrames;
+          this.metrics.recordFrames(update.streamId, newFrames);
+
+          // Feed bitrate bytes into MetricsCollector for export
+          if (update.bitrateKbps > 0) {
+            this.metrics.recordBytes(update.streamId, Math.round(update.bitrateKbps * 1000 / 8));
+          }
+
+          // Feed extended metrics for export
+          this.metrics.updateExtendedMetrics(
+            update.streamId,
+            update.frameIntervalMs,
+            update.frameIntervalJitterMs,
+            update.stutterCount
+          );
+        }
+        break;
+    }
+  }
+
+  /**
+   * Post a message to the worker with proper typing.
+   */
+  private postWorker(msg: MainToWorkerMessage, transfer?: Transferable[]): void {
+    if (!this.worker) {
+      log.warn('Worker not available');
+      return;
+    }
+    if (transfer) {
+      this.worker.postMessage(msg, transfer);
+    } else {
+      this.worker.postMessage(msg);
+    }
   }
 
   /**
    * Add a new video stream.
    *
    * Creates a StreamTile (canvas + label), appends it to the CSS grid,
-   * and starts a StreamPipeline that draws directly to the tile's canvas.
+   * transfers the canvas to the worker, and tells the worker to start
+   * decode+render for this stream.
    */
   async addStream(): Promise<void> {
-    if (!this.wsReceiver || !this.gridContainer) {
+    if (!this.workerReady || !this.gridContainer) {
       log.warn('Not ready to add stream');
       return;
     }
@@ -130,24 +299,56 @@ class VMSApp {
     const tile = new StreamTile(streamId);
     this.gridContainer.appendChild(tile.element);
 
-    // Click to toggle focus
-    tile.element.addEventListener('click', () => this.toggleFocus(streamId));
-
-    const pipeline = new StreamPipeline(
-      streamId,
-      this.wsReceiver,
-      (frame: VideoFrame) => {
-        tile.drawFrame(frame);
-        this.metrics.recordFrame(streamId);
-      },
-      (sid, error) => {
-        log.error(`Stream ${sid} error: ${error.message}`);
+    // Click to toggle focus (only if it wasn't a drag-to-zoom)
+    tile.element.addEventListener('click', () => {
+      if (!tile.wasDrag) {
+        this.toggleFocus(streamId);
       }
+    });
+
+    // Transfer the canvas to the worker for rendering
+    const { canvas, width, height } = tile.transferCanvas();
+
+    // Register resize callback to notify worker
+    tile.onResize((w, h) => {
+      this.postWorker({ type: 'resize', streamId, width: w, height: h });
+    });
+
+    // Register zoom callback
+    tile.onZoom((sid, crop) => {
+      this.postWorker({ type: 'setZoom', streamId: sid, crop });
+      // Sync zoom to companion tile if in comparison mode
+      const companion = this.companions.get(sid);
+      if (companion) {
+        this.postWorker({ type: 'setZoom', streamId: companion.companionId, crop });
+        companion.tile.setZoomExternal(crop);
+      }
+    });
+
+    // Register pause callback
+    tile.onPause((sid, paused) => {
+      this.postWorker({ type: 'pauseStream', streamId: sid, paused });
+    });
+
+    // Tell the worker to start decode+render for this stream
+    this.postWorker(
+      { type: 'addStream', streamId, canvas, width, height },
+      [canvas]
     );
 
-    pipeline.start();
-    this.streams.set(streamId, { pipeline, tile });
+    // Create per-stream metrics overlay
+    const overlay = new StreamOverlay(tile.element);
+    if (this.metricsOverlayEnabled) {
+      overlay.show();
+    }
+
+    this.streams.set(streamId, { tile, overlay });
     this.applyFocus();
+
+    // If comparison mode is active, also create a companion tile
+    if (this.compareMode) {
+      this.addCompanionForStream(streamId);
+    }
   }
 
   /**
@@ -163,9 +364,14 @@ class VMSApp {
 
     const entry = this.streams.get(removeId);
     if (entry) {
-      entry.pipeline.stop();
+      // Remove companion first if it exists
+      this.removeCompanionForStream(removeId);
+
+      this.postWorker({ type: 'removeStream', streamId: removeId });
+      entry.overlay.destroy();
       entry.tile.destroy();
       this.streams.delete(removeId);
+      this.workerMetrics.delete(removeId);
       this.metrics.removeStream(removeId);
     }
 
@@ -182,8 +388,11 @@ class VMSApp {
    */
   removeAllStreams(): void {
     for (const [streamId, entry] of this.streams) {
-      entry.pipeline.stop();
+      this.removeCompanionForStream(streamId);
+      this.postWorker({ type: 'removeStream', streamId });
+      entry.overlay.destroy();
       entry.tile.destroy();
+      this.workerMetrics.delete(streamId);
       this.metrics.removeStream(streamId);
     }
     this.streams.clear();
@@ -227,7 +436,7 @@ class VMSApp {
       () => this.addStream(),
       () => this.removeAllStreams(),
       this.metrics,
-      'Canvas2D (per-tile)'
+      'WebGPU Worker (importExternalTexture)'
     );
 
     log.info('Starting benchmark...');
@@ -247,6 +456,12 @@ class VMSApp {
     const json = this.metrics.exportJSON();
     this.downloadJSON('vms-metrics.json', json);
     log.info('Metrics exported');
+  }
+
+  /** Reset all collected metrics and analytics. */
+  resetMetrics(): void {
+    this.metrics.reset();
+    log.info('Metrics reset');
   }
 
   /** Update the CSS grid-template-columns property */
@@ -281,18 +496,166 @@ class VMSApp {
     }
   }
 
-  /** Poll pipeline metrics and update tile labels (called at 1Hz) */
+  /**
+   * Update tile labels using cached worker metrics (called at 1Hz).
+   */
   private updateMetrics(): void {
     for (const [streamId, entry] of this.streams) {
-      const pipelineMetrics = entry.pipeline.metrics;
-      this.metrics.updateQueueSize(streamId, pipelineMetrics.queueSize);
+      const wm = this.workerMetrics.get(streamId);
+      if (wm) {
+        const resStr = wm.resolution ? `${wm.resolution.width}x${wm.resolution.height}` : '...';
+        entry.tile.updateLabel(resStr, wm.fps);
 
-      // Update the tile's label overlay
-      const res = entry.pipeline.resolution;
-      const sm = this.metrics.getStreamMetrics(streamId);
-      const resStr = res ? `${res.width}x${res.height}` : '...';
-      entry.tile.updateLabel(resStr, sm.fps);
+        // Update per-stream overlay if enabled
+        if (this.metricsOverlayEnabled) {
+          entry.overlay.update({
+            fps: wm.fps,
+            resolution: resStr,
+            droppedFrames: wm.droppedFrames,
+            decodedFrames: wm.decodedFrames,
+            decodeTimeMs: wm.decodeTimeMs,
+            queueSize: wm.queueSize,
+            frameIntervalMs: wm.frameIntervalMs,
+            frameIntervalJitterMs: wm.frameIntervalJitterMs,
+            stutterCount: wm.stutterCount,
+            bitrateKbps: wm.bitrateKbps,
+          });
+        }
+      }
     }
+  }
+
+  /**
+   * Toggle per-stream metrics overlay on all tiles.
+   */
+  private toggleMetricsOverlay(): void {
+    this.metricsOverlayEnabled = !this.metricsOverlayEnabled;
+    for (const entry of this.streams.values()) {
+      if (this.metricsOverlayEnabled) {
+        entry.overlay.show();
+      } else {
+        entry.overlay.hide();
+      }
+    }
+    log.info(`Metrics overlay ${this.metricsOverlayEnabled ? 'enabled' : 'disabled'}`);
+  }
+
+  // ── Comparison Mode ──────────────────────────────────────────
+
+  /**
+   * Toggle comparison mode: show original (no upscale) and upscaled side by side.
+   */
+  private toggleCompareMode(): void {
+    this.compareMode = !this.compareMode;
+
+    if (this.compareMode) {
+      // Save current columns and force 2-column layout
+      this.savedColumns = this.columns;
+      this.columns = 2;
+      this.focusId = null;
+      this.updateGridCSS();
+
+      // Create companion tiles for all existing streams
+      for (const streamId of this.streams.keys()) {
+        this.addCompanionForStream(streamId);
+      }
+    } else {
+      // Remove all companion tiles
+      for (const streamId of this.streams.keys()) {
+        this.removeCompanionForStream(streamId);
+      }
+
+      // Restore saved column count
+      this.columns = this.savedColumns;
+      this.updateGridCSS();
+    }
+
+    this.applyFocus();
+    log.info(`Comparison mode ${this.compareMode ? 'enabled' : 'disabled'}`);
+  }
+
+  /**
+   * Create a companion tile for a primary stream (original, no upscaling).
+   * The companion tile is inserted before the primary tile in the DOM
+   * so it appears on the left in the 2-column grid.
+   */
+  private addCompanionForStream(primaryId: number): void {
+    if (!this.workerReady || !this.gridContainer) return;
+    if (this.companions.has(primaryId)) return;
+
+    const companionId = primaryId + VMSApp.COMPANION_ID_OFFSET;
+    const tile = new StreamTile(companionId);
+    tile.setComparisonLabel('Original');
+
+    // Insert companion tile before primary tile in DOM (left column)
+    const primaryEntry = this.streams.get(primaryId);
+    if (primaryEntry) {
+      this.gridContainer.insertBefore(tile.element, primaryEntry.tile.element);
+    } else {
+      this.gridContainer.appendChild(tile.element);
+    }
+
+    // Transfer canvas to worker
+    const { canvas, width, height } = tile.transferCanvas();
+
+    // Register resize callback
+    tile.onResize((w, h) => {
+      this.postWorker({ type: 'resize', streamId: companionId, width: w, height: h });
+    });
+
+    // Register zoom callback — sync zoom to both tiles
+    tile.onZoom((sid, crop) => {
+      this.postWorker({ type: 'setZoom', streamId: sid, crop });
+      // Also sync zoom to the primary tile
+      this.postWorker({ type: 'setZoom', streamId: primaryId, crop });
+      primaryEntry?.tile.setZoomExternal(crop);
+    });
+
+    // Register pause callback
+    tile.onPause((sid, paused) => {
+      this.postWorker({ type: 'pauseStream', streamId: sid, paused });
+    });
+
+    // Tell worker to create companion renderer
+    this.postWorker(
+      { type: 'addCompanion', primaryStreamId: primaryId, companionStreamId: companionId, canvas, width, height },
+      [canvas]
+    );
+
+    const overlay = new StreamOverlay(tile.element);
+    if (this.metricsOverlayEnabled) {
+      overlay.show();
+    }
+
+    this.companions.set(primaryId, { companionId, tile, overlay });
+
+    // Also update the primary tile label to show upscale mode
+    if (primaryEntry) {
+      primaryEntry.tile.setComparisonLabel('Upscaled');
+    }
+
+    log.info(`Companion tile ${companionId} created for stream ${primaryId}`);
+  }
+
+  /**
+   * Remove the companion tile for a primary stream.
+   */
+  private removeCompanionForStream(primaryId: number): void {
+    const companion = this.companions.get(primaryId);
+    if (!companion) return;
+
+    this.postWorker({ type: 'removeCompanion', companionStreamId: companion.companionId });
+    companion.overlay.destroy();
+    companion.tile.destroy();
+    this.companions.delete(primaryId);
+
+    // Clear the comparison label on the primary tile
+    const primaryEntry = this.streams.get(primaryId);
+    if (primaryEntry) {
+      primaryEntry.tile.setComparisonLabel(null);
+    }
+
+    log.info(`Companion tile ${companion.companionId} removed for stream ${primaryId}`);
   }
 
   /**

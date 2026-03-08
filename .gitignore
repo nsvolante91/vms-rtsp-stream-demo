@@ -2,5 +2,6 @@ node_modules/
 dist/
 test-videos/
 .stream-pids
+.certs/
 *.log
 .DS_Store

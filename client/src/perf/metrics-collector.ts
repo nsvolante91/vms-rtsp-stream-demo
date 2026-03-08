@@ -22,6 +22,12 @@ export interface StreamMetrics {
   queueSize: number;
   /** Estimated bitrate in kilobits per second */
   bitrateKbps: number;
+  /** Average inter-frame interval in milliseconds */
+  frameIntervalMs: number;
+  /** Standard deviation of inter-frame intervals (jitter) in milliseconds */
+  frameIntervalJitterMs: number;
+  /** Cumulative stutter count (frame interval > 2× median) */
+  stutterCount: number;
 }
 
 /** Aggregate performance metrics across all streams */
@@ -49,6 +55,12 @@ interface StreamData {
   droppedFrames: number;
   decodedFrames: number;
   queueSize: number;
+  /** Cached from worker: average inter-frame interval (ms) */
+  frameIntervalMs: number;
+  /** Cached from worker: frame interval jitter (ms) */
+  frameIntervalJitterMs: number;
+  /** Cached from worker: cumulative stutter count */
+  stutterCount: number;
 }
 
 /** Internal global tracking data */
@@ -90,6 +102,9 @@ export class MetricsCollector {
         droppedFrames: 0,
         decodedFrames: 0,
         queueSize: 0,
+        frameIntervalMs: 0,
+        frameIntervalJitterMs: 0,
+        stutterCount: 0,
       };
       this.streamData.set(streamId, data);
     }
@@ -104,6 +119,21 @@ export class MetricsCollector {
     const data = this.getStream(streamId);
     data.frameTimes.push(performance.now());
     data.decodedFrames++;
+  }
+
+  /**
+   * Record multiple decoded frames at once (batch variant of recordFrame).
+   * @param streamId - Stream that produced the frames
+   * @param count - Number of frames to record
+   */
+  recordFrames(streamId: number, count: number): void {
+    if (count <= 0) return;
+    const data = this.getStream(streamId);
+    const now = performance.now();
+    for (let i = 0; i < count; i++) {
+      data.frameTimes.push(now);
+    }
+    data.decodedFrames += count;
   }
 
   /**
@@ -175,6 +205,25 @@ export class MetricsCollector {
   }
 
   /**
+   * Update extended metrics cached from the worker.
+   * @param streamId - Stream identifier
+   * @param frameIntervalMs - Average inter-frame interval (ms)
+   * @param frameIntervalJitterMs - Frame interval jitter (ms)
+   * @param stutterCount - Cumulative stutter count
+   */
+  updateExtendedMetrics(
+    streamId: number,
+    frameIntervalMs: number,
+    frameIntervalJitterMs: number,
+    stutterCount: number
+  ): void {
+    const data = this.getStream(streamId);
+    data.frameIntervalMs = frameIntervalMs;
+    data.frameIntervalJitterMs = frameIntervalJitterMs;
+    data.stutterCount = stutterCount;
+  }
+
+  /**
    * Get performance metrics for a specific stream.
    * @param streamId - Stream identifier
    * @returns Current metrics snapshot for the stream
@@ -211,6 +260,9 @@ export class MetricsCollector {
       decodedFrames: data.decodedFrames,
       queueSize: data.queueSize,
       bitrateKbps,
+      frameIntervalMs: data.frameIntervalMs,
+      frameIntervalJitterMs: data.frameIntervalJitterMs,
+      stutterCount: data.stutterCount,
     };
   }
 
@@ -272,7 +324,7 @@ export class MetricsCollector {
    * @returns CSV string with header row and one data row per stream
    */
   exportCSV(): string {
-    const headers = ['streamId', 'fps', 'decodeTimeMs', 'droppedFrames', 'decodedFrames', 'queueSize', 'bitrateKbps'];
+    const headers = ['streamId', 'fps', 'decodeTimeMs', 'droppedFrames', 'decodedFrames', 'queueSize', 'bitrateKbps', 'frameIntervalMs', 'frameIntervalJitterMs', 'stutterCount'];
     const rows = [headers.join(',')];
 
     for (const streamId of this.streamData.keys()) {
@@ -285,6 +337,9 @@ export class MetricsCollector {
         m.decodedFrames,
         m.queueSize,
         m.bitrateKbps.toFixed(1),
+        m.frameIntervalMs.toFixed(1),
+        m.frameIntervalJitterMs.toFixed(1),
+        m.stutterCount,
       ].join(','));
     }
 
@@ -305,5 +360,13 @@ export class MetricsCollector {
   reset(): void {
     this.streamData.clear();
     this.globalData = { renderTimes: [], longestFrameMs: 0 };
+  }
+
+  /**
+   * Get sorted list of tracked stream IDs.
+   * @returns Array of stream identifiers
+   */
+  getStreamIds(): number[] {
+    return Array.from(this.streamData.keys()).sort((a, b) => a - b);
   }
 }

@@ -4,9 +4,13 @@
  * Uses importExternalTexture for zero-copy GPU rendering of VideoFrames.
  * Renders multiple video streams in a configurable grid layout within
  * a single render pass per animation frame.
+ *
+ * Delegates texture lifecycle management to TextureManager, ensuring
+ * that every VideoFrame is closed after rendering even if errors occur.
  */
 
 import { Logger } from '../utils/logger';
+import { TextureManager } from './texture-manager';
 import shaderCode from './shaders.wgsl?raw';
 
 /** A viewport definition mapping a stream to a normalized canvas region */
@@ -23,8 +27,8 @@ interface Viewport {
   height: number;
 }
 
-/** Size of the viewport uniform buffer (2x vec2<f32> = 16 bytes) */
-const VIEWPORT_UNIFORM_SIZE = 16;
+/** Size of the viewport uniform buffer (12x f32 = 48 bytes) */
+const VIEWPORT_UNIFORM_SIZE = 48;
 
 /**
  * WebGPU-based video renderer.
@@ -43,12 +47,27 @@ export class GPURenderer {
   private context!: GPUCanvasContext;
   private pipeline!: GPURenderPipeline;
   private sampler!: GPUSampler;
+  private textureManager!: TextureManager;
   private viewportBuffers: Map<number, GPUBuffer> = new Map();
   private currentViewports: Viewport[] = [];
   private canvasFormat!: GPUTextureFormat;
   private renderCount = 0;
   private canvas!: HTMLCanvasElement;
   private readonly log: Logger;
+  /** Cached bind group layout — avoids getBindGroupLayout(0) per frame */
+  private bindGroupLayout!: GPUBindGroupLayout;
+
+  /**
+   * Pre-allocated per-stream bind group descriptors.
+   * The entries array and descriptor object are created once per stream
+   * and mutated in place each frame, avoiding per-frame GC pressure.
+   */
+  private bindGroupDescriptors: Map<number, GPUBindGroupDescriptor> = new Map();
+
+  /** Cached per-stream video aspect ratios to avoid rewriting buffers every frame */
+  private lastVideoARs: Map<number, number> = new Map();
+  /** Cached canvas aspect ratio to detect canvas resizes */
+  private lastCanvasAR = 0;
 
   constructor() {
     this.log = new Logger('GPURenderer');
@@ -125,6 +144,12 @@ export class GPURenderer {
       minFilter: 'linear',
     });
 
+    // Cache bind group layout for reuse in pre-allocated descriptors
+    this.bindGroupLayout = this.pipeline.getBindGroupLayout(0);
+
+    // Create texture manager for VideoFrame → GPUExternalTexture lifecycle
+    this.textureManager = new TextureManager(this.device);
+
     this.canvas = canvas;
     this.log.info(`Initialized with format ${this.canvasFormat}, canvas ${canvas.width}x${canvas.height}`);
   }
@@ -162,12 +187,33 @@ export class GPURenderer {
 
     renderPass.setPipeline(this.pipeline);
 
-    let rendered = 0;
+    // Import all frames via TextureManager (must happen in same microtask as draw)
+    const managedTextures: Array<{ streamId: number; managed: import('./texture-manager').ManagedTexture }> = [];
+
     for (const viewport of this.currentViewports) {
       const frame = frames.get(viewport.streamId);
-      if (!frame) {
-        continue;
+      if (!frame) continue;
+
+      try {
+        const managed = this.textureManager.importFrame(frame);
+        managedTextures.push({ streamId: viewport.streamId, managed });
+        // Remove from frames map so we don't double-close
+        frames.delete(viewport.streamId);
+      } catch (e) {
+        this.log.warn(`Failed to import texture for stream ${viewport.streamId}:`, e);
       }
+    }
+
+    let rendered = 0;
+    const canvasAR = this.canvas.width / this.canvas.height;
+    const canvasARChanged = canvasAR !== this.lastCanvasAR;
+    if (canvasARChanged) {
+      this.lastCanvasAR = canvasAR;
+    }
+
+    for (const viewport of this.currentViewports) {
+      const entry = managedTextures.find(t => t.streamId === viewport.streamId);
+      if (!entry) continue;
 
       const viewportBuffer = this.viewportBuffers.get(viewport.streamId);
       if (!viewportBuffer) {
@@ -177,21 +223,53 @@ export class GPURenderer {
         continue;
       }
 
-      try {
-        // importExternalTexture provides zero-copy GPU access to the VideoFrame.
-        // The resulting GPUExternalTexture is only valid until the current microtask ends.
-        const externalTexture = this.device.importExternalTexture({
-          source: frame,
-        });
+      // Update viewport buffer for aspect-ratio-correct rendering
+      const videoAR = entry.managed.width / entry.managed.height;
+      const lastAR = this.lastVideoARs.get(viewport.streamId);
+      if (canvasARChanged || videoAR !== lastAR) {
+        const cellPixelW = viewport.width * this.canvas.width;
+        const cellPixelH = viewport.height * this.canvas.height;
+        const cellAR = cellPixelW / cellPixelH;
 
-        const bindGroup = this.device.createBindGroup({
-          layout: this.pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: this.sampler },
-            { binding: 1, resource: externalTexture },
-            { binding: 2, resource: { buffer: viewportBuffer } },
-          ],
-        });
+        let adjScaleX = viewport.width;
+        let adjScaleY = viewport.height;
+
+        if (videoAR > cellAR) {
+          // Video wider than cell → shrink height
+          adjScaleY = viewport.height * (cellAR / videoAR);
+        } else {
+          // Video taller than cell → shrink width
+          adjScaleX = viewport.width * (videoAR / cellAR);
+        }
+
+        const offsetX = viewport.x * 2 - 1 + viewport.width;
+        const offsetY = 1 - viewport.y * 2 - viewport.height;
+
+        const uniformData = new Float32Array([offsetX, offsetY, adjScaleX, adjScaleY, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0, 1.0]);
+        this.device.queue.writeBuffer(viewportBuffer, 0, uniformData);
+        this.lastVideoARs.set(viewport.streamId, videoAR);
+      }
+
+      try {
+        // Mutate pre-allocated descriptor in place — only the external
+        // texture entry (binding 1) changes per frame.
+        let desc = this.bindGroupDescriptors.get(viewport.streamId);
+        if (!desc) {
+          desc = {
+            layout: this.bindGroupLayout,
+            entries: [
+              { binding: 0, resource: this.sampler },
+              { binding: 1, resource: entry.managed.texture },
+              { binding: 2, resource: { buffer: viewportBuffer } },
+            ],
+          };
+          this.bindGroupDescriptors.set(viewport.streamId, desc);
+        } else {
+          // Mutate only the texture entry (the only thing that changes per frame)
+          (desc.entries as GPUBindGroupEntry[])[1] = { binding: 1, resource: entry.managed.texture };
+        }
+
+        const bindGroup = this.device.createBindGroup(desc);
 
         renderPass.setBindGroup(0, bindGroup);
         renderPass.draw(4); // triangle strip quad
@@ -205,10 +283,15 @@ export class GPURenderer {
     this.device.queue.submit([commandEncoder.finish()]);
 
     if (this.renderCount <= 3 || this.renderCount % 60 === 0) {
-      this.log.info(`renderAll #${this.renderCount}: rendered ${rendered}/${frames.size} streams`);
+      this.log.info(`renderAll #${this.renderCount}: rendered ${rendered}/${managedTextures.length} streams`);
     }
 
-    // Close ALL VideoFrames after submission
+    // Release all managed textures (closes the source VideoFrames)
+    for (const entry of managedTextures) {
+      entry.managed.release();
+    }
+
+    // Close any remaining frames that weren't imported (streams not in viewports)
     for (const frame of frames.values()) {
       frame.close();
     }
@@ -237,6 +320,7 @@ export class GPURenderer {
       if (!activeStreamIds.has(streamId)) {
         buffer.destroy();
         this.viewportBuffers.delete(streamId);
+        this.bindGroupDescriptors.delete(streamId);
       }
     }
 
@@ -257,7 +341,7 @@ export class GPURenderer {
       const scaleX = viewport.width;
       const scaleY = viewport.height;
 
-      const uniformData = new Float32Array([offsetX, offsetY, scaleX, scaleY]);
+      const uniformData = new Float32Array([offsetX, offsetY, scaleX, scaleY, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 1.0, 1.0]);
       this.device.queue.writeBuffer(buffer, 0, uniformData);
 
       this.log.info(`Viewport stream ${viewport.streamId}: norm(${viewport.x.toFixed(2)},${viewport.y.toFixed(2)},${viewport.width.toFixed(2)},${viewport.height.toFixed(2)}) → clip offset(${offsetX.toFixed(3)},${offsetY.toFixed(3)}) scale(${scaleX.toFixed(3)},${scaleY.toFixed(3)})`);
@@ -278,8 +362,24 @@ export class GPURenderer {
     if (!this.device) {
       return 'Not initialized';
     }
-    // GPU info is limited in WebGPU for privacy; return what we can
     return `WebGPU (${this.canvasFormat})`;
+  }
+
+  /**
+   * Get texture manager statistics for monitoring.
+   *
+   * @returns Import/release/error counts and pending frame count
+   */
+  getTextureStats(): { imported: number; released: number; errors: number; pending: number } {
+    if (!this.textureManager) {
+      return { imported: 0, released: 0, errors: 0, pending: 0 };
+    }
+    return {
+      imported: this.textureManager.importCount,
+      released: this.textureManager.releaseCount,
+      errors: this.textureManager.errorCount,
+      pending: this.textureManager.pendingCount,
+    };
   }
 
   /**

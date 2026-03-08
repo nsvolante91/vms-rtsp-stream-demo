@@ -12,8 +12,15 @@ import { Logger } from '../utils/logger';
 /** Callback invoked when the decoder outputs a decoded VideoFrame */
 export type FrameOutputCallback = (frame: VideoFrame) => void;
 
-/** Maximum decode queue size before non-keyframes are dropped */
-const MAX_QUEUE_SIZE = 3;
+/**
+ * Graduated backpressure thresholds:
+ * - queue ≤ NORMAL_THRESHOLD: accept all frames
+ * - queue = SOFT_THRESHOLD: drop B-frames (non-reference delta frames)
+ * - queue ≥ HARD_THRESHOLD: drop all non-keyframes
+ */
+const NORMAL_THRESHOLD = 2;
+const SOFT_THRESHOLD = 3;
+const HARD_THRESHOLD = 4;
 
 /** Minimum interval between recovery attempts in milliseconds */
 const RECOVERY_COOLDOWN_MS = 1000;
@@ -34,7 +41,17 @@ export class VideoStreamDecoder {
   private _lastDecodeTime = 0;
   private _waitingForKeyframe = true;
   private _lastRecoveryTime = 0;
+  private _softwareFallback = false;
+  /** Previous queue size for tracking derivative (proactive dropping) */
+  private _prevQueueSize = 0;
   private readonly log: Logger;
+
+  // ── Decode time tracking ──────────────────────────────────
+  /** Timestamps of chunks submitted for decoding (rolling, capped at 30) */
+  private _decodeSubmitTimes: number[] = [];
+  /** Rolling decode time samples (ms) for averaging */
+  private _decodeTimeSamples: number[] = [];
+  private static readonly MAX_DECODE_SAMPLES = 60;
 
   /**
    * Create a new VideoStreamDecoder.
@@ -62,6 +79,23 @@ export class VideoStreamDecoder {
   configure(config: VideoDecoderConfig): void {
     this.log.info(`Configuring decoder: ${config.codec} ${config.codedWidth}x${config.codedHeight}`);
 
+    // Log description details for debugging
+    if (config.description) {
+      const desc = config.description instanceof ArrayBuffer
+        ? new Uint8Array(config.description)
+        : new Uint8Array((config.description as ArrayBufferView).buffer,
+            (config.description as ArrayBufferView).byteOffset,
+            (config.description as ArrayBufferView).byteLength);
+      this.log.info(`avcC description: ${desc.length} bytes, hex=${Array.from(desc.subarray(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}...`);
+    }
+
+    // Check isConfigSupported asynchronously (non-blocking diagnostic)
+    VideoDecoder.isConfigSupported(config).then(result => {
+      this.log.info(`isConfigSupported: ${result.supported}`);
+    }).catch(err => {
+      this.log.error('isConfigSupported error', err);
+    });
+
     if (this.decoder) {
       try {
         this.decoder.close();
@@ -72,18 +106,93 @@ export class VideoStreamDecoder {
 
     this.config = config;
     this._waitingForKeyframe = true;
+    this._softwareFallback = false;
 
     this.decoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
         this._decodedFrames++;
         this._lastDecodeTime = performance.now();
+        // Record decode time from oldest pending submit
+        if (this._decodeSubmitTimes.length > 0) {
+          const submitTime = this._decodeSubmitTimes.shift()!;
+          const dt = this._lastDecodeTime - submitTime;
+          this._decodeTimeSamples.push(dt);
+          if (this._decodeTimeSamples.length > VideoStreamDecoder.MAX_DECODE_SAMPLES) {
+            this._decodeTimeSamples.shift();
+          }
+        }
         if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
           this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
         }
-        this.onFrame(frame);
+        try {
+          this.onFrame(frame);
+        } catch {
+          try { frame.close(); } catch { /* already closed */ }
+        }
       },
       error: (error: DOMException) => {
         this.log.error('Decoder error', error);
+        // On first error, try software decoding before reporting to pipeline
+        if (!this._softwareFallback && this.config) {
+          this._softwareFallback = true;
+          this.log.info('Hardware decode failed, trying software fallback...');
+          try {
+            const swConfig = { ...this.config, hardwareAcceleration: 'prefer-software' as HardwareAcceleration };
+            this.configureDirect(swConfig);
+            return;
+          } catch (e) {
+            this.log.error('Software fallback configure failed', e);
+          }
+        }
+        this.onError(new Error(`Decoder error: ${error.message}`));
+        this.recoverFromError();
+      },
+    });
+
+    this.decoder.configure(config);
+  }
+
+  /**
+   * Direct configure without diagnostics (used by software fallback).
+   */
+  private configureDirect(config: VideoDecoderConfig): void {
+    this.log.info(`Configuring decoder (fallback): ${config.codec} ${config.codedWidth}x${config.codedHeight} hw=${config.hardwareAcceleration}`);
+
+    if (this.decoder) {
+      try {
+        this.decoder.close();
+      } catch {
+        // Ignore
+      }
+    }
+
+    this.config = config;
+    this._waitingForKeyframe = true;
+
+    this.decoder = new VideoDecoder({
+      output: (frame: VideoFrame) => {
+        this._decodedFrames++;
+        this._lastDecodeTime = performance.now();
+        // Record decode time from oldest pending submit
+        if (this._decodeSubmitTimes.length > 0) {
+          const submitTime = this._decodeSubmitTimes.shift()!;
+          const dt = this._lastDecodeTime - submitTime;
+          this._decodeTimeSamples.push(dt);
+          if (this._decodeTimeSamples.length > VideoStreamDecoder.MAX_DECODE_SAMPLES) {
+            this._decodeTimeSamples.shift();
+          }
+        }
+        if (this._decodedFrames <= 3 || this._decodedFrames % 60 === 0) {
+          this.log.info(`Frame decoded [stream ${this.streamId}] ${frame.displayWidth}x${frame.displayHeight} (total: ${this._decodedFrames})`);
+        }
+        try {
+          this.onFrame(frame);
+        } catch {
+          try { frame.close(); } catch { /* already closed */ }
+        }
+      },
+      error: (error: DOMException) => {
+        this.log.error('Decoder error (fallback)', error);
         this.onError(new Error(`Decoder error: ${error.message}`));
         this.recoverFromError();
       },
@@ -124,10 +233,14 @@ export class VideoStreamDecoder {
   /**
    * Submit an encoded video chunk for decoding.
    *
-   * Implements backpressure: if the decoder's internal queue has more
-   * than MAX_QUEUE_SIZE items and the chunk is NOT a keyframe, the chunk
-   * is dropped. Keyframes are never dropped because they are required
-   * for correct decoding of subsequent frames.
+   * Implements graduated backpressure:
+   * - queue ≤ 2: accept all frames
+   * - queue = 3: drop B-frames (small non-keyframes likely to be B-frames)
+   * - queue ≥ 4: drop all non-keyframes
+   * - queue growing rapidly: proactively drop to prevent further buildup
+   *
+   * Keyframes are never dropped because they are required for correct
+   * decoding of subsequent frames.
    *
    * @param chunk - EncodedVideoChunk to decode
    */
@@ -145,19 +258,46 @@ export class VideoStreamDecoder {
         return;
       }
       this._waitingForKeyframe = false;
-      this.log.info('First keyframe received after configure');
+      this.log.info(`First keyframe: ${chunk.byteLength} bytes, ts=${chunk.timestamp}`);
     }
 
-    // Backpressure: drop non-keyframes when queue is congested
-    if (this.decoder.decodeQueueSize > MAX_QUEUE_SIZE && chunk.type !== 'key') {
-      this._droppedFrames++;
-      return;
+    const queueSize = this.decoder.decodeQueueSize;
+    const queueGrowing = queueSize > this._prevQueueSize;
+    this._prevQueueSize = queueSize;
+
+    if (chunk.type !== 'key') {
+      // Hard threshold: drop all non-keyframes
+      if (queueSize >= HARD_THRESHOLD) {
+        this._droppedFrames++;
+        return;
+      }
+      // Soft threshold: drop likely B-frames (small delta frames)
+      // B-frames are typically much smaller than P-frames
+      if (queueSize >= SOFT_THRESHOLD) {
+        // Heuristic: B-frames are usually < 25% of keyframe size
+        // and the smallest delta frames in a GOP
+        if (chunk.byteLength < 2048) {
+          this._droppedFrames++;
+          return;
+        }
+      }
+      // Proactive: if queue is at normal limit AND growing, start dropping small frames
+      if (queueSize > NORMAL_THRESHOLD && queueGrowing && chunk.byteLength < 1024) {
+        this._droppedFrames++;
+        return;
+      }
     }
 
     try {
+      this._decodeSubmitTimes.push(performance.now());
+      // Cap pending timestamps to prevent unbounded growth on stalls
+      if (this._decodeSubmitTimes.length > 30) {
+        this._decodeSubmitTimes.shift();
+      }
       this.decoder.decode(chunk);
     } catch (e) {
       this.log.error('Failed to decode chunk', e);
+      this._decodeSubmitTimes.pop(); // remove the timestamp we just pushed
       this._droppedFrames++;
     }
   }
@@ -220,5 +360,12 @@ export class VideoStreamDecoder {
   /** Timestamp (performance.now()) of the last successfully decoded frame */
   get lastDecodeTime(): number {
     return this._lastDecodeTime;
+  }
+
+  /** Average decode time in milliseconds (rolling window) */
+  get avgDecodeTimeMs(): number {
+    if (this._decodeTimeSamples.length === 0) return 0;
+    const sum = this._decodeTimeSamples.reduce((a, b) => a + b, 0);
+    return sum / this._decodeTimeSamples.length;
   }
 }

@@ -9,8 +9,8 @@ A browser-based Video Management System prototype demonstrating maximum video st
 Three main components:
 
 1. **Test Environment** (Docker): MediaMTX RTSP server + FFmpeg looping test videos as simulated cameras
-2. **Bridge Server** (Node.js/TypeScript): Reads RTSP streams, extracts H.264 NAL units, serves them over WebSocket with a simple binary protocol
-3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebSocket, decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics
+2. **Bridge Server** (Node.js/TypeScript): Reads RTSP streams, extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) with a binary protocol. One unidirectional QUIC stream per video subscription eliminates cross-stream head-of-line blocking.
+3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebTransport, decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics
 
 ## Key Technical Constraints
 
@@ -18,7 +18,9 @@ Three main components:
 - **importExternalTexture lifetime** — the GPUExternalTexture is only valid until the current microtask completes; must use it in the same synchronous render pass
 - **Backpressure** — check `decoder.decodeQueueSize` before feeding frames; drop non-keyframes when queue > 3
 - **H.264 codec string** — must be derived from SPS NAL unit: `avc1.{profile}{constraints}{level}` in hex
-- **Chrome-first** — target Chrome 113+; WebGPU importExternalTexture is not in Firefox yet
+- **Chrome-first** — target Chrome 114+; WebTransport + WebGPU importExternalTexture require Chrome
+- **WebTransport framing** — QUIC streams are byte-oriented; all messages use 4-byte big-endian length prefix
+- **Self-signed certs** — WebTransport requires TLS; bridge server generates ECDSA P-256 cert at startup (≤14 days validity); client pins via `serverCertificateHashes`
 
 ## Build & Run
 
@@ -63,5 +65,6 @@ npm run typecheck        # TypeScript type checking
 - All public functions have JSDoc comments
 - No runtime dependencies in the browser client (all native APIs)
 - Prefer `performance.now()` for timing, not `Date.now()`
-- All WebSocket messages are binary (ArrayBuffer) except subscribe/unsubscribe (JSON text)
+- All WebTransport control messages are length-prefixed JSON on a bidirectional stream
+- All video data is currently multiplexed over a single unidirectional QUIC stream per client using the binary protocol (per-stream unidirectional QUIC streams remain a future optimization target)
 - Use `const` by default, `let` only when reassignment is needed

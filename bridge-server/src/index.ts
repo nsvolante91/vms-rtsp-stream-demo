@@ -1,29 +1,37 @@
 /**
- * Bridge Server Entry Point
+ * Bridge Server Entry Point — WebTransport Edition
  *
- * WebSocket server on port 9000 that bridges RTSP H.264 streams to browser
- * clients. Provides a REST API for stream management and auto-discovers
- * active streams on startup.
+ * HTTP/3 WebTransport server on port 9001 that bridges RTSP H.264 streams
+ * to browser clients via multiplexed QUIC streams. Also provides an HTTP/1.1
+ * REST API on port 9000 for stream management and certificate hash retrieval.
  *
- * REST Endpoints:
+ * REST Endpoints (HTTP/1.1 on port 9000):
  * - GET  /streams     — List all available streams
  * - POST /streams     — Add a new stream { rtspUrl }
  * - DELETE /streams/:id — Remove a stream
+ * - GET  /cert-hash   — Get the TLS certificate SHA-256 hash for WebTransport pinning
+ * - GET  /health      — Server health check
  *
- * WebSocket at / — Binary frame protocol for H.264 streaming
+ * WebTransport at https://localhost:9001/streams — Binary H.264 streaming
+ * - Client opens a bidirectional stream for control (subscribe/unsubscribe)
+ * - Server opens one unidirectional stream per subscribed video feed
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
-import { WebSocketServer, WebSocket } from 'ws';
+import { Http3Server } from '@fails-components/webtransport';
 import { StreamManager } from './stream-manager.js';
 import { probeRTSPStream } from './rtsp-client.js';
+import { generateCertificate, type CertMaterial } from './cert-utils.js';
+import { attachWebSocketServer } from './ws-handler.js';
 
-const PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
+const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
+const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
 const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://localhost:8554';
-const MAX_DISCOVER_STREAMS = 16;
+const MAX_DISCOVER_STREAMS = 1;
 
 const streamManager = new StreamManager();
 let nextStreamId = 1;
+let certMaterial: CertMaterial;
 
 /**
  * Parse the request body as JSON.
@@ -76,7 +84,7 @@ async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
+  const url = new URL(req.url ?? '/', `http://localhost:${HTTP_PORT}`);
   const method = req.method ?? 'GET';
 
   // CORS preflight
@@ -87,6 +95,16 @@ async function handleRequest(
       'Access-Control-Allow-Headers': 'Content-Type',
     });
     res.end();
+    return;
+  }
+
+  // GET /cert-hash — certificate fingerprint for WebTransport pinning
+  if (url.pathname === '/cert-hash' && method === 'GET') {
+    sendJSON(res, 200, {
+      hash: certMaterial.hashHex,
+      algorithm: 'sha-256',
+      wtUrl: `https://localhost:${WT_PORT}/streams`,
+    });
     return;
   }
 
@@ -141,14 +159,39 @@ async function handleRequest(
 }
 
 /**
- * Auto-discover active RTSP streams on the local MediaMTX server.
+ * Auto-discover active RTSP streams.
  *
- * Probes RTSP URLs from stream1 through stream16 and adds any that
- * respond successfully. Uses parallel probing for speed.
+ * If RTSP_BASE_URL looks like a MediaMTX local server (contains localhost or
+ * 127.0.0.1), probes stream1..stream16 as sub-paths. Otherwise, treats the
+ * base URL as a single direct RTSP stream (e.g. a real IP camera).
  */
 async function discoverStreams(): Promise<void> {
+  const isLocalMediaMTX =
+    RTSP_BASE_URL.includes('localhost') ||
+    RTSP_BASE_URL.includes('127.0.0.1');
+
+  if (!isLocalMediaMTX) {
+    // Direct camera URL — probe and add as a single stream
+    console.log(`[Discovery] Probing direct RTSP URL: ${RTSP_BASE_URL}`);
+    const available = true; // await probeRTSPStream(RTSP_BASE_URL, 10000);
+    if (available) {
+      const id = nextStreamId++;
+      try {
+        await streamManager.addStream(id, RTSP_BASE_URL);
+        console.log(`[Discovery] Added direct stream as ID ${id}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        console.error(`[Discovery] Failed to add direct stream: ${message}`);
+      }
+    } else {
+      console.error(`[Discovery] Could not connect to ${RTSP_BASE_URL}`);
+    }
+    return;
+  }
+
+  // MediaMTX local server — probe stream
   console.log(
-    `[Discovery] Probing ${RTSP_BASE_URL}/stream1..stream${MAX_DISCOVER_STREAMS}`
+    `[Discovery] Probing ${RTSP_BASE_URL}`
   );
 
   const probePromises: Promise<{ index: number; available: boolean }>[] = [];
@@ -170,7 +213,6 @@ async function discoverStreams(): Promise<void> {
     `[Discovery] Found ${available.length} active stream(s): ${available.map((r) => `stream${r.index}`).join(', ') || 'none'}`
   );
 
-  // Connect to discovered streams sequentially to avoid overwhelming FFmpeg
   for (const result of available) {
     const url = `${RTSP_BASE_URL}/stream${result.index}`;
     const id = nextStreamId++;
@@ -188,14 +230,51 @@ async function discoverStreams(): Promise<void> {
 }
 
 /**
+ * Accept incoming WebTransport sessions from the Http3Server.
+ *
+ * Reads sessions from the session stream for the `/streams` path and
+ * hands each one to the StreamManager for control/video multiplexing.
+ *
+ * @param sessionStream - ReadableStream of WebTransport sessions
+ */
+async function acceptSessions(
+  sessionStream: ReadableStream<any>
+): Promise<void> {
+  const reader = sessionStream.getReader();
+
+  try {
+    while (true) {
+      const { value: session, done } = await reader.read();
+      if (done) break;
+
+      console.log('[WT] New WebTransport session accepted');
+      // Handle each session concurrently — don't block the accept loop
+      streamManager.handleSession(session).catch((err) => {
+        console.error('[WT] Session handler error:', err);
+      });
+    }
+  } catch (err) {
+    console.error('[WT] Session accept loop error:', err);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
  * Start the bridge server.
  *
- * Creates an HTTP server for the REST API and upgrades WebSocket connections
- * for streaming. Auto-discovers RTSP streams on startup.
+ * Creates an HTTP/1.1 REST API server and an HTTP/3 WebTransport server.
+ * Generates a self-signed TLS certificate for WebTransport and exposes
+ * its SHA-256 hash via the REST API. Auto-discovers RTSP streams on startup.
  */
 async function main(): Promise<void> {
-  // Create HTTP server
-  const server = createServer((req, res) => {
+  // Generate self-signed ECDSA certificate for WebTransport
+  console.log('[Bridge] Generating self-signed TLS certificate...');
+  certMaterial = generateCertificate();
+  console.log(`[Bridge] Certificate hash: ${certMaterial.hashHex}`);
+
+  // Create HTTP/1.1 REST API server
+  const httpServer = createServer((req, res) => {
     handleRequest(req, res).catch((err) => {
       console.error('[HTTP] Request handler error:', err);
       if (!res.headersSent) {
@@ -204,41 +283,49 @@ async function main(): Promise<void> {
     });
   });
 
-  // Create WebSocket server attached to the HTTP server
-  const wss = new WebSocketServer({ server });
-
-  wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-    const remoteAddr =
-      req.socket.remoteAddress ?? 'unknown';
-    console.log(`[WS] Client connected from ${remoteAddr}`);
-    streamManager.handleClient(ws);
+  // Create HTTP/3 WebTransport server
+  const wtServer = new Http3Server({
+    port: WT_PORT,
+    host: '0.0.0.0',
+    secret: 'vms-bridge-secret',
+    cert: certMaterial.cert,
+    privKey: certMaterial.key,
   });
 
-  wss.on('error', (err: Error) => {
-    console.error('[WS] Server error:', err.message);
+  // Register the /streams path for WebTransport sessions
+  const sessionStream = wtServer.sessionStream('/streams');
+
+  // Attach WebSocket fallback server on the HTTP server at /ws
+  attachWebSocketServer(httpServer, streamManager);
+
+  // Start servers
+  httpServer.listen(HTTP_PORT, () => {
+    console.log(`[Bridge] REST API listening on http://localhost:${HTTP_PORT}`);
+    console.log(`[Bridge] Certificate hash: GET http://localhost:${HTTP_PORT}/cert-hash`);
   });
 
-  // Start listening
-  server.listen(PORT, () => {
-    console.log(`[Bridge] Server listening on port ${PORT}`);
-    console.log(`[Bridge] REST API: http://localhost:${PORT}/streams`);
-    console.log(`[Bridge] WebSocket: ws://localhost:${PORT}/`);
+  wtServer.startServer();
+  await wtServer.ready;
+  console.log(`[Bridge] WebTransport server listening on https://localhost:${WT_PORT}/streams`);
+
+  // Accept WebTransport sessions (runs in background)
+  acceptSessions(sessionStream).catch((err) => {
+    console.error('[Bridge] Fatal: session acceptor crashed:', err);
   });
 
-  // Auto-discover streams
+  // Auto-discover RTSP streams
   await discoverStreams();
 
   // Graceful shutdown
   const shutdown = (): void => {
     console.log('\n[Bridge] Shutting down...');
     streamManager.shutdown();
-    wss.close();
-    server.close(() => {
+    wtServer.stopServer();
+    httpServer.close(() => {
       console.log('[Bridge] Server stopped');
       process.exit(0);
     });
 
-    // Force exit after 5 seconds
     setTimeout(() => {
       console.error('[Bridge] Forced exit after timeout');
       process.exit(1);
@@ -249,7 +336,6 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown);
 }
 
-// Start the server
 main().catch((err) => {
   console.error('[Bridge] Fatal error:', err);
   process.exit(1);

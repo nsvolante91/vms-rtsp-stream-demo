@@ -16,6 +16,11 @@ import {
   parseSPS,
   type SPSInfo,
 } from './h264-parser.js';
+import {
+  createRtspAuthProxy,
+  parseRtspUrl,
+  type RtspAuthProxy,
+} from './rtsp-auth-proxy.js';
 
 /** Event emitted when a complete NAL unit is extracted from the stream */
 export interface NALUEvent {
@@ -64,6 +69,7 @@ export class RTSPClient extends EventEmitter {
   private frameCount = 0;
   private startTime = 0n;
   private spsInfo: SPSInfo | null = null;
+  private authProxy: RtspAuthProxy | null = null;
 
   constructor(private readonly rtspUrl: string) {
     super();
@@ -113,11 +119,17 @@ export class RTSPClient extends EventEmitter {
     this.startTime = process.hrtime.bigint();
     this.buffer = Buffer.alloc(0);
 
+    // Start auth proxy to work around FFmpeg 8.x SHA-256 Digest auth bug
+    const { host, port: rtspPort } = parseRtspUrl(this.rtspUrl);
+    this.authProxy = await createRtspAuthProxy(host, rtspPort);
+    const proxiedUrl = this.authProxy.rewriteUrl(this.rtspUrl);
+    console.log(`[RTSPClient] Using auth proxy: ${proxiedUrl}`);
+
     return new Promise<void>((resolve, reject) => {
       // Spawn FFmpeg: read RTSP via TCP, output raw H.264 Annex B to stdout
       this.ffmpeg = spawn('ffmpeg', [
         '-rtsp_transport', 'tcp',
-        '-i', this.rtspUrl,
+        '-i', proxiedUrl,
         '-c:v', 'copy',
         '-an',
         '-f', 'h264',
@@ -128,10 +140,12 @@ export class RTSPClient extends EventEmitter {
       });
 
       let resolved = false;
+      let connectTimeout: ReturnType<typeof setTimeout> | null = null;
 
       this.ffmpeg.stdout!.on('data', (chunk: Buffer) => {
         if (!resolved) {
           resolved = true;
+          if (connectTimeout) clearTimeout(connectTimeout);
           resolve();
         }
         this.onData(chunk);
@@ -154,6 +168,10 @@ export class RTSPClient extends EventEmitter {
         this.running = false;
         if (!resolved) {
           resolved = true;
+          if (this.authProxy) {
+            this.authProxy.close();
+            this.authProxy = null;
+          }
           reject(new Error(`Failed to spawn FFmpeg: ${err.message}`));
         } else {
           this.emit('error', err);
@@ -166,6 +184,10 @@ export class RTSPClient extends EventEmitter {
         this.flushBuffer();
         if (!resolved) {
           resolved = true;
+          if (this.authProxy) {
+            this.authProxy.close();
+            this.authProxy = null;
+          }
           reject(
             new Error(`FFmpeg exited with code ${code} before producing output`)
           );
@@ -174,7 +196,7 @@ export class RTSPClient extends EventEmitter {
       });
 
       // Timeout if FFmpeg doesn't produce output within 10 seconds
-      setTimeout(() => {
+      connectTimeout = setTimeout(() => {
         if (!resolved) {
           resolved = true;
           this.close();
@@ -192,6 +214,13 @@ export class RTSPClient extends EventEmitter {
    */
   close(): void {
     this.running = false;
+
+    // Shut down the auth proxy
+    if (this.authProxy) {
+      this.authProxy.close();
+      this.authProxy = null;
+    }
+
     if (this.ffmpeg) {
       const proc = this.ffmpeg;
       this.ffmpeg = null;
@@ -202,13 +231,15 @@ export class RTSPClient extends EventEmitter {
       // Force kill after 5 seconds if still alive
       const killTimeout = setTimeout(() => {
         try {
-          proc.kill('SIGKILL');
+          if (!proc.killed) {
+            proc.kill('SIGKILL');
+          }
         } catch {
           // Process may have already exited
         }
       }, 5000);
 
-      proc.on('close', () => {
+      proc.once('exit', () => {
         clearTimeout(killTimeout);
       });
     }
@@ -269,20 +300,15 @@ export class RTSPClient extends EventEmitter {
 
   /**
    * Get the start code length at a given offset.
-   * @param data - Buffer to inspect
-   * @param offset - Offset of the start code
-   * @returns 3 or 4 (the start code length)
+   *
+   * Always returns 3 to match the 3-byte-only detection used by
+   * findNALUnits. This preserves trailing zero bytes as part of the
+   * preceding NAL unit rather than consuming them into a 4-byte start code.
+   *
+   * @returns 3 (always uses 3-byte start code detection)
    */
-  private getStartCodeLength(data: Uint8Array, offset: number): number {
-    if (
-      offset >= 1 &&
-      data[offset] === 0x00 &&
-      data[offset + 1] === 0x00 &&
-      data[offset + 2] === 0x00 &&
-      data[offset + 3] === 0x01
-    ) {
-      return 4;
-    }
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  private getStartCodeLength(_data: Uint8Array, _offset: number): number {
     return 3;
   }
 
@@ -362,12 +388,23 @@ export async function probeRTSPStream(
   rtspUrl: string,
   timeoutMs = 5000
 ): Promise<boolean> {
+  // Start auth proxy to work around FFmpeg 8.x SHA-256 Digest auth bug
+  let proxy: RtspAuthProxy | null = null;
+  let proxiedUrl = rtspUrl;
+  try {
+    const { host, port: rtspPort } = parseRtspUrl(rtspUrl);
+    proxy = await createRtspAuthProxy(host, rtspPort);
+    proxiedUrl = proxy.rewriteUrl(rtspUrl);
+  } catch {
+    // If proxy fails to start, try direct connection
+  }
+
   return new Promise<boolean>((resolve) => {
     const proc = spawn('ffprobe', [
       '-rtsp_transport', 'tcp',
       '-analyzeduration', '1000000',
       '-probesize', '1000000',
-      '-i', rtspUrl,
+      '-i', proxiedUrl,
       '-show_streams',
       '-select_streams', 'v:0',
       '-loglevel', 'error',
@@ -391,12 +428,14 @@ export async function probeRTSPStream(
         } catch {
           // Process may have already exited
         }
+        proxy?.close();
         resolve(false);
       }
     }, timeoutMs);
 
     proc.on('close', (code: number | null) => {
       clearTimeout(timeout);
+      proxy?.close();
       if (!resolved) {
         resolved = true;
         if (code === 0 && stdout.length > 0) {
@@ -416,6 +455,7 @@ export async function probeRTSPStream(
 
     proc.on('error', () => {
       clearTimeout(timeout);
+      proxy?.close();
       if (!resolved) {
         resolved = true;
         resolve(false);
