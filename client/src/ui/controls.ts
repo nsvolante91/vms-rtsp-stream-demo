@@ -21,7 +21,7 @@ import type { UpscaleMode } from '../worker/messages';
  */
 export class Controls {
   private cpuHogInterval: number | null = null;
-  private secondaryVisible = false;
+  private overflowOpen = false;
 
   /**
    * Create a new Controls instance.
@@ -126,27 +126,58 @@ export class Controls {
     if (upscaleSelect) {
       upscaleSelect.addEventListener('change', () => {
         const mode = upscaleSelect.value as typeof Controls.UPSCALE_MODES[number];
-        const infoEl = document.getElementById('upscale-info');
-        if (infoEl) {
-          infoEl.textContent = Controls.UPSCALE_DESCRIPTIONS[mode];
-          infoEl.dataset.mode = mode;
-        }
+        upscaleSelect.title = Controls.UPSCALE_DESCRIPTIONS[mode];
         upscaleSelect.dataset.mode = mode;
         console.log(`[Upscale] Mode: ${mode}`);
         this.onUpscaleChange?.(mode);
       });
     }
 
-    // "More" toggle for secondary controls on mobile
-    const moreBtn = document.getElementById('btn-more');
-    if (moreBtn) {
-      moreBtn.addEventListener('click', () => {
-        this.secondaryVisible = !this.secondaryVisible;
-        const secondary = document.querySelector('.control-secondary');
-        if (secondary) {
-          secondary.classList.toggle('visible', this.secondaryVisible);
+    // Overflow menu (⋮) toggle
+    const overflowBtn = document.getElementById('btn-overflow');
+    const overflowMenu = document.getElementById('overflow-menu');
+    if (overflowBtn && overflowMenu) {
+      overflowBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.overflowOpen = !this.overflowOpen;
+        overflowMenu.classList.toggle('hidden', !this.overflowOpen);
+      });
+
+      // Close on outside click
+      document.addEventListener('click', (e) => {
+        if (this.overflowOpen && !overflowMenu.contains(e.target as Node)) {
+          this.overflowOpen = false;
+          overflowMenu.classList.add('hidden');
         }
-        moreBtn.textContent = this.secondaryVisible ? 'Less ▴' : 'More ▾';
+      });
+
+      // Close on Escape
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && this.overflowOpen) {
+          this.overflowOpen = false;
+          overflowMenu.classList.add('hidden');
+        }
+      });
+    }
+
+    // Mobile-only overflow items that mirror main bar buttons
+    const metricsOverlayMobile = document.getElementById('btn-metrics-overlay-mobile');
+    if (metricsOverlayMobile) {
+      metricsOverlayMobile.addEventListener('click', () => {
+        const mainBtn = document.getElementById('btn-metrics-overlay');
+        mainBtn?.classList.toggle('active');
+        metricsOverlayMobile.classList.toggle('active');
+        this.onToggleMetricsOverlay?.();
+      });
+    }
+
+    const compareMobile = document.getElementById('btn-compare-mobile');
+    if (compareMobile) {
+      compareMobile.addEventListener('click', () => {
+        const mainBtn = document.getElementById('btn-compare');
+        mainBtn?.classList.toggle('active');
+        compareMobile.classList.toggle('active');
+        this.onToggleCompare?.();
       });
     }
 

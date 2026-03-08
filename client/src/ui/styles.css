@@ -170,59 +170,109 @@ body {
 
 /* ── Control bar ────────────────────────────────────────────── */
 #controls {
+  position: relative;
   display: flex;
-  flex-direction: column;
-  gap: 0;
-  padding: 0;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  padding-left: max(12px, env(safe-area-inset-left, 12px));
+  padding-right: max(12px, env(safe-area-inset-right, 12px));
+  padding-bottom: max(6px, env(safe-area-inset-bottom, 6px));
   background: #1a1a1a;
   border-top: 1px solid #333;
   flex-shrink: 0;
-  padding-bottom: env(safe-area-inset-bottom, 0px);
-}
-
-.control-primary {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 8px 16px;
-  padding-left: max(16px, env(safe-area-inset-left, 16px));
-  padding-right: max(16px, env(safe-area-inset-right, 16px));
-  flex-wrap: wrap;
-}
-
-.control-secondary {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 8px 16px;
-  padding-left: max(16px, env(safe-area-inset-left, 16px));
-  padding-right: max(16px, env(safe-area-inset-right, 16px));
-  border-top: 1px solid #222;
-  flex-wrap: wrap;
 }
 
 .control-group {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
 }
 
-.control-group label {
-  font-size: 13px;
-  color: #999;
+.cg-streams,
+.cg-upscale,
+.cg-toggles {
+  border-left: 1px solid #333;
+  padding-left: 6px;
 }
 
-/* "More" toggle button — hidden on wide screens */
-.btn-more {
-  display: none;
+.control-spacer {
+  flex: 1;
 }
 
-/* Fullscreen button — hidden on wide screens by default */
 .btn-fullscreen {
-  display: none;
   font-size: 18px;
   line-height: 1;
   padding: 4px 10px;
+}
+
+/* ── Overflow (kebab) button ────────────────────────────────── */
+.btn-overflow {
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 10px;
+  letter-spacing: 1px;
+}
+
+/* ── Overflow menu ──────────────────────────────────────────── */
+.overflow-menu {
+  position: absolute;
+  bottom: 100%;
+  right: 12px;
+  margin-bottom: 4px;
+  background: #222;
+  border: 1px solid #444;
+  border-radius: 6px;
+  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.6);
+  padding: 4px 0;
+  min-width: 200px;
+  z-index: 50;
+}
+
+.overflow-menu.hidden {
+  display: none;
+}
+
+.overflow-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: #e0e0e0;
+  font-size: 13px;
+  padding: 8px 14px;
+  cursor: pointer;
+  text-align: left;
+  gap: 6px;
+}
+
+.overflow-item:hover {
+  background: #333;
+}
+
+.overflow-item.active {
+  background: #0066cc;
+  border-color: transparent;
+}
+
+.overflow-sep {
+  height: 1px;
+  background: #333;
+  margin: 4px 0;
+}
+
+.overflow-hint {
+  display: block;
+  font-size: 11px;
+  color: #666;
+  padding: 4px 14px;
+}
+
+.overflow-mobile-only {
+  display: none;
 }
 
 button {
@@ -332,7 +382,7 @@ button.active {
   border-radius: 4px;
   font-size: 13px;
   cursor: pointer;
-  min-width: 120px;
+  min-width: 70px;
   transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
   appearance: auto;
 }
@@ -408,54 +458,11 @@ button.active {
   color: #fff;
 }
 
-.upscale-info {
-  font-size: 11px;
-  color: #888;
-  max-width: 500px;
-  line-height: 1.35;
-  padding: 2px 8px;
-  border-left: 2px solid #444;
-  transition: color 0.2s, border-color 0.2s;
-}
-
-.upscale-info[data-mode="cas"] {
-  color: #66cc88;
-  border-color: #00aa55;
-}
-
-.upscale-info[data-mode="fsr"] {
-  color: #ffaa44;
-  border-color: #ff8800;
-}
-
-.upscale-info[data-mode="a4k"] {
-  color: #bb88ff;
-  border-color: #8800ff;
-}
-
-.upscale-info[data-mode="a4k-fast"] {
-  color: #aa77ee;
-  border-color: #7700dd;
-}
-
-.upscale-info[data-mode="tsr"] {
-  color: #44ccee;
-  border-color: #0099cc;
-}
-
-.upscale-info[data-mode="spec"] {
-  color: #6699ff;
-  border-color: #0066ff;
-}
-
-.upscale-info[data-mode="vqsr"] {
-  color: #eebb44;
-  border-color: #cc9900;
-}
-
-.upscale-info[data-mode="gen"] {
-  color: #ff4466;
-  border-color: #cc0033;
+#upscale-select[data-mode="dlss"] {
+  background: #333399;
+  border-color: #5555ff;
+  box-shadow: 0 0 8px rgba(85, 85, 255, 0.5);
+  color: #fff;
 }
 
 .error-overlay {
@@ -555,52 +562,43 @@ button.active {
     padding: 10px 14px;
   }
 
-  .btn-fullscreen {
+  .btn-fullscreen,
+  .btn-overflow {
+    min-height: 44px;
+    min-width: 44px;
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+
+  .overflow-item {
     min-height: 44px;
-    min-width: 44px;
+    font-size: 15px;
+    padding: 10px 14px;
   }
 }
 
 /* ── Narrow screen (mobile phones) ─────────────────────────────── */
 @media (max-width: 640px) {
-  .control-primary {
-    gap: 8px;
-    padding: 6px 10px;
-    padding-left: max(10px, env(safe-area-inset-left, 10px));
-    padding-right: max(10px, env(safe-area-inset-right, 10px));
-  }
-
-  .control-secondary {
-    gap: 8px;
-    padding: 6px 10px;
-    padding-left: max(10px, env(safe-area-inset-left, 10px));
-    padding-right: max(10px, env(safe-area-inset-right, 10px));
+  #controls {
+    gap: 4px;
+    padding: 4px 8px;
+    padding-left: max(8px, env(safe-area-inset-left, 8px));
+    padding-right: max(8px, env(safe-area-inset-right, 8px));
+    padding-bottom: max(4px, env(safe-area-inset-bottom, 4px));
   }
 
   .control-group {
-    gap: 4px;
+    gap: 2px;
   }
 
-  .upscale-info {
+  /* Hide desktop-only toggle buttons on mobile — available in overflow */
+  .cg-toggles {
     display: none;
   }
 
-  /* "More" toggle visible on narrow screens */
-  .btn-more {
-    display: inline-flex;
-    align-items: center;
-    margin-left: auto;
-  }
-
-  /* Secondary controls hidden by default on mobile */
-  .control-secondary {
-    display: none;
-  }
-
-  .control-secondary.visible {
+  /* Show mobile-only overflow items */
+  .overflow-mobile-only {
     display: flex;
   }
 
