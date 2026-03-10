@@ -17,6 +17,10 @@ export interface StreamOverlayData {
   frameIntervalJitterMs: number;
   stutterCount: number;
   bitrateKbps: number;
+  /** Frames superseded in the render queue before display */
+  renderDroppedFrames: number;
+  /** Resolution tier driving adaptive thresholds (sd/hd/uhd) */
+  resolutionTier: 'sd' | 'hd' | 'uhd';
 }
 
 /**
@@ -44,9 +48,10 @@ export class StreamOverlay {
     const fpsColor = data.fps > 25 ? 'smo-green' : data.fps >= 15 ? 'smo-yellow' : 'smo-red';
     const dropColor = data.droppedFrames > 0 ? 'smo-red' : '';
     const decodeColor = data.decodeTimeMs > 33 ? 'smo-red' : data.decodeTimeMs > 16 ? 'smo-yellow' : '';
-    const queueColor = data.queueSize >= 4 ? 'smo-red' : data.queueSize >= 3 ? 'smo-yellow' : '';
+    const queueColor = data.queueSize >= 6 ? 'smo-red' : data.queueSize >= 4 ? 'smo-yellow' : '';
     const jitterColor = data.frameIntervalJitterMs > 10 ? 'smo-yellow' : '';
     const stutterColor = data.stutterCount > 0 ? 'smo-red' : '';
+    const renderDropColor = data.renderDroppedFrames > 0 ? 'smo-yellow' : '';
 
     // Format bitrate: show Mbps if ≥ 1000 kbps
     const bitrateStr = data.bitrateKbps >= 1000
@@ -55,13 +60,14 @@ export class StreamOverlay {
 
     this.el.innerHTML =
       `<div class="smo-row"><span class="smo-label">FPS</span><span class="smo-val ${fpsColor}">${data.fps}</span></div>` +
-      `<div class="smo-row"><span class="smo-label">Res</span><span class="smo-val">${data.resolution}</span></div>` +
+      `<div class="smo-row"><span class="smo-label">Res</span><span class="smo-val">${data.resolution} <span class="smo-tier">${data.resolutionTier.toUpperCase()}</span></span></div>` +
       `<div class="smo-row"><span class="smo-label">Decode</span><span class="smo-val ${decodeColor}">${data.decodeTimeMs.toFixed(1)} ms</span></div>` +
       `<div class="smo-row"><span class="smo-label">Queue</span><span class="smo-val ${queueColor}">${data.queueSize}</span></div>` +
       `<div class="smo-row"><span class="smo-label">Interval</span><span class="smo-val">${data.frameIntervalMs.toFixed(1)} ms</span></div>` +
       `<div class="smo-row"><span class="smo-label">Jitter</span><span class="smo-val ${jitterColor}">${data.frameIntervalJitterMs.toFixed(1)} ms</span></div>` +
       `<div class="smo-row"><span class="smo-label">Stutters</span><span class="smo-val ${stutterColor}">${data.stutterCount}</span></div>` +
       `<div class="smo-row"><span class="smo-label">Dropped</span><span class="smo-val ${dropColor}">${data.droppedFrames}</span></div>` +
+      `<div class="smo-row"><span class="smo-label">Render Drop</span><span class="smo-val ${renderDropColor}">${data.renderDroppedFrames}</span></div>` +
       `<div class="smo-row"><span class="smo-label">Decoded</span><span class="smo-val">${data.decodedFrames}</span></div>` +
       `<div class="smo-row"><span class="smo-label">Bitrate</span><span class="smo-val">${bitrateStr}</span></div>`;
   }

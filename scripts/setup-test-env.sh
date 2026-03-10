@@ -28,6 +28,18 @@ download_if_missing \
   "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4" \
   "$VIDEO_DIR/TearsOfSteel.mp4"
 
+# 4K 60fps Big Buck Bunny (zip archive)
+if [ -f "$VIDEO_DIR/bbb_sunflower_2160p_60fps_normal.mp4" ]; then
+  echo "  Already exists: bbb_sunflower_2160p_60fps_normal.mp4"
+else
+  echo "  Downloading: bbb_sunflower_2160p_60fps_normal.mp4.zip..."
+  curl -L -o "$VIDEO_DIR/bbb_sunflower_2160p_60fps_normal.mp4.zip" \
+    "https://download.blender.org/demo/movies/BBB/bbb_sunflower_2160p_60fps_normal.mp4.zip"
+  echo "  Extracting..."
+  unzip -o "$VIDEO_DIR/bbb_sunflower_2160p_60fps_normal.mp4.zip" -d "$VIDEO_DIR"
+  rm "$VIDEO_DIR/bbb_sunflower_2160p_60fps_normal.mp4.zip"
+fi
+
 echo ""
 echo "=== Generating resolution variants ==="
 
@@ -47,15 +59,21 @@ generate_variant "$VIDEO_DIR/BigBuckBunny.mp4" "$VIDEO_DIR/bbb_720p.mp4" "1280:7
 generate_variant "$VIDEO_DIR/BigBuckBunny.mp4" "$VIDEO_DIR/bbb_480p.mp4" "854:480"
 
 echo ""
-echo "=== Starting Docker environment ==="
-docker compose -f "$PROJECT_DIR/docker/docker-compose.yml" up -d
+if command -v docker &>/dev/null; then
+  echo "=== Starting Docker environment ==="
+  docker compose -f "$PROJECT_DIR/docker/docker-compose.yml" up -d
 
-echo ""
-echo "=== Waiting for MediaMTX to start ==="
-sleep 3
+  echo ""
+  echo "=== Waiting for MediaMTX to start ==="
+  sleep 3
 
-echo ""
-echo "=== Test environment ready ==="
-echo "MediaMTX RTSP: rtsp://localhost:8554"
+  echo ""
+  echo "=== Test environment ready ==="
+  echo "MediaMTX RTSP: rtsp://localhost:8554"
+else
+  echo "=== Skipping Docker (not found in PATH) ==="
+  echo "Install Docker or start MediaMTX manually to use RTSP streams."
+fi
+
 echo ""
 echo "Run ./scripts/generate-streams.sh <N> to start N simulated camera streams"

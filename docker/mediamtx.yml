@@ -11,6 +11,10 @@ rtsp: yes
 rtspAddress: :8554
 protocols: [tcp]
 
+# Buffer tuning for high-bitrate 4K streams (16+ simultaneous)
+readBufferCount: 4096
+writeQueueSize: 2048
+
 # RTMP (disabled)
 rtmp: no
 

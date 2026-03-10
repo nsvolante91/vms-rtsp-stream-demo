@@ -18,7 +18,7 @@
 
 import { WebSocket as WSSocket } from 'ws';
 import { RTSPClient, type NALUEvent } from './rtsp-client.js';
-import { frameLengthPrefixed, readLengthPrefixed, writeLengthPrefixed } from './framing.js';
+import { readLengthPrefixed, writeLengthPrefixed } from './framing.js';
 import {
   isKeyframe,
   isConfigNAL,
@@ -71,6 +71,8 @@ interface PendingAccessUnit {
 interface VideoSubscription {
   /** Client identifier */
   clientId: number;
+  /** Transport type — determines which frame view to send */
+  transport: 'webtransport' | 'websocket';
   /** Send a binary protocol frame to this subscriber (fire-and-forget) */
   send: (frame: Buffer) => void;
   /** Whether this subscriber is currently backpressured */
@@ -134,6 +136,10 @@ interface ManagedStream {
   auBuffer: Buffer;
   /** Current write position in auBuffer */
   auFilled: number;
+  /** Monotonic frame counter for synthetic timestamp generation */
+  auFrameCount: number;
+  /** Frame duration in µs — defaults to 33333 (30fps), updated from SPS if available */
+  frameDurationUs: bigint;
 }
 
 /** Client subscribe/unsubscribe message format */
@@ -160,19 +166,49 @@ interface ClientMessage {
  * @param payload - H.264 NAL unit data
  * @returns Binary frame as Buffer
  */
+/**
+ * Build a binary frame for the streaming protocol.
+ *
+ * Writes the 12-byte header + payload into a compact buffer.
+ * Returns separate views for WebTransport (length-prefixed) and
+ * WebSocket (raw), each as an independent copy safe for async send.
+ */
+const FRAME_BUF_INITIAL = 2 * 1024 * 1024; // 2MB — covers large 4K AUs
+let frameBuf = Buffer.allocUnsafe(FRAME_BUF_INITIAL);
+
 function buildFrame(
   streamId: number,
   timestamp: bigint,
   flags: number,
   payload: Uint8Array
-): Buffer {
-  const frame = Buffer.allocUnsafe(12 + payload.length);
-  frame[0] = PROTOCOL_VERSION;
-  frame.writeUInt16BE(streamId, 1);
-  frame.writeBigUInt64BE(timestamp, 3);
-  frame[11] = flags;
-  frame.set(payload, 12);
-  return frame;
+): { wtFrame: Buffer; wsFrame: Buffer } {
+  const totalWithPrefix = 4 + 12 + payload.length;
+
+  // Grow the shared staging buffer if needed (rare after first large frame)
+  if (totalWithPrefix > frameBuf.length) {
+    frameBuf = Buffer.allocUnsafe(Math.max(frameBuf.length * 2, totalWithPrefix));
+  }
+
+  // 4-byte length prefix (for WebTransport)
+  const frameLen = 12 + payload.length;
+  frameBuf.writeUInt32BE(frameLen, 0);
+
+  // 12-byte protocol header at offset 4
+  frameBuf[4] = PROTOCOL_VERSION;
+  frameBuf.writeUInt16BE(streamId, 5);
+  frameBuf.writeBigUInt64BE(timestamp, 7);
+  frameBuf[15] = flags;
+
+  // Payload at offset 16
+  frameBuf.set(payload, 16);
+
+  // Return owned copies — safe for async writer.write() and sequential buildFrame calls.
+  // IMPORTANT: Buffer.from(ArrayBuffer, offset, len) creates a VIEW, not a copy!
+  // We must pass a Buffer/Uint8Array to Buffer.from() to get an actual copy.
+  return {
+    wtFrame: Buffer.from(frameBuf.subarray(0, totalWithPrefix)),
+    wsFrame: Buffer.from(frameBuf.subarray(4, totalWithPrefix)),
+  };
 }
 
 let nextClientId = 1;
@@ -225,17 +261,49 @@ export class StreamManager {
       ppsNALU: null,
       subscribers: new Map(),
       pendingAU: null,
-      auBuffer: Buffer.allocUnsafe(128 * 1024),
+      auBuffer: Buffer.allocUnsafe(256 * 1024),
       auFilled: 0,
+      auFrameCount: 0,
+      frameDurationUs: 33333n, // default 30fps, updated from SPS if available
     };
 
     this.streams.set(id, managed);
 
     client.on('sps', (info: SPSInfo) => {
       managed.spsInfo = info;
-      console.log(
-        `[Stream ${id}] SPS: ${info.width}x${info.height} ${info.codecString}`
-      );
+      // Resize AU buffer based on detected resolution and framerate.
+      // Higher fps at the same resolution implies higher bitrate → larger IDRs.
+      // Base sizes at 30fps; scale up by fps/30 for higher framerates.
+      //   SD (≤720p):   128KB base — IDR typically 20-100KB
+      //   HD (≤1080p):  512KB base — IDR typically 50-250KB
+      //   UHD (>1080p): 2MB base   — 4K IDR can reach 500KB-2MB at high bitrates
+      const pixels = info.width * info.height;
+      const fps = info.fps && info.fps > 0 ? info.fps : 30;
+      const fpsScale = Math.max(1, fps / 30);
+      const baseSize = pixels > 2_073_600 ? 2 * 1024 * 1024
+        : pixels > 921_600 ? 512 * 1024
+        : 128 * 1024;
+      const targetSize = Math.round(baseSize * fpsScale);
+      if (managed.auBuffer.length < targetSize) {
+        // Flush any in-progress access unit before resizing to avoid data loss
+        if (managed.pendingAU) {
+          this.flushAccessUnit(managed);
+        }
+        managed.auBuffer = Buffer.allocUnsafe(targetSize);
+        managed.auFilled = 0;
+      }
+      // Update frame duration from SPS timing info if available
+      if (info.fps && info.fps > 0) {
+        managed.frameDurationUs = BigInt(Math.round(1_000_000 / info.fps));
+        console.log(
+          `[Stream ${id}] SPS: ${info.width}x${info.height} ${info.codecString} @${info.fps}fps ` +
+          `(AU buffer: ${Math.round(targetSize / 1024)}KB, frame duration: ${managed.frameDurationUs}µs)`
+        );
+      } else {
+        console.log(
+          `[Stream ${id}] SPS: ${info.width}x${info.height} ${info.codecString} (AU buffer: ${Math.round(targetSize / 1024)}KB)`
+        );
+      }
     });
 
     client.on('nalu', (event: NALUEvent) => {
@@ -573,10 +641,13 @@ export class StreamManager {
 
         subscription = {
           clientId: client.id,
+          transport: 'webtransport',
           send: (frame: Buffer) => {
-            const prefixed = frameLengthPrefixed(frame);
-            writer.write(prefixed).catch(() => {
+            writer.write(frame).catch(() => {
               managed.subscribers.delete(client.id);
+              // Close the writer so the client's readable side ends
+              // and it can detect the subscription is dead.
+              try { writer.close().catch(() => {}); } catch { /* already closed */ }
             });
           },
           isBackpressured: () =>
@@ -587,12 +658,20 @@ export class StreamManager {
         const ws = client.ws;
         subscription = {
           clientId: client.id,
+          transport: 'websocket',
           send: (frame: Buffer) => {
             if (ws.readyState === WSSocket.OPEN) {
               ws.send(frame);
             }
           },
-          isBackpressured: () => ws.bufferedAmount > 256 * 1024,
+          isBackpressured: () => {
+            // Scale WS backpressure threshold with number of active subscriptions.
+            // bufferedAmount is per-connection, so more streams → higher baseline.
+            // Base 2MB per stream, capped at 32MB to prevent OOM.
+            const activeStreams = Math.max(1, client.subscribedStreams.size);
+            const limit = Math.min(activeStreams * 2 * 1024 * 1024, 32 * 1024 * 1024);
+            return ws.bufferedAmount > limit;
+          },
         };
       }
 
@@ -641,16 +720,13 @@ export class StreamManager {
     if (!managed.spsNALU || !managed.ppsNALU) return;
 
     // Send SPS and PPS as separate CONFIG frames (matching handleNALU behavior).
-    // Combining them into one Annex B frame with start codes causes re-parsing
-    // ambiguity: the client's 3-byte start code scanner would absorb a trailing
-    // zero from the SPS into the next start code boundary.
     const spsPayload = Buffer.concat([START_CODE, managed.spsNALU]);
-    const spsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, spsPayload);
-    sub.send(spsFrame);
+    const spsFrames = buildFrame(managed.id, 0n, FLAG_CONFIG, spsPayload);
+    sub.send(sub.transport === 'webtransport' ? spsFrames.wtFrame : spsFrames.wsFrame);
 
     const ppsPayload = Buffer.concat([START_CODE, managed.ppsNALU]);
-    const ppsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, ppsPayload);
-    sub.send(ppsFrame);
+    const ppsFrames = buildFrame(managed.id, 0n, FLAG_CONFIG, ppsPayload);
+    sub.send(sub.transport === 'webtransport' ? ppsFrames.wtFrame : ppsFrames.wsFrame);
   }
 
   /**
@@ -752,8 +828,8 @@ export class StreamManager {
       if (managed.subscribers.size === 0) return;
 
       const payload = Buffer.concat([START_CODE, event.nalUnit]);
-      const frame = buildFrame(managed.id, event.timestamp, FLAG_CONFIG, payload);
-      this.sendToSubscribers(managed, frame, false);
+      const frames = buildFrame(managed.id, event.timestamp, FLAG_CONFIG, payload);
+      this.sendToSubscribers(managed, frames, false);
       return;
     }
 
@@ -810,26 +886,36 @@ export class StreamManager {
       flags |= FLAG_KEYFRAME;
     }
 
-    // Use subarray view — buildFrame copies the payload into a new frame buffer
+    // Use monotonic synthetic timestamp (frameCount × frameDuration) instead
+    // of wall-clock time. FFmpeg's PassThrough buffering causes data to arrive
+    // in bursts, making wall-clock timestamps wildly uneven.
+    const syntheticTimestamp = BigInt(managed.auFrameCount) * managed.frameDurationUs;
+    managed.auFrameCount++;
+
+    // Use subarray view — buildFrame writes into a shared buffer
     const payload = managed.auBuffer.subarray(0, managed.auFilled);
-    const frame = buildFrame(managed.id, au.timestamp, flags, payload);
-    this.sendToSubscribers(managed, frame, au.isKeyframe);
+    const frames = buildFrame(managed.id, syntheticTimestamp, flags, payload);
+    this.sendToSubscribers(managed, frames, au.isKeyframe);
   }
 
   /**
-   * Send a length-prefixed binary frame to all subscribers of a stream.
+   * Send a binary frame to all subscribers of a stream.
    *
    * Applies backpressure detection: non-keyframes are dropped for
    * clients whose QUIC stream write buffer is full. Keyframes are
    * always sent since they're required for decoder recovery.
    *
+   * Uses pre-built frame views to avoid per-subscriber allocation:
+   * - WebTransport subscribers get the length-prefixed wtFrame
+   * - WebSocket subscribers get the raw wsFrame
+   *
    * @param managed - Source stream
-   * @param frame - Binary frame to send
+   * @param frames - Pre-built frame views (WT and WS)
    * @param isKeyframe - Whether this frame is an IDR keyframe
    */
   private sendToSubscribers(
     managed: ManagedStream,
-    frame: Buffer,
+    frames: { wtFrame: Buffer; wsFrame: Buffer },
     isKeyframe: boolean
   ): void {
     for (const [clientId, sub] of managed.subscribers) {
@@ -844,7 +930,7 @@ export class StreamManager {
         continue;
       }
 
-      sub.send(frame);
+      sub.send(sub.transport === 'webtransport' ? frames.wtFrame : frames.wsFrame);
     }
   }
 

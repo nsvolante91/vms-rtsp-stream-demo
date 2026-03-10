@@ -9,6 +9,8 @@
 import { Logger } from '../utils/logger';
 import { H264Demuxer } from './h264-demuxer';
 import { VideoStreamDecoder } from './decoder';
+import { getResolutionProfile } from './resolution-profile';
+import type { ResolutionTier } from './resolution-profile';
 import type { ReceivedFrame } from './wt-receiver';
 
 /** Transport-agnostic receiver interface for stream subscription */
@@ -39,10 +41,15 @@ export class StreamPipeline {
   private _lastSmoothedTimestamp = 0;
   private _timestampOffset = 0;
   private _timestampInitialized = false;
-  /** Maximum allowed jitter correction per frame (50ms in µs) */
-  private static readonly MAX_JITTER_CORRECTION_US = 50_000;
-  /** Discontinuity threshold (500ms in µs) */
-  private static readonly DISCONTINUITY_THRESHOLD_US = 500_000;
+  /** Running average of inter-frame delta (µs) for jitter baseline */
+  private _expectedFrameDelta = 0;
+  /** Maximum allowed jitter correction per frame (microseconds).
+   *  Clamps the deviation from the running-average frame period,
+   *  NOT the total delta.  Adapts to resolution: SD=10ms, HD=20ms, UHD=25ms. */
+  private _maxJitterCorrectionUs = 20_000;
+  /** Discontinuity threshold in µs — adapted per-stream based on fps.
+   *  Defaults to 5 seconds; updated to ~20 frames worth when fps is known. */
+  private _discontinuityThresholdUs = 5_000_000;
 
   // ── Frame timing & stutter detection ───────────────────────
   /** Rolling buffer of inter-frame intervals (ms) */
@@ -51,7 +58,8 @@ export class StreamPipeline {
   private _lastFrameTime = 0;
   /** Cumulative stutter count (frame interval > 2× median) */
   private _stutterCount = 0;
-  private static readonly FRAME_INTERVAL_WINDOW = 60;
+  /** Frame interval window size — time-normalized to ~2 seconds of frames */
+  private _frameIntervalWindow = 60;
 
   // ── Bitrate tracking ───────────────────────────────────────
   /** Accumulated bytes received since last metrics read */
@@ -195,6 +203,16 @@ export class StreamPipeline {
     return this.demuxer.resolution;
   }
 
+  /** Source fps from SPS VUI timing info, or null if unknown */
+  get fps(): number | null {
+    return this.demuxer.fps;
+  }
+
+  /** Current resolution tier driving adaptive thresholds */
+  get resolutionTier(): ResolutionTier {
+    return this.decoder?.resolutionTier ?? 'hd';
+  }
+
   /**
    * Handle a frame received from the WebSocket.
    *
@@ -206,7 +224,25 @@ export class StreamPipeline {
     if (frame.isConfig) {
       const config = this.demuxer.processConfig(frame.data);
       if (config && this.decoder) {
-        this.decoder.configure(config);
+        const fps = this.demuxer.fps ?? 0;
+        this.decoder.configure(config, fps);
+        // Adapt thresholds to the detected resolution and fps
+        if (config.codedWidth && config.codedHeight) {
+          const fps = this.demuxer.fps ?? 0;
+          const profile = getResolutionProfile(config.codedWidth, config.codedHeight, fps);
+          this._maxJitterCorrectionUs = profile.maxJitterCorrectionUs;
+          // Scale discontinuity threshold: ~20 frames at source fps
+          // (min 500ms to tolerate network bursts, max 5s to catch real errors)
+          const effectiveFps = profile.fps;
+          const twentyFramesUs = Math.round((20 / effectiveFps) * 1_000_000);
+          this._discontinuityThresholdUs = Math.max(500_000, Math.min(5_000_000, twentyFramesUs));
+          // Scale frame interval window to ~2 seconds of frames
+          this._frameIntervalWindow = Math.max(10, Math.round(effectiveFps * 2));
+          this.log.info(
+            `Adapted to ${profile.tier}@${effectiveFps}fps: jitter=${profile.maxJitterCorrectionUs}µs, ` +
+            `discontinuity=${this._discontinuityThresholdUs}µs, intervalWindow=${this._frameIntervalWindow}`
+          );
+        }
       }
       return;
     }
@@ -246,12 +282,14 @@ export class StreamPipeline {
     const rawDelta = rawTs - this._lastRawTimestamp;
 
     // Detect discontinuity: large backward jump or implausible forward jump
-    if (rawDelta < 0 || rawDelta > StreamPipeline.DISCONTINUITY_THRESHOLD_US) {
+    if (rawDelta < 0 || rawDelta > this._discontinuityThresholdUs) {
       this.log.info(`Timestamp discontinuity: delta=${rawDelta}µs, resetting smoother`);
       this._lastRawTimestamp = rawTs;
       // Apply offset so smoothed timestamps remain monotonic
-      this._timestampOffset = this._lastSmoothedTimestamp + 33333 - rawTs; // assume ~30fps gap
+      const gapUs = this._expectedFrameDelta > 0 ? this._expectedFrameDelta : 33333;
+      this._timestampOffset = this._lastSmoothedTimestamp + gapUs - rawTs;
       this._lastSmoothedTimestamp = rawTs + this._timestampOffset;
+      this._expectedFrameDelta = 0; // reset EMA on discontinuity
       // Mutate pooled frame's timestamp
       this._pooledSmoothedFrame.streamId = frame.streamId;
       this._pooledSmoothedFrame.timestamp = BigInt(Math.round(this._lastSmoothedTimestamp));
@@ -261,9 +299,18 @@ export class StreamPipeline {
       return this._pooledSmoothedFrame;
     }
 
-    // Low-pass filter: clamp jitter to MAX_JITTER_CORRECTION_US
-    const expectedDelta = rawDelta;
-    const smoothedDelta = Math.max(0, expectedDelta);
+    // Update running average of frame period (EMA, α=0.05)
+    if (this._expectedFrameDelta === 0) {
+      this._expectedFrameDelta = rawDelta;
+    } else {
+      this._expectedFrameDelta += (rawDelta - this._expectedFrameDelta) * 0.05;
+    }
+
+    // Clamp the **deviation** from the expected frame period, not the total delta.
+    // This absorbs network jitter without systematically shrinking the delta.
+    const deviation = rawDelta - this._expectedFrameDelta;
+    const clampedDeviation = Math.max(-this._maxJitterCorrectionUs, Math.min(deviation, this._maxJitterCorrectionUs));
+    const smoothedDelta = Math.max(0, this._expectedFrameDelta + clampedDeviation);
     const smoothedTs = this._lastSmoothedTimestamp + smoothedDelta + this._timestampOffset;
 
     this._lastRawTimestamp = rawTs;
@@ -306,7 +353,7 @@ export class StreamPipeline {
     if (this._lastFrameTime > 0) {
       const interval = now - this._lastFrameTime;
       this._frameIntervals.push(interval);
-      if (this._frameIntervals.length > StreamPipeline.FRAME_INTERVAL_WINDOW) {
+      if (this._frameIntervals.length > this._frameIntervalWindow) {
         this._frameIntervals.shift();
       }
       // Stutter detection: interval > 2× running average

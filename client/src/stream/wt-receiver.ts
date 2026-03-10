@@ -67,14 +67,17 @@ async function writeLengthPrefixed(
   await writer.write(frame);
 }
 
-/** Accumulation buffer initial size (64 KB) */
-const ACCUM_BUFFER_INITIAL_SIZE = 65_536;
+/** Maximum allowed frame size (50 MB) — reject frames beyond this as corrupt */
+const MAX_FRAME_SIZE = 50 * 1024 * 1024;
 
-/** BYOB read buffer initial size (32 KB) — recycled by browser on each read */
-const BYOB_READ_BUFFER_INITIAL_SIZE = 32_768;
+/** Accumulation buffer initial size (256 KB) — sized for 4K frame payloads */
+const ACCUM_BUFFER_INITIAL_SIZE = 262_144;
 
-/** Maximum BYOB read buffer size (256 KB) — cap to prevent unbounded growth */
-const BYOB_READ_BUFFER_MAX_SIZE = 262_144;
+/** BYOB read buffer initial size (64 KB) — recycled by browser on each read */
+const BYOB_READ_BUFFER_INITIAL_SIZE = 65_536;
+
+/** Maximum BYOB read buffer size (1 MB) — sized for 4K IDR keyframes */
+const BYOB_READ_BUFFER_MAX_SIZE = 1_048_576;
 
 /**
  * P99 frame size tracker for BYOB buffer pre-sizing.
@@ -193,6 +196,14 @@ async function* readLengthPrefixed(
 
       const length =
         ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0;
+
+      // Guard against corrupted length prefix causing multi-GB allocation
+      if (length > MAX_FRAME_SIZE) {
+        throw new RangeError(
+          `Frame length ${length} exceeds maximum ${MAX_FRAME_SIZE} — stream likely out of sync`
+        );
+      }
+
       const totalNeeded = 4 + length;
 
       // Pre-grow if the message exceeds current buffer capacity
@@ -494,15 +505,38 @@ export class WTReceiver {
 
   /**
    * Read length-prefixed binary frames from a single unidirectional video stream.
+   * Tracks the streamId from parsed frames so it can re-subscribe on failure.
    *
    * @param readable - ReadableStream from a server→client unidirectional QUIC stream
    */
   private async processVideoStream(readable: ReadableStream<Uint8Array>): Promise<void> {
-    for await (const frameBytes of readLengthPrefixed(readable)) {
-      this._bytesReceived += frameBytes.byteLength;
-      this._messageCount++;
+    let lastStreamId: number | null = null;
+    try {
+      for await (const frameBytes of readLengthPrefixed(readable)) {
+        this._bytesReceived += frameBytes.byteLength;
+        this._messageCount++;
 
-      this.parseBinaryFrame(frameBytes);
+        // Track which stream this is so we can re-subscribe on failure
+        if (frameBytes.byteLength >= HEADER_SIZE) {
+          lastStreamId = (frameBytes[1] << 8) | frameBytes[2];
+        }
+
+        this.parseBinaryFrame(frameBytes);
+      }
+      // Stream ended cleanly — server closed the writer (e.g. write error).
+      // Re-subscribe to get a fresh QUIC stream.
+      if (lastStreamId !== null && this.callbacks.has(lastStreamId) && this.controlWriter) {
+        this.log.warn(`Stream ${lastStreamId} ended, re-subscribing`);
+        this.sendSubscribe(lastStreamId).catch(() => {});
+      }
+    } catch (err) {
+      // Re-subscribe to get a fresh QUIC stream from the server
+      if (lastStreamId !== null && this.callbacks.has(lastStreamId) && this.controlWriter) {
+        this.log.warn(`Stream ${lastStreamId} failed, re-subscribing`, err);
+        this.sendSubscribe(lastStreamId).catch(() => {});
+      } else {
+        throw err;
+      }
     }
   }
 

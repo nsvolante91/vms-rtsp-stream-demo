@@ -65,9 +65,11 @@ export interface RTSPClientEvents {
 export class RTSPClient extends EventEmitter {
   private ffmpeg: ChildProcess | null = null;
   /** Pre-allocated accumulation buffer — grows by doubling, never shrinks */
-  private buffer: Buffer = Buffer.allocUnsafe(256 * 1024);
+  private buffer: Buffer = Buffer.allocUnsafe(1024 * 1024);
   /** Number of valid bytes in the accumulation buffer */
   private bufferFilled = 0;
+  /** Offset to start scanning for start codes (avoids rescanning old data) */
+  private scanOffset = 0;
   private running = false;
   private frameCount = 0;
   private startTime = 0n;
@@ -131,11 +133,19 @@ export class RTSPClient extends EventEmitter {
     return new Promise<void>((resolve, reject) => {
       // Spawn FFmpeg: read RTSP via TCP, output raw H.264 Annex B to stdout
       this.ffmpeg = spawn('ffmpeg', [
+        '-fflags', 'nobuffer',
+        '-flags', 'low_delay',
         '-rtsp_transport', 'tcp',
+        '-buffer_size', '16777216',
+        '-max_delay', '0',
+        '-reorder_queue_size', '0',
         '-i', proxiedUrl,
         '-c:v', 'copy',
         '-an',
         '-f', 'h264',
+        '-flush_packets', '1',
+        '-fflags', '+flush_packets+nobuffer',
+        '-avioflags', 'direct',
         '-loglevel', 'warning',
         'pipe:1',
       ], {
@@ -211,21 +221,21 @@ export class RTSPClient extends EventEmitter {
 
   /**
    * Pause FFmpeg stdout to stop data flow when no subscribers need it.
-   * Prevents unbounded memory growth when streams have no active viewers.
+   * Currently a no-op — pausing causes stale data to accumulate in the OS
+   * pipe buffer. On resume, the burst of old data creates timestamp gaps
+   * and decoder confusion. The StreamManager already short-circuits frame
+   * delivery when there are no subscribers.
    */
   pause(): void {
-    if (this.ffmpeg?.stdout && !this.ffmpeg.stdout.isPaused()) {
-      this.ffmpeg.stdout.pause();
-    }
+    // Intentionally a no-op. See comment above.
   }
 
   /**
    * Resume FFmpeg stdout when subscribers become available.
+   * Currently a no-op — see pause() comment.
    */
   resume(): void {
-    if (this.ffmpeg?.stdout?.isPaused()) {
-      this.ffmpeg.stdout.resume();
-    }
+    // Intentionally a no-op. See pause() comment.
   }
 
   /**
@@ -293,13 +303,13 @@ export class RTSPClient extends EventEmitter {
     chunk.copy(this.buffer, this.bufferFilled);
     this.bufferFilled += chunk.length;
 
-    // Find all NAL units in the current buffer
+    // Find all NAL units in the current buffer, starting scan from scanOffset
     const data = new Uint8Array(
       this.buffer.buffer,
       this.buffer.byteOffset,
       this.bufferFilled
     );
-    const nalUnits = findNALUnits(data);
+    const nalUnits = findNALUnits(data, this.scanOffset);
 
     if (nalUnits.length === 0) {
       return;
@@ -328,6 +338,7 @@ export class RTSPClient extends EventEmitter {
       const remaining = this.bufferFilled - keepFrom;
       this.buffer.copyWithin(0, keepFrom, this.bufferFilled);
       this.bufferFilled = remaining;
+      this.scanOffset = 0; // Reset scan offset after compaction
     } else if (completeCount === nalUnits.length) {
       // All NAL units were complete; keep any trailing data after the last one
       const remaining = this.bufferFilled - lastNALUEnd;
@@ -335,8 +346,12 @@ export class RTSPClient extends EventEmitter {
         this.buffer.copyWithin(0, lastNALUEnd, this.bufferFilled);
       }
       this.bufferFilled = remaining;
+      this.scanOffset = 0; // Reset scan offset after compaction
+    } else {
+      // No complete NALs found — advance scanOffset to avoid rescanning
+      // Leave 2 bytes margin so we don't miss a start code split across chunks
+      this.scanOffset = Math.max(0, this.bufferFilled - 2);
     }
-    // If completeCount === 0, keep the entire buffer
   }
 
   /**

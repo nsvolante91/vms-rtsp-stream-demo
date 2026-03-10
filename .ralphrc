@@ -1,8 +1,0 @@
-# Ralph Configuration for VMS Browser Prototype
-
-CLAUDE_TIMEOUT_MINUTES=30
-RALPH_CALL_LIMIT=80
-RALPH_SESSION_EXPIRY=48
-RALPH_CIRCUIT_BREAKER_THRESHOLD=5
-ALLOWED_TOOLS="Bash(*),Write(*),Read(*),Edit(*),MultiEdit(*),Grep(*),Glob(*),WebFetch(*),TodoWrite(*),TodoRead(*),Task(*),ExitPlanMode,AskUserQuestion,DeleteFile(*)"
-CLAUDE_FLAGS="--dangerously-skip-permissions"

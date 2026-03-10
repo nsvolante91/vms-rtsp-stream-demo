@@ -13,7 +13,8 @@ A technology demonstrator showing that modern browsers can hardware-decode, GPU-
 - Dedicated **Web Worker** pipeline — decode + render off the main thread
 - 9 GPU upscaling/super-resolution modes (bilinear, Lanczos, FSR, DLSS-style, spectral, temporal, VQSR, generative, compute)
 - Side-by-side comparison mode (upscaled vs. original)
-- Per-stream overlay with real-time metrics (FPS, bitrate, decode latency, resolution)
+- **Resolution- and fps-adaptive pipeline** — decode queue depth, jitter correction, hardware acceleration, and server buffer sizing auto-tune to SD/HD/UHD tier based on detected stream resolution and frame rate (thresholds scale linearly with fps/30)
+- Per-stream overlay with real-time metrics (FPS, bitrate, decode latency, resolution, adaptive tier)
 - Click-to-zoom with GPU-accelerated crop and pan
 - Auto-recovery from decoder errors (reconnects on next keyframe)
 - WebSocket fallback when WebTransport is unavailable
@@ -33,7 +34,7 @@ A technology demonstrator showing that modern browsers can hardware-decode, GPU-
 <img src="docs/architecture-browser.svg" alt="Browser client pipeline: Main Thread vs Web Worker architecture" />
 
 - **Main Thread**: VMSApp orchestrates device detection, CSS Grid layout (1×1 to 4×4), StreamTile[] (canvas + overlay per stream), Controls, MetricsCollector, Dashboard, and BenchmarkRunner.
-- **Web Worker**: WTReceiver (BYOB reader, auto-reconnect) → StreamPipeline → H264Demuxer (Annex B → EncodedVideoChunk) → VideoDecoder (WebCodecs HW accel, backpressure: drop B-frames at queue ≥3, non-keyframes at ≥4) → rAF-gated batch render via OffscreenRenderer.
+- **Web Worker**: Transport receiver (WTReceiver with BYOB reader, auto-fallback to WSReceiver if WebTransport unavailable) → StreamPipeline → H264Demuxer (Annex B → EncodedVideoChunk) → VideoDecoder (WebCodecs, resolution+fps-adaptive backpressure and HW accel) → rAF-gated batch render via OffscreenRenderer.
   - **WebGPU path**: `importExternalTexture` (zero-copy, valid until microtask end) → upscale shaders (10 modes: off, CAS, FSR, Anime4K, Lanczos, TSR, Spectral, VQSR, Generative, DLSS) → `queue.submit()` → `frame.close()`.
   - **Canvas2D fallback**: `drawImage(VideoFrame)` with letterbox/pillarbox → `frame.close()`.
 - **postMessage** carries commands (init, addStream, resize, setUpscale, setZoom) main→worker and events (connected, error, metrics at 1 Hz) worker→main.
@@ -167,9 +168,11 @@ docker compose -f docker/docker-compose.yml down
 │   │   │   └── messages.ts             # Worker ↔ main thread message types
 │   │   ├── stream/
 │   │   │   ├── wt-receiver.ts          # WebTransport client + binary protocol parser
+│   │   │   ├── ws-receiver.ts          # WebSocket fallback receiver (same interface)
 │   │   │   ├── stream-pipeline.ts      # Per-stream decode pipeline orchestrator
 │   │   │   ├── h264-demuxer.ts         # Annex B → EncodedVideoChunk
-│   │   │   └── decoder.ts             # VideoDecoder wrapper with backpressure
+│   │   │   ├── decoder.ts             # VideoDecoder wrapper with backpressure
+│   │   │   └── resolution-profile.ts   # SD/HD/UHD × fps adaptive threshold profiles
 │   │   ├── render/
 │   │   │   ├── gpu-renderer.ts         # WebGPU render pipeline setup
 │   │   │   ├── canvas2d-renderer.ts    # Canvas2D fallback renderer
@@ -222,7 +225,16 @@ npm run typecheck        # TypeScript type checking (both packages)
 - **Web Worker pipeline**: All decode and render work runs in a dedicated Web Worker via `OffscreenCanvas`. The main thread only handles DOM, layout, and UI. Frames are batched into a single `rAF`-gated GPU submit per vsync.
 - **BYOB stream reader**: Uses `ReadableStreamBYOBReader` to read WebTransport QUIC streams with zero browser-side allocation per read. A stable accumulation buffer with doubling growth and `copyWithin` compaction avoids O(n²) concat+slice patterns.
 - **Certificate pinning**: The bridge server generates an ECDSA P-256 self-signed certificate at startup (≤14 days validity). The client fetches the SHA-256 hash via the REST API and passes it to `WebTransport` via `serverCertificateHashes`.
-- **Backpressure**: Graduated thresholds on `decodeQueueSize` — accept all at ≤2, drop B-frames at 3, drop all non-keyframes at ≥4. Keyframes are never dropped.
+- **Resolution- and fps-adaptive pipeline**: SPS NAL parsing detects stream resolution (width × height) and frame rate (VUI timing info). Resolution assigns a tier — SD (≤720p), HD (≤1080p), or UHD (>1080p) — and all thresholds scale linearly by `max(0.8, fps / 30)`. A 4K 60 fps stream gets 2× the queue depth of a 4K 30 fps stream; a 480p 24 fps stream stays near baseline. The tier and fps are displayed in each stream's overlay.
+
+  | Parameter | SD (≤720p) @30fps | HD (≤1080p) @30fps | UHD (>1080p) @30fps | Scaling |
+  |---|---|---|---|---|
+  | Decode queue (normal / soft / hard) | 2 / 3 / 5 | 3 / 5 / 8 | 4 / 6 / 10 | × fps/30 |
+  | Jitter correction window | 10 ms | 20 ms | 25 ms | × fps/30 |
+  | Hardware acceleration | `no-preference` | `no-preference` | `prefer-hardware` | — |
+  | Server AU buffer | 128 KB | 512 KB | 2 MB | × fps/30 |
+
+- **Backpressure**: Graduated resolution-adaptive thresholds on `decodeQueueSize` — proactive drops when queue exceeds the normal threshold, soft drops of non-reference frames at the soft threshold, hard drops of all non-keyframes at the hard threshold. Keyframes are never dropped.
 - **VideoFrame lifecycle**: Every `VideoFrame` from the decoder is closed after GPU submit via `frame.close()` to prevent GPU memory leaks.
 - **GPU upscaling modes**: 9 shader-based upscaling pipelines — bilinear (default sampler), Lanczos (windowed sinc), FSR (AMD FidelityFX-style edge sharpening), DLSS-style (temporal accumulation with motion vectors), spectral (frequency-domain enhancement), temporal (multi-frame accumulation), VQSR (learned super-resolution approximation), generative (detail synthesis), and compute (compute shader upscale).
 

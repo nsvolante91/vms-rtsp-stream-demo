@@ -8,19 +8,15 @@
  */
 
 import { Logger } from '../utils/logger';
+import { getResolutionProfile, type ResolutionProfile, type ResolutionTier } from './resolution-profile';
 
 /** Callback invoked when the decoder outputs a decoded VideoFrame */
 export type FrameOutputCallback = (frame: VideoFrame) => void;
 
-/**
- * Graduated backpressure thresholds:
- * - queue ≤ NORMAL_THRESHOLD: accept all frames
- * - queue = SOFT_THRESHOLD: drop B-frames (non-reference delta frames)
- * - queue ≥ HARD_THRESHOLD: drop all non-keyframes
- */
-const NORMAL_THRESHOLD = 2;
-const SOFT_THRESHOLD = 3;
-const HARD_THRESHOLD = 4;
+/** Default thresholds used until resolution is known (HD-tier values) */
+const DEFAULT_NORMAL_THRESHOLD = 3;
+const DEFAULT_SOFT_THRESHOLD = 5;
+const DEFAULT_HARD_THRESHOLD = 8;
 
 /** Minimum interval between recovery attempts in milliseconds */
 const RECOVERY_COOLDOWN_MS = 1000;
@@ -45,6 +41,19 @@ export class VideoStreamDecoder {
   /** Previous queue size for tracking derivative (proactive dropping) */
   private _prevQueueSize = 0;
   private readonly log: Logger;
+
+  // ── Resolution-adaptive thresholds ─────────────────────────
+  private _normalThreshold = DEFAULT_NORMAL_THRESHOLD;
+  private _softThreshold = DEFAULT_SOFT_THRESHOLD;
+  private _hardThreshold = DEFAULT_HARD_THRESHOLD;
+  private _resolutionTier: ResolutionTier = 'hd';
+
+  // ── Rolling average frame size for adaptive B-frame heuristic ──
+  /** Rolling average of recent non-keyframe sizes (bytes) */
+  private _avgFrameSize = 0;
+  /** Number of samples in the rolling average */
+  private _frameSizeSamples = 0;
+  private static readonly FRAME_SIZE_ALPHA = 0.05;
 
   // ── Decode time tracking ──────────────────────────────────
   /** Timestamps of chunks submitted for decoding (rolling, capped at 30) */
@@ -75,9 +84,20 @@ export class VideoStreamDecoder {
    * encoded chunks.
    *
    * @param config - VideoDecoderConfig with codec string, dimensions, and acceleration hints
+   * @param fps - Source framerate from SPS VUI (0 = unknown, falls back to 30)
    */
-  configure(config: VideoDecoderConfig): void {
-    this.log.info(`Configuring decoder: ${config.codec} ${config.codedWidth}x${config.codedHeight}`);
+  configure(config: VideoDecoderConfig, fps = 0): void {
+    this.log.info(`Configuring decoder: ${config.codec} ${config.codedWidth}x${config.codedHeight} @${fps || '?'}fps`);
+
+    // Apply resolution- and fps-adaptive thresholds
+    if (config.codedWidth && config.codedHeight) {
+      const profile = getResolutionProfile(config.codedWidth, config.codedHeight, fps);
+      this._normalThreshold = profile.normalThreshold;
+      this._softThreshold = profile.softThreshold;
+      this._hardThreshold = profile.hardThreshold;
+      this._resolutionTier = profile.tier;
+      this.log.info(`Resolution tier: ${profile.tier}@${profile.fps}fps (thresholds: ${profile.normalThreshold}/${profile.softThreshold}/${profile.hardThreshold})`);
+    }
 
     // Log description details for debugging
     if (config.description) {
@@ -250,24 +270,35 @@ export class VideoStreamDecoder {
 
     if (chunk.type !== 'key') {
       // Hard threshold: drop all non-keyframes
-      if (queueSize >= HARD_THRESHOLD) {
+      if (queueSize >= this._hardThreshold) {
         this._droppedFrames++;
         return;
       }
+
+      // Update rolling average frame size (EMA) for adaptive heuristic
+      if (this._frameSizeSamples === 0) {
+        this._avgFrameSize = chunk.byteLength;
+      } else {
+        this._avgFrameSize += (chunk.byteLength - this._avgFrameSize) * VideoStreamDecoder.FRAME_SIZE_ALPHA;
+      }
+      this._frameSizeSamples++;
+
       // Soft threshold: drop likely B-frames (small delta frames)
-      // B-frames are typically much smaller than P-frames
-      if (queueSize >= SOFT_THRESHOLD) {
-        // Heuristic: B-frames are usually < 25% of keyframe size
-        // and the smallest delta frames in a GOP
-        if (chunk.byteLength < 2048) {
+      // B-frames are typically < 25% of the rolling average frame size
+      if (queueSize >= this._softThreshold) {
+        const bFrameThreshold = Math.max(2048, this._avgFrameSize * 0.25);
+        if (chunk.byteLength < bFrameThreshold) {
           this._droppedFrames++;
           return;
         }
       }
-      // Proactive: if queue is at normal limit AND growing, start dropping small frames
-      if (queueSize > NORMAL_THRESHOLD && queueGrowing && chunk.byteLength < 1024) {
-        this._droppedFrames++;
-        return;
+      // Proactive: if queue is at normal limit AND growing, drop smallest frames
+      if (queueSize > this._normalThreshold && queueGrowing) {
+        const proactiveThreshold = Math.max(1024, this._avgFrameSize * 0.15);
+        if (chunk.byteLength < proactiveThreshold) {
+          this._droppedFrames++;
+          return;
+        }
       }
     }
 
@@ -350,5 +381,10 @@ export class VideoStreamDecoder {
     if (this._decodeTimeSamples.length === 0) return 0;
     const sum = this._decodeTimeSamples.reduce((a, b) => a + b, 0);
     return sum / this._decodeTimeSamples.length;
+  }
+
+  /** Current resolution tier driving backpressure thresholds */
+  get resolutionTier(): ResolutionTier {
+    return this._resolutionTier;
   }
 }

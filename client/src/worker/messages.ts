@@ -1,3 +1,5 @@
+import type { ResolutionTier } from '../stream/resolution-profile';
+
 /**
  * Message types for main thread ↔ stream worker communication.
  *
@@ -8,10 +10,11 @@
 
 // ─── Main → Worker ─────────────────────────────────────────────
 
-/** Initialize the WebTransport connection in the worker */
+/** Initialize the transport connection in the worker */
 export interface InitMessage {
   type: 'init';
   wtUrl: string;
+  wsUrl: string;
   certHashUrl: string;
   /** GPU adapter power preference (defaults to 'high-performance' if absent) */
   gpuPowerPreference?: GPUPowerPreference;
@@ -113,9 +116,11 @@ export type MainToWorkerMessage =
 
 // ─── Worker → Main ─────────────────────────────────────────────
 
-/** WebTransport session successfully established */
+/** Transport session successfully established */
 export interface ConnectedMessage {
   type: 'connected';
+  /** Which transport was used */
+  transport: 'webtransport' | 'websocket';
 }
 
 /** An error occurred (optionally scoped to a specific stream) */
@@ -143,6 +148,10 @@ export interface StreamMetricsUpdate {
   stutterCount: number;
   /** Estimated bitrate in kilobits per second */
   bitrateKbps: number;
+  /** Frames superseded in the render queue before display (render-dropped) */
+  renderDroppedFrames: number;
+  /** Resolution tier driving adaptive thresholds */
+  resolutionTier: ResolutionTier;
 }
 
 /** Periodic metrics update for all active streams */

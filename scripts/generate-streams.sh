@@ -29,6 +29,14 @@ echo ""
 pkill -f "ffmpeg.*rtsp://.*stream" 2>/dev/null || true
 sleep 1
 
+# Check if source video is already H.264 (can use stream copy instead of re-encoding)
+is_h264() {
+  local codec
+  codec=$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name -of csv=p=0 "$1" 2>/dev/null | head -1)
+  [[ "$codec" == "h264" ]]
+}
+
 PIDS=()
 
 for i in $(seq 1 "$NUM_STREAMS"); do
@@ -38,24 +46,39 @@ for i in $(seq 1 "$NUM_STREAMS"); do
   STREAM_NAME="stream${i}"
   RTSP_URL="rtsp://${RTSP_HOST}:${RTSP_PORT}/${STREAM_NAME}"
 
-  echo "  Stream $i: $(basename "$VIDEO") → $RTSP_URL"
+  if is_h264 "$VIDEO"; then
+    # Source is already H.264 — stream copy (near-zero CPU, original quality)
+    echo "  Stream $i: $(basename "$VIDEO") → $RTSP_URL  (passthrough, ~0% CPU)"
 
-  ffmpeg \
-    -re \
-    -stream_loop -1 \
-    -i "$VIDEO" \
-    -c:v libx264 \
-    -preset ultrafast \
-    -tune zerolatency \
-    -b:v 2M \
-    -maxrate 2M \
-    -bufsize 1M \
-    -g 30 \
-    -an \
-    -f rtsp \
-    -rtsp_transport tcp \
-    "$RTSP_URL" \
-    </dev/null >/dev/null 2>&1 &
+    ffmpeg \
+      -re \
+      -stream_loop -1 \
+      -i "$VIDEO" \
+      -c:v copy \
+      -an \
+      -f rtsp \
+      -rtsp_transport tcp \
+      "$RTSP_URL" \
+      </dev/null >/dev/null 2>&1 &
+  else
+    # Non-H.264 source — must re-encode
+    echo "  Stream $i: $(basename "$VIDEO") → $RTSP_URL  (re-encoding to H.264)"
+
+    ffmpeg \
+      -re \
+      -stream_loop -1 \
+      -i "$VIDEO" \
+      -c:v libx264 \
+      -preset ultrafast \
+      -tune zerolatency \
+      -crf 23 \
+      -g 60 \
+      -an \
+      -f rtsp \
+      -rtsp_transport tcp \
+      "$RTSP_URL" \
+      </dev/null >/dev/null 2>&1 &
+  fi
 
   PIDS+=($!)
   sleep 0.5

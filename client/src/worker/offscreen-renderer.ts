@@ -137,10 +137,19 @@ export async function initWorkerGPU(
     return { ok: false, reason: `requestAdapter returned null (tried '${gpuPowerPreference ?? 'high-performance'}' and default)` };
   }
 
-  const device = await adapter.requestDevice();
-  // Use rgba8unorm (not getPreferredCanvasFormat which returns bgra8unorm on macOS)
-  // because compute shaders need STORAGE_BINDING and rgba8unorm always supports it
-  const format: GPUTextureFormat = 'rgba8unorm';
+  const hasBgraStorage = adapter.features.has('bgra8unorm-storage');
+
+  const device = await adapter.requestDevice({
+    requiredFeatures: hasBgraStorage ? ['bgra8unorm-storage' as GPUFeatureName] : [],
+  });
+  // Use the device's preferred canvas format when possible to avoid an extra
+  // GPU copy on every frame. Compute shaders need STORAGE_BINDING, which
+  // bgra8unorm only supports with the 'bgra8unorm-storage' feature.
+  const preferredFormat = navigator.gpu.getPreferredCanvasFormat();
+  const format: GPUTextureFormat =
+    preferredFormat === 'bgra8unorm' && !hasBgraStorage
+      ? 'rgba8unorm'
+      : preferredFormat;
 
   const shaderModule = device.createShaderModule({ code: shaderCode });
 
@@ -227,7 +236,7 @@ export function ensureBlitPipeline(gpu: WorkerGPU): BlitPipeline {
     fragment: {
       module: shaderModule,
       entryPoint: 'fragmentMain',
-      targets: [{ format: 'rgba8unorm' }],
+      targets: [{ format: gpu.format }],
     },
     primitive: {
       topology: 'triangle-strip',

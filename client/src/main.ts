@@ -27,18 +27,20 @@ import type { WorkerToMainMessage, MainToWorkerMessage } from './worker/messages
  * to avoid the macOS IPv6 issue. When accessed from another device on the LAN
  * (e.g. a phone), use the current hostname so the phone can reach the bridge server.
  */
-function deriveServerUrls(): { apiUrl: string; wtUrl: string } {
+function deriveServerUrls(): { apiUrl: string; wtUrl: string; wsUrl: string } {
   const host = window.location.hostname;
   const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '::1';
   const serverHost = isLocalhost ? '127.0.0.1' : host;
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
 
   return {
     apiUrl: '/api',
     wtUrl: `https://${serverHost}:9001/streams`,
+    wsUrl: `${wsProtocol}://${serverHost}:9000/ws`,
   };
 }
 
-const { apiUrl: API_URL, wtUrl: WT_URL } = deriveServerUrls();
+const { apiUrl: API_URL, wtUrl: WT_URL, wsUrl: WS_URL } = deriveServerUrls();
 
 /** REST endpoint for certificate hash (for WebTransport pinning) */
 const CERT_HASH_URL = `${API_URL}/cert-hash`;
@@ -69,6 +71,8 @@ interface WorkerStreamMetrics {
   frameIntervalJitterMs: number;
   stutterCount: number;
   bitrateKbps: number;
+  renderDroppedFrames: number;
+  resolutionTier: 'sd' | 'hd' | 'uhd';
 }
 
 /**
@@ -233,7 +237,7 @@ class VMSApp {
         const msg = e.data;
         if (msg.type === 'connected') {
           this.workerReady = true;
-          log.info('Worker connected (WebTransport ready)');
+          log.info(`Worker connected via ${msg.transport}`);
           resolve();
         } else if (msg.type === 'error') {
           log.error(`Worker init error: ${msg.message}`);
@@ -266,6 +270,7 @@ class VMSApp {
       this.postWorker({
         type: 'init',
         wtUrl: WT_URL,
+        wsUrl: WS_URL,
         certHashUrl: CERT_HASH_URL,
         gpuPowerPreference: this.deviceProfile.gpuPowerPreference,
       });
@@ -280,7 +285,7 @@ class VMSApp {
       case 'connected':
         // Reconnection
         this.workerReady = true;
-        log.info('Worker reconnected');
+        log.info(`Worker reconnected via ${msg.transport}`);
         break;
 
       case 'error':
@@ -314,6 +319,8 @@ class VMSApp {
             frameIntervalJitterMs: update.frameIntervalJitterMs,
             stutterCount: update.stutterCount,
             bitrateKbps: update.bitrateKbps,
+            renderDroppedFrames: update.renderDroppedFrames,
+            resolutionTier: update.resolutionTier,
           });
 
           // Feed queue size into MetricsCollector (used by dashboard)
@@ -623,6 +630,8 @@ class VMSApp {
             frameIntervalJitterMs: wm.frameIntervalJitterMs,
             stutterCount: wm.stutterCount,
             bitrateKbps: wm.bitrateKbps,
+            renderDroppedFrames: wm.renderDroppedFrames,
+            resolutionTier: wm.resolutionTier,
           });
         }
       }

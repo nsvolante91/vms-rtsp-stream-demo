@@ -7,6 +7,7 @@
  */
 
 import { Logger } from '../utils/logger';
+import { getResolutionProfile } from './resolution-profile';
 import type { ReceivedFrame } from './wt-receiver';
 
 /**
@@ -44,9 +45,14 @@ class BitReader {
   readBits(count: number): number {
     let value = 0;
     for (let i = 0; i < count; i++) {
-      value = (value << 1) | this.readBit();
+      value = ((value << 1) | this.readBit()) >>> 0;
     }
     return value;
+  }
+
+  /** Check if there are more bits available to read */
+  hasMoreData(): boolean {
+    return this.byteOffset < this.data.length;
   }
 
   /**
@@ -306,7 +312,7 @@ function extractNALType(data: Uint8Array): number | null {
  * and above, parses chroma and transform parameters. Correctly handles
  * frame cropping to compute actual video dimensions.
  */
-function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc: number; constraintSetFlags: number; levelIdc: number; chromaFormatIdc: number; bitDepthLumaMinus8: number; bitDepthChromaMinus8: number } {
+function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc: number; constraintSetFlags: number; levelIdc: number; chromaFormatIdc: number; bitDepthLumaMinus8: number; bitDepthChromaMinus8: number; fps: number | null } {
   const rbsp = removeEmulationPreventionBytes(sps);
   const reader = new BitReader(rbsp.subarray(1)); // skip NAL header
 
@@ -412,7 +418,53 @@ function parseSPS(sps: Uint8Array): { width: number; height: number; profileIdc:
   const width = (picWidthInMbsMinus1 + 1) * 16 - cropUnitX * (cropLeft + cropRight);
   const height = (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1) * 16 - cropUnitY * (cropTop + cropBottom);
 
-  return { width, height, profileIdc, constraintSetFlags, levelIdc, chromaFormatIdc, bitDepthLumaMinus8, bitDepthChromaMinus8 };
+  // Parse VUI parameters for timing info (frame rate)
+  let fps: number | null = null;
+  try {
+    if (reader.hasMoreData()) {
+      const vuiParametersPresentFlag = reader.readBit();
+      if (vuiParametersPresentFlag) {
+        // aspect_ratio_info_present_flag
+        if (reader.readBit()) {
+          const aspectRatioIdc = reader.readBits(8);
+          if (aspectRatioIdc === 255) { // Extended_SAR
+            reader.readBits(16); // sar_width
+            reader.readBits(16); // sar_height
+          }
+        }
+        // overscan_info_present_flag
+        if (reader.readBit()) {
+          reader.readBit(); // overscan_appropriate_flag
+        }
+        // video_signal_type_present_flag
+        if (reader.readBit()) {
+          reader.readBits(3); // video_format
+          reader.readBit();   // video_full_range_flag
+          // colour_description_present_flag
+          if (reader.readBit()) {
+            reader.readBits(24); // colour_primaries + transfer_characteristics + matrix_coefficients
+          }
+        }
+        // chroma_loc_info_present_flag
+        if (reader.readBit()) {
+          reader.readUE(); // chroma_sample_loc_type_top_field
+          reader.readUE(); // chroma_sample_loc_type_bottom_field
+        }
+        // timing_info_present_flag
+        if (reader.readBit()) {
+          const numUnitsInTick = reader.readBits(32);
+          const timeScale = reader.readBits(32);
+          if (numUnitsInTick > 0 && timeScale > 0) {
+            fps = timeScale / (2 * numUnitsInTick);
+          }
+        }
+      }
+    }
+  } catch {
+    // VUI parsing is best-effort; if we run out of bits, just use null fps
+  }
+
+  return { width, height, profileIdc, constraintSetFlags, levelIdc, chromaFormatIdc, bitDepthLumaMinus8, bitDepthChromaMinus8, fps };
 }
 
 /**
@@ -452,6 +504,7 @@ export class H264Demuxer {
   private chromaFormatIdc = 1;
   private bitDepthLumaMinus8 = 0;
   private bitDepthChromaMinus8 = 0;
+  private _fps: number | null = null;
   private configured = false;
   private _keyframeLogCount = 0;
   private readonly log: Logger;
@@ -515,8 +568,9 @@ export class H264Demuxer {
         this.chromaFormatIdc = info.chromaFormatIdc;
         this.bitDepthLumaMinus8 = info.bitDepthLumaMinus8;
         this.bitDepthChromaMinus8 = info.bitDepthChromaMinus8;
+        this._fps = info.fps;
         this.codec = buildCodecString(newSps);
-        this.log.info(`SPS parsed: ${this.codec}, ${this.width}x${this.height}, chroma=${this.chromaFormatIdc}`);
+        this.log.info(`SPS parsed: ${this.codec}, ${this.width}x${this.height}, chroma=${this.chromaFormatIdc}, fps=${this._fps ?? 'unknown'}`);
       } catch (e) {
         this.log.error('Failed to parse SPS', e);
         return null;
@@ -537,12 +591,13 @@ export class H264Demuxer {
         this.bitDepthLumaMinus8,
         this.bitDepthChromaMinus8
       );
+      const profile = getResolutionProfile(this.width, this.height, this._fps ?? 0);
       return {
         codec: this.codec,
         codedWidth: this.width,
         codedHeight: this.height,
         description,
-        hardwareAcceleration: 'prefer-hardware',
+        hardwareAcceleration: profile.hardwareAcceleration,
         optimizeForLatency: true,
       };
     }
@@ -621,6 +676,11 @@ export class H264Demuxer {
       return null;
     }
     return { width: this.width, height: this.height };
+  }
+
+  /** Source fps from VUI timing info, or null if SPS had no timing data */
+  get fps(): number | null {
+    return this._fps;
   }
 
   /** Whether SPS and PPS have been received and parsed */

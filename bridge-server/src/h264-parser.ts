@@ -30,6 +30,8 @@ export interface SPSInfo {
   height: number;
   /** Codec string in "avc1.XXYYZZ" format */
   codecString: string;
+  /** Framerate derived from VUI timing info, if present in SPS */
+  fps: number | null;
 }
 
 /**
@@ -72,9 +74,11 @@ class BitReader {
    * @returns Unsigned integer value
    */
   readBits(count: number): number {
+    if (count > 32) throw new Error('BitReader: cannot read more than 32 bits');
+    // Use unsigned right shift to avoid sign issues with 32-bit reads
     let value = 0;
     for (let i = 0; i < count; i++) {
-      value = (value << 1) | this.readBit();
+      value = ((value << 1) | this.readBit()) >>> 0;
     }
     return value;
   }
@@ -123,6 +127,11 @@ class BitReader {
       this.readBit();
     }
   }
+
+  /** Check if there are more bits available to read */
+  hasMoreData(): boolean {
+    return this.byteOffset < this.data.length;
+  }
 }
 
 /**
@@ -169,16 +178,15 @@ function removeEmulationPreventionBytes(data: Uint8Array): Uint8Array {
  * @param data - Raw Annex B byte stream
  * @returns Array of parsed NAL units
  */
-export function findNALUnits(data: Uint8Array): NALUnit[] {
+export function findNALUnits(data: Uint8Array, startOffset = 0): NALUnit[] {
   const units: NALUnit[] = [];
   const startCodePositions: { offset: number; startCodeLength: number }[] = [];
 
   // Find all 3-byte start code positions (0x000001).
-  // We intentionally do NOT promote to 4-byte (0x00000001) because doing
-  // so would steal a trailing 0x00 byte from the preceding NAL unit.
-  // For example, a PPS ending with 0xC0 0x00 followed by 0x00 0x00 0x01
-  // would lose the 0x00 trailing byte if we detected a 4-byte start code.
-  for (let i = 0; i < data.length - 2; i++) {
+  // When startOffset > 0, skip already-scanned data but backtrack 2 bytes
+  // to catch start codes that span chunk boundaries.
+  const scanFrom = Math.max(0, startOffset - 2);
+  for (let i = scanFrom; i < data.length - 2; i++) {
     if (data[i] === 0x00 && data[i + 1] === 0x00 && data[i + 2] === 0x01) {
       startCodePositions.push({ offset: i, startCodeLength: 3 });
       i += 2; // skip past the start code
@@ -396,6 +404,53 @@ export function parseSPS(sps: Uint8Array): SPSInfo {
 
   const codecString = buildCodecString(sps);
 
+  // Parse VUI parameters for timing info (frame rate)
+  let fps: number | null = null;
+  try {
+    if (reader.hasMoreData()) {
+      const vuiParametersPresentFlag = reader.readBit();
+      if (vuiParametersPresentFlag) {
+        // aspect_ratio_info_present_flag
+        if (reader.readBit()) {
+          const aspectRatioIdc = reader.readBits(8);
+          if (aspectRatioIdc === 255) { // Extended_SAR
+            reader.skipBits(32); // sar_width (16) + sar_height (16)
+          }
+        }
+        // overscan_info_present_flag
+        if (reader.readBit()) {
+          reader.readBit(); // overscan_appropriate_flag
+        }
+        // video_signal_type_present_flag
+        if (reader.readBit()) {
+          reader.skipBits(4); // video_format (3) + video_full_range_flag (1)
+          // colour_description_present_flag
+          if (reader.readBit()) {
+            reader.skipBits(24); // colour_primaries (8) + transfer_characteristics (8) + matrix_coefficients (8)
+          }
+        }
+        // chroma_loc_info_present_flag
+        if (reader.readBit()) {
+          reader.readUE(); // chroma_sample_loc_type_top_field
+          reader.readUE(); // chroma_sample_loc_type_bottom_field
+        }
+        // timing_info_present_flag
+        if (reader.readBit()) {
+          const numUnitsInTick = reader.readBits(32);
+          const timeScale = reader.readBits(32);
+          const fixedFrameRateFlag = reader.readBit();
+          if (numUnitsInTick > 0 && timeScale > 0) {
+            // H.264 spec: fps = time_scale / (2 * num_units_in_tick)
+            // The factor of 2 accounts for field-based timing
+            fps = timeScale / (2 * numUnitsInTick);
+          }
+        }
+      }
+    }
+  } catch {
+    // VUI parsing is best-effort; if we run out of bits, just use null fps
+  }
+
   return {
     profileIdc,
     constraintSetFlags,
@@ -403,6 +458,7 @@ export function parseSPS(sps: Uint8Array): SPSInfo {
     width,
     height,
     codecString,
+    fps,
   };
 }
 

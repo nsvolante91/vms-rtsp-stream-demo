@@ -13,6 +13,7 @@
 
 import { Logger } from '../utils/logger';
 import { WTReceiver } from '../stream/wt-receiver';
+import { WSReceiver } from '../stream/ws-receiver';
 import { StreamPipeline } from '../stream/stream-pipeline';
 import type { StreamReceiver } from '../stream/stream-pipeline';
 import {
@@ -68,12 +69,22 @@ const companionSet = new Set<number>();
 const pendingFrames = new Map<number, VideoFrame>();
 let rafScheduled = false;
 
+/** Count of frames superseded in pendingFrames before rAF (render-dropped) */
+let renderDroppedFrames = 0;
+
 /** Batch-render all pending frames in a single rAF callback.
  *  Collects GPUCommandBuffers from all streams and submits once.
  *  Frames are closed AFTER submit because GPUExternalTexture references
  *  the VideoFrame data and becomes invalid if closed before submit. */
 function renderLoop(): void {
   rafScheduled = false;
+
+  // Skip GPU busy gate — at 4K 60fps, onSubmittedWorkDone latency can
+  // exceed a full vsync interval, causing multi-frame stalls. WebGPU
+  // already pipelines command buffers internally; submitting while the
+  // previous batch is in-flight is safe and keeps the GPU fed.
+  // Tearing is prevented by the browser's compositor, not by our gating.
+
   const cmdBuffers: GPUCommandBuffer[] = [];
   const framesToClose: VideoFrame[] = [];
   for (const [streamId, frame] of pendingFrames) {
@@ -131,6 +142,7 @@ function queueFrame(streamId: number, frame: VideoFrame): void {
   const prev = pendingFrames.get(streamId);
   if (prev) {
     prev.close();
+    renderDroppedFrames++;
   }
   pendingFrames.set(streamId, frame);
   scheduleRender();
@@ -227,9 +239,12 @@ function startMetricsReporter(): void {
         frameIntervalJitterMs: m.frameIntervalJitterMs,
         stutterCount: m.stutterCount,
         bitrateKbps,
+        renderDroppedFrames,
+        resolutionTier: entry.pipeline.resolutionTier,
       });
     }
     postMsg({ type: 'metrics', streams: updates });
+    renderDroppedFrames = 0;
   }, 1000);
 }
 
@@ -243,7 +258,7 @@ function stopMetricsReporter(): void {
 
 // ─── Message Handlers ──────────────────────────────────────────
 
-async function handleInit(wtUrl: string, certHashUrl: string, gpuPowerPreference?: GPUPowerPreference): Promise<void> {
+async function handleInit(wtUrl: string, certHashUrl: string, wsUrl: string, gpuPowerPreference?: GPUPowerPreference): Promise<void> {
   log.info('Initializing worker pipeline...');
 
   // 1. WebGPU (optional — Canvas2D fallback used if unavailable)
@@ -256,22 +271,36 @@ async function handleInit(wtUrl: string, certHashUrl: string, gpuPowerPreference
     log.warn(`WebGPU unavailable in worker (${gpuFailReason}) — will use Canvas2D fallback`);
   }
 
-  // 2. WebTransport
+  // 2. Transport — try WebTransport first, fall back to WebSocket
+  let transport: 'webtransport' | 'websocket';
+
   const wt = new WTReceiver(wtUrl, certHashUrl);
   try {
     await wt.connect();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log.error('WebTransport connect failed', e);
-    postMsg({ type: 'error', message: `WebTransport connect failed: ${msg}` });
-    return;
+    receiver = wt;
+    transport = 'webtransport';
+    log.info('Connected via WebTransport');
+  } catch (wtErr) {
+    log.warn('WebTransport connect failed, falling back to WebSocket', wtErr);
+
+    const ws = new WSReceiver(wsUrl);
+    try {
+      await ws.connect();
+      receiver = ws;
+      transport = 'websocket';
+      log.info('Connected via WebSocket fallback');
+    } catch (wsErr) {
+      const msg = wsErr instanceof Error ? wsErr.message : String(wsErr);
+      log.error('Both transports failed', wsErr);
+      postMsg({ type: 'error', message: `All transports failed. WS: ${msg}` });
+      return;
+    }
   }
-  receiver = wt;
 
   // 3. Start metrics reporter
   startMetricsReporter();
 
-  postMsg({ type: 'connected' });
+  postMsg({ type: 'connected', transport });
   log.info('Worker pipeline ready');
 }
 
@@ -396,7 +425,7 @@ self.onmessage = (e: MessageEvent<MainToWorkerMessage>) => {
 
   switch (msg.type) {
     case 'init':
-      handleInit(msg.wtUrl, msg.certHashUrl, msg.gpuPowerPreference).catch((err) => {
+      handleInit(msg.wtUrl, msg.certHashUrl, msg.wsUrl, msg.gpuPowerPreference).catch((err) => {
         log.error('Init failed', err);
         postMsg({ type: 'error', message: `Init failed: ${err}` });
       });

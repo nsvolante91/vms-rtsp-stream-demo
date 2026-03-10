@@ -50,6 +50,9 @@ export function attachWebSocketServer(
 
   wss.on('connection', (ws) => {
     console.log('[WS] New WebSocket client connected');
+    ws.on('error', (err) => {
+      console.error('[WS] Connection error:', err.message);
+    });
     streamManager.handleWebSocketClient(ws);
   });
 

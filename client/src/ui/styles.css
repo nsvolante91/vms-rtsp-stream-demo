@@ -543,6 +543,15 @@ button.active {
 .smo-yellow { color: #ff9800; }
 .smo-red { color: #f44336; }
 
+.smo-tier {
+  font-size: 0.8em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #aaa;
+  margin-left: 4px;
+}
+
 /* ── Touch-friendly targets (coarse pointer = touch device) ──── */
 @media (pointer: coarse) {
   button {

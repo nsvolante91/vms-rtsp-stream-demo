@@ -55,9 +55,7 @@ npm run typecheck        # TypeScript type checking
 - `bridge-server/` — Node.js TypeScript WebSocket server
 - `client/` — Vite TypeScript browser application
 - `docker/` — Docker Compose + MediaMTX config
-- `scripts/` — Setup and automation scripts
 - `test-videos/` — Downloaded test video files (gitignored)
-- `.ralph/` — Ralph autonomous development configuration
 
 ## Coding Standards
 

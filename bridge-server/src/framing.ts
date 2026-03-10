@@ -52,6 +52,9 @@ function concat(a: Uint8Array, b: Uint8Array<ArrayBufferLike>): Uint8Array {
  * @param readable - Source byte stream (e.g., from a WebTransport bidirectional stream)
  * @yields Complete message payloads (without the length prefix)
  */
+/** Maximum allowed frame size (50 MB) — reject frames beyond this as corrupt */
+const MAX_FRAME_SIZE = 50 * 1024 * 1024;
+
 export async function* readLengthPrefixed(
   readable: ReadableStream<Uint8Array>
 ): AsyncGenerator<Uint8Array> {
@@ -71,6 +74,12 @@ export async function* readLengthPrefixed(
         buffer.buffer,
         buffer.byteOffset
       ).getUint32(0, false);
+
+      if (length > MAX_FRAME_SIZE) {
+        throw new RangeError(
+          `Frame length ${length} exceeds maximum ${MAX_FRAME_SIZE} — stream likely out of sync`
+        );
+      }
 
       // Read until we have the full message
       while (buffer.length < 4 + length) {
