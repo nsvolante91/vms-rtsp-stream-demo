@@ -1,0 +1,71 @@
+%%{ init: { "theme": "base", "themeVariables": { "fontSize": "16px", "fontFamily": "Segoe UI, sans-serif" } } }%%
+
+flowchart TB
+  Bridge["Bridge Server"]
+
+  Bridge -->|"H.264 over QUIC"| WTRecv
+  Bridge -.->|"H.264 over WebSocket"| WSRecv
+
+  subgraph MAIN["🟦 Main Thread — UI Only"]
+    direction LR
+    style MAIN fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#0d47a1
+    App["App"]
+    Tiles["Canvas elements"]
+    App --- Tiles
+  end
+
+  PostMsg["postMessage boundary<br/>commands ↓<br/>metrics ↑<br/>OffscreenCanvas ↓"]
+  style PostMsg fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,stroke-dasharray:5 5,color:#4a148c
+
+  MAIN --> PostMsg --> WORKER
+
+  subgraph WORKER["🟩 Dedicated Web Worker — Full Media Pipeline"]
+    direction TB
+    style WORKER fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#1b5e20
+    workerSpacer[ ] ~~~ TRANSPORT
+    style workerSpacer fill:none,stroke:none,color:transparent,height:0px
+
+    subgraph TRANSPORT["① Transport"]
+      direction LR
+      style TRANSPORT fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
+      WTRecv["WTReceiver · QUIC"]
+      WSRecv["WSReceiver · WS"]
+    end
+
+    Demux["② H264Demuxer<br/>NAL units → EncodedVideoChunk"]
+    style Demux fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
+
+    Decoder["③ VideoDecoder<br/>HW-accelerated · backpressure"]
+    style Decoder fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
+
+    FrameQ["④ Frame Queue<br/>latest VideoFrame per stream"]
+    style FrameQ fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
+
+    subgraph RENDER["⑤ rAF Render Loop → OffscreenCanvas"]
+      direction TB
+      style RENDER fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
+      renderSpacer[ ] ~~~ WebGPU
+      style renderSpacer fill:none,stroke:none,color:transparent,height:0px
+      WebGPU["WebGPU<br/>importExternalTexture → shader → submit"]
+      Canvas2D["Canvas2D fallback<br/>drawImage"]
+      WebGPU ~~~ Canvas2D
+    end
+
+    WTRecv -->|"NAL units"| Demux
+    WSRecv -->|"NAL units"| Demux
+    Demux -->|"EncodedVideoChunk"| Decoder
+    Decoder -->|"VideoFrame"| FrameQ
+    FrameQ -->|"VideoFrame"| RENDER
+  end
+
+  subgraph GPU["🟨 GPU Hardware"]
+    direction LR
+    style GPU fill:#fff9c4,stroke:#f9a825,stroke-width:2px,color:#333
+    HW["Decode → Render → Compositor → Display"]
+  end
+
+  Decoder -.->|"HW decode"| HW
+  WebGPU -->|"GPU commands"| HW
+
+%%   note1["💡 The entire media pipeline runs in a dedicated<br/>Web Worker — the main thread only manages<br/>DOM layout and receives metrics."]
+%%   style note1 fill:#fffde7,stroke:#f57f17,stroke-width:1px,color:#333,font-size:12px
