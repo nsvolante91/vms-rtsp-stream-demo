@@ -5,34 +5,34 @@ flowchart TB
     direction TB
     style MAIN fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#333
 
-    VMSApp["VMSApp\ndevice detection · stream lifecycle"]
-    DeviceProfile["DeviceProfile\nmobile: maxStreams=4, DPR≤2\ndesktop: maxStreams=16, DPR≤3"]
+    VMSApp["VMSApp<br/>device detection · stream lifecycle"]
+    DeviceProfile["DeviceProfile<br/>mobile: maxStreams=4, DPR≤2<br/>desktop: maxStreams=16, DPR≤3"]
 
     VMSApp --> DeviceProfile
 
     subgraph UI["UI Layer"]
       direction LR
       style UI fill:#bbdefb,stroke:#1565c0,stroke-width:1px,color:#333
-      Controls["Controls\ngrid layout · +/- streams\nupscale mode · compare toggle"]
-      GridLayout["CSS Grid\n1×1 / 2×2 / 3×3 / 4×4"]
+      Controls["Controls<br/>grid layout · +/- streams<br/>upscale mode · compare toggle"]
+      GridLayout["CSS Grid<br/>1×1 / 2×2 / 3×3 / 4×4"]
       Controls --- GridLayout
     end
 
     subgraph TILES["Stream Tiles"]
       direction LR
       style TILES fill:#bbdefb,stroke:#1565c0,stroke-width:1px,color:#333
-      Tile1["StreamTile 1\ncanvas + overlay"]
-      Tile2["StreamTile 2\ncanvas + overlay"]
-      TileN["StreamTile N\ncanvas + overlay"]
+      Tile1["StreamTile 1<br/>canvas + overlay"]
+      Tile2["StreamTile 2<br/>canvas + overlay"]
+      TileN["StreamTile N<br/>canvas + overlay"]
       Tile1 ~~~ Tile2 ~~~ TileN
     end
 
     subgraph PERF["Performance"]
       direction LR
       style PERF fill:#bbdefb,stroke:#1565c0,stroke-width:1px,color:#333
-      Metrics["MetricsCollector\nFPS · latency · memory"]
-      Dash["Dashboard\nreal-time overlay"]
-      Bench["BenchmarkRunner\nauto stream scaling"]
+      Metrics["MetricsCollector<br/>FPS · latency · memory"]
+      Dash["Dashboard<br/>real-time overlay"]
+      Bench["BenchmarkRunner<br/>auto stream scaling"]
       Metrics --- Dash
       Metrics --- Bench
     end
@@ -42,7 +42,7 @@ flowchart TB
     VMSApp --> PERF
   end
 
-  MAIN <-->|"postMessage\ninit · addStream · removeStream\nresize · setUpscale · setZoom\nmetrics · connected · error"| WORKER
+  MAIN <-->|"postMessage<br/>init · addStream · removeStream<br/>resize · setUpscale · setZoom<br/>metrics · connected · error"| WORKER
 
   subgraph WORKER["Web Worker"]
     direction TB
@@ -51,17 +51,17 @@ flowchart TB
     subgraph TRANSPORT["Transport Layer"]
       direction LR
       style TRANSPORT fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
-      WTRecv["WTReceiver\nHTTP/3 QUIC\nBYOB reader\nauto-reconnect"]
-      WSRecv["WSReceiver\nWebSocket TCP\nfallback"]
+      WTRecv["WTReceiver<br/>HTTP/3 QUIC<br/>BYOB reader<br/>auto-reconnect"]
+      WSRecv["WSReceiver<br/>WebSocket TCP<br/>fallback"]
       WTRecv ~~~ WSRecv
     end
 
     subgraph DECODE["Decode Pipeline  (per stream)"]
       direction TB
       style DECODE fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
-      SPipeline["StreamPipeline\norchestrator"]
-      Demux["H264Demuxer\nAnnex B → NALs\nSPS/PPS → codec string\n→ EncodedVideoChunk"]
-      VDecoder["VideoDecoder\nWebCodecs HW accel\nbackpressure: drop B@3, non-KF@4"]
+      SPipeline["StreamPipeline<br/>orchestrator"]
+      Demux["H264Demuxer<br/>Annex B → NALs<br/>SPS/PPS → codec string<br/>→ EncodedVideoChunk"]
+      VDecoder["VideoDecoder<br/>WebCodecs HW accel<br/>backpressure: drop B@3, non-KF@4"]
       SPipeline --> Demux --> VDecoder
     end
 
@@ -69,39 +69,39 @@ flowchart TB
       direction TB
       style RENDER fill:#c8e6c9,stroke:#2e7d32,stroke-width:1px,color:#333
 
-      RAFLoop["rAF Render Loop\nbatch all streams\nsingle GPU submit"]
-      OffRenderer["OffscreenRenderer\nOffscreenCanvas per stream"]
+      RAFLoop["rAF Render Loop<br/>batch all streams<br/>single GPU submit"]
+      OffRenderer["OffscreenRenderer<br/>OffscreenCanvas per stream"]
 
       RAFLoop --> OffRenderer
 
       subgraph WEBGPU_PATH["WebGPU Path"]
         direction TB
         style WEBGPU_PATH fill:#a5d6a7,stroke:#2e7d32,stroke-width:1px,color:#333
-        ImportTex["importExternalTexture\nVideoFrame → GPUExternalTexture\nvalid until microtask end"]
+        ImportTex["importExternalTexture<br/>VideoFrame → GPUExternalTexture<br/>valid until microtask end"]
         Upscale["Upscale Shaders"]
-        GPUSub["queue.submit()\nthen frame.close()"]
+        GPUSub["queue.submit()<br/>then frame.close()"]
         ImportTex --> Upscale --> GPUSub
       end
 
       subgraph UPSCALE_MODES["Upscale Modes"]
         direction LR
         style UPSCALE_MODES fill:#a5d6a7,stroke:#2e7d32,stroke-width:1px,color:#333
-        M1["off\n(passthrough)"]
-        M2["CAS\n(sharpening)"]
-        M3["FSR\n(edge-aware)"]
-        M4["Anime4K\n(CNN)"]
-        M5["Lanczos\n(compute)"]
-        M6["TSR\n(temporal)"]
-        M7["Spectral\n(frequency)"]
-        M8["VQSR\n(learned SR)"]
-        M9["Generative\n(detail synth)"]
-        M10["DLSS\n(temporal+spatial)"]
+        M1["off<br/>(passthrough)"]
+        M2["CAS<br/>(sharpening)"]
+        M3["FSR<br/>(edge-aware)"]
+        M4["Anime4K<br/>(CNN)"]
+        M5["Lanczos<br/>(compute)"]
+        M6["TSR<br/>(temporal)"]
+        M7["Spectral<br/>(frequency)"]
+        M8["VQSR<br/>(learned SR)"]
+        M9["Generative<br/>(detail synth)"]
+        M10["DLSS<br/>(temporal+spatial)"]
       end
 
       subgraph CANVAS2D_PATH["Canvas2D Fallback"]
         direction TB
         style CANVAS2D_PATH fill:#fff3e0,stroke:#e65100,stroke-width:1px,color:#333
-        DrawImage["drawImage(VideoFrame)\nletterbox/pillarbox\nthen frame.close()"]
+        DrawImage["drawImage(VideoFrame)<br/>letterbox/pillarbox<br/>then frame.close()"]
       end
 
       OffRenderer --> WEBGPU_PATH
