@@ -1,34 +1,49 @@
 /**
  * Stream pipeline orchestrating the full decode chain for a single stream.
  *
- * Connects the WebSocket receiver, H.264 demuxer, and WebCodecs decoder
- * into a unified pipeline. Decoded frames are forwarded directly to the
- * onFrame callback (which draws to a per-stream canvas and closes the frame).
+ * Connects the WebTransport receiver, RTP depacketizer, H.264 demuxer,
+ * and WebCodecs decoder into a unified pipeline:
+ *
+ *   WTReceiver → RTPDepacketizer → H264Demuxer → VideoDecoder → onFrame
+ *
+ * The pipeline receives raw RTP packets from the server, depacketizes them
+ * into H.264 access units (RFC 6184), converts to AVCC format, and feeds
+ * them to the hardware-accelerated WebCodecs VideoDecoder.
+ *
+ * Codec configuration (SPS/PPS) is received via the control channel from
+ * the server's SDP output, with fallback to in-band parameter sets.
  */
 
 import { Logger } from '../utils/logger';
 import { H264Demuxer } from './h264-demuxer';
 import { VideoStreamDecoder } from './decoder';
-import type { ReceivedFrame } from './wt-receiver';
+import { RTPDepacketizer, type AccessUnit } from './rtp-depacketizer';
+import type { WTReceiver } from './wt-receiver';
+import type { CodecConfig, ReceivedRTPPacket } from './wt-receiver';
 
 /** Transport-agnostic receiver interface for stream subscription */
 export interface StreamReceiver {
-  subscribe(streamId: number, callback: (frame: ReceivedFrame) => void): void;
+  subscribe(
+    streamId: number,
+    rtpCallback: (packet: ReceivedRTPPacket) => void,
+    configCallback?: (config: CodecConfig) => void
+  ): void;
   unsubscribe(streamId: number): void;
 }
 
 /**
  * Full decode pipeline for a single video stream.
  *
- * Subscribes to the shared WSReceiver for its stream, demuxes incoming
- * H.264 Annex B data, decodes via WebCodecs, and forwards each decoded
- * VideoFrame to the onFrame callback for immediate rendering.
+ * Subscribes to the shared WTReceiver for its stream, depacketizes
+ * incoming RTP packets into H.264 access units, decodes via WebCodecs,
+ * and forwards each decoded VideoFrame to the onFrame callback.
  *
  * CRITICAL: The onFrame callback MUST call frame.close() after rendering,
  * or GPU memory will leak catastrophically.
  */
 export class StreamPipeline {
   private readonly demuxer: H264Demuxer;
+  private readonly depacketizer: RTPDepacketizer;
   private decoder: VideoStreamDecoder | null = null;
   private _started = false;
   private _decodedFrameCount = 0;
@@ -48,15 +63,15 @@ export class StreamPipeline {
     private readonly onError?: (streamId: number, error: Error) => void
   ) {
     this.demuxer = new H264Demuxer();
+    this.depacketizer = new RTPDepacketizer();
     this.log = new Logger(`Pipeline[${streamId}]`);
   }
 
   /**
    * Start the decode pipeline.
    *
-   * Creates the decoder, subscribes to the WebSocket receiver for this
-   * stream's data, and begins processing incoming frames through the
-   * demux/decode chain.
+   * Creates the decoder, subscribes to the receiver for this stream's
+   * RTP packets and codec config, and begins processing.
    */
   start(): void {
     if (this._started) {
@@ -77,25 +92,34 @@ export class StreamPipeline {
       }
     );
 
-    this.receiver.subscribe(this.streamId, (frame: ReceivedFrame) => {
-      this.handleReceivedFrame(frame);
-    });
+    // Wire up the RTP depacketizer to deliver access units
+    this.depacketizer.onAccessUnit = (au: AccessUnit) => {
+      this.handleAccessUnit(au);
+    };
+
+    // Subscribe to the receiver for RTP packets and codec config
+    this.receiver.subscribe(
+      this.streamId,
+      (packet: ReceivedRTPPacket) => {
+        this.depacketizer.processPacket(packet.packet);
+      },
+      (config: CodecConfig) => {
+        this.handleCodecConfig(config);
+      }
+    );
 
     this.log.info('Pipeline started');
   }
 
   /**
    * Stop the decode pipeline.
-   *
-   * Unsubscribes from the WebSocket receiver and closes the decoder.
    */
   stop(): void {
-    if (!this._started) {
-      return;
-    }
+    if (!this._started) return;
 
     this._started = false;
     this.receiver.unsubscribe(this.streamId);
+    this.depacketizer.reset();
 
     if (this.decoder) {
       this.decoder.close();
@@ -122,32 +146,52 @@ export class StreamPipeline {
     };
   }
 
-  /** Video resolution from the SPS, or null if not yet configured */
+  /** Video resolution from the config, or null if not yet configured */
   get resolution(): { width: number; height: number } | null {
     return this.demuxer.resolution;
   }
 
   /**
-   * Handle a frame received from the WebSocket.
-   *
-   * Config frames (SPS/PPS) are processed by the demuxer to extract
-   * decoder configuration. Video frames are demuxed into EncodedVideoChunks
-   * and fed to the decoder.
+   * Handle codec configuration received from the server via control channel.
    */
-  private handleReceivedFrame(frame: ReceivedFrame): void {
-    if (frame.isConfig) {
-      const config = this.demuxer.processConfig(frame.data);
-      if (config && this.decoder) {
+  private handleCodecConfig(config: CodecConfig): void {
+    this.log.info(`Received codec config: ${config.codecString} ${config.width}x${config.height}`);
+    const decoderConfig = this.demuxer.processCodecConfig(config);
+    if (decoderConfig && this.decoder) {
+      this.decoder.configure(decoderConfig);
+    }
+  }
+
+  /**
+   * Handle a complete access unit from the RTP depacketizer.
+   *
+   * Checks for in-band SPS/PPS (common in STAP-A packets before IDR),
+   * then creates an EncodedVideoChunk and feeds it to the decoder.
+   */
+  private handleAccessUnit(au: AccessUnit): void {
+    // Check for in-band SPS/PPS NAL units
+    let sps: Uint8Array | null = null;
+    let pps: Uint8Array | null = null;
+
+    for (const nal of au.nalUnits) {
+      if (nal.type === 7) sps = nal.data; // SPS
+      if (nal.type === 8) pps = nal.data; // PPS
+    }
+
+    // If we found in-band SPS+PPS, try to configure/reconfigure
+    if (sps && pps && this.decoder) {
+      const config = this.demuxer.processInBandConfig(sps, pps);
+      if (config) {
+        this.log.info('Reconfiguring decoder from in-band SPS/PPS');
         this.decoder.configure(config);
       }
-      return;
     }
 
     if (!this.demuxer.isConfigured || !this.decoder) {
       return;
     }
 
-    const chunk = this.demuxer.createChunk(frame);
+    const chunk = this.demuxer.createChunkFromAU(au);
     if (chunk) {
       this.decoder.decode(chunk);
     }
@@ -155,9 +199,6 @@ export class StreamPipeline {
 
   /**
    * Handle a decoded VideoFrame from the decoder.
-   *
-   * Forwards the frame directly to the onFrame callback for immediate
-   * rendering. The callback is responsible for calling frame.close().
    */
   private handleDecodedFrame(frame: VideoFrame): void {
     this._decodedFrameCount++;

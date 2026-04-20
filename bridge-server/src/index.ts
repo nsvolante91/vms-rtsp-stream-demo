@@ -23,7 +23,7 @@ import { resolve as pathResolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { Http3Server } from '@fails-components/webtransport';
 import { StreamManager } from './stream-manager.js';
-import { probeLocalFile } from './local-file-source.js';
+import { probeLocalFile } from './local-rtp-source.js';
 import { generateCertificate, type CertMaterial } from './cert-utils.js';
 import { attachWebSocketServer } from './ws-handler.js';
 

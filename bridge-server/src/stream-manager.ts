@@ -1,42 +1,26 @@
 /**
- * Stream Manager — WebTransport + WebSocket Edition
+ * Stream Manager — RTP Forwarding Edition
  *
- * Manages multiple RTSP stream bridges. Each managed stream maintains
- * an RTSPClient connection and forwards H.264 NAL units to subscribed
- * clients using a compact binary protocol.
+ * Manages multiple video stream sources and forwards raw RTP packets to
+ * subscribed clients over WebTransport or WebSocket. The server performs
+ * no H.264 parsing — it acts as a transparent RTP packet relay.
+ *
+ * Each RTP packet from FFmpeg is forwarded with a minimal 2-byte stream ID
+ * prefix. Clients are responsible for RTP depacketization (RFC 6184).
+ *
+ * SPS/PPS codec configuration is extracted from FFmpeg's SDP output and
+ * sent to clients as a JSON control message on subscription.
  *
  * Supports two transport layers:
- * - **WebTransport** (primary): Per-stream QUIC unidirectional streams,
- *   no head-of-line blocking, ideal for Chrome 114+.
- * - **WebSocket** (fallback): Single TCP connection with binary frames,
- *   compatible with Safari, Firefox, and older browsers.
- *
- * Both transports use the same 12-byte binary frame header. WebTransport
- * frames are length-prefixed (byte-oriented QUIC streams), while
- * WebSocket frames are sent raw (native message boundaries).
+ * - **WebTransport** (primary): Per-stream QUIC unidirectional streams
+ * - **WebSocket** (fallback): Single TCP connection with binary frames
  */
 
 import type { WebSocket as WSSocket } from 'ws';
-import { FFmpegSource, type NALUEvent } from './ffmpeg-source.js';
-import { RTSPClient } from './rtsp-client.js';
-import { LocalFileSource } from './local-file-source.js';
+import { RTPSource, type RTPPacketEvent, type SDPInfo } from './rtp-source.js';
+import { LocalRTPSource } from './local-rtp-source.js';
+import { RTSPRTPSource } from './rtsp-rtp-source.js';
 import { frameLengthPrefixed, readLengthPrefixed, writeLengthPrefixed } from './framing.js';
-import {
-  isKeyframe,
-  isConfigNAL,
-  isVCLNAL,
-  isFirstSliceInPicture,
-  type SPSInfo,
-} from './h264-parser.js';
-
-/** Protocol version for the binary frame header */
-const PROTOCOL_VERSION = 0x01;
-
-/** Flag bit indicating the payload contains a keyframe */
-const FLAG_KEYFRAME = 0x01;
-
-/** Flag bit indicating the payload contains SPS/PPS configuration */
-const FLAG_CONFIG = 0x02;
 
 /** Public information about a managed stream */
 export interface StreamInfo {
@@ -46,11 +30,11 @@ export interface StreamInfo {
   source: string;
   /** Source type */
   sourceType: 'rtsp' | 'file';
-  /** Video width in pixels (0 if SPS not yet received) */
+  /** Video width in pixels (0 if SDP not yet received) */
   width: number;
-  /** Video height in pixels (0 if SPS not yet received) */
+  /** Video height in pixels (0 if SDP not yet received) */
   height: number;
-  /** AVC codec string (empty if SPS not yet received) */
+  /** AVC codec string (empty if SDP not yet received) */
   codecString: string;
   /** Whether the stream is currently receiving data */
   active: boolean;
@@ -61,21 +45,11 @@ export interface StreamInfo {
   rtspUrl: string;
 }
 
-/** A pending access unit being accumulated from VCL NAL units */
-interface PendingAccessUnit {
-  /** Concatenated NAL unit data with Annex B start codes */
-  payload: Buffer;
-  /** Timestamp for this access unit */
-  timestamp: bigint;
-  /** Whether this AU contains a keyframe (IDR) */
-  isKeyframe: boolean;
-}
-
 /** A transport-agnostic subscriber for a specific video stream */
 interface VideoSubscription {
   /** Client identifier */
   clientId: number;
-  /** Send a binary protocol frame to this subscriber (fire-and-forget) */
+  /** Send a binary frame to this subscriber (fire-and-forget) */
   send: (frame: Buffer) => void;
   /** Whether this subscriber is currently backpressured */
   isBackpressured: () => boolean;
@@ -95,10 +69,9 @@ interface WTClient {
    * Single shared writer for all video data (one unidirectional QUIC stream).
    *
    * We use a single uni stream instead of one-per-subscription because
-   * Chrome's QUIC `initial_max_streams_uni` transport parameter is ~16,
+   * Chrome's QUIC initial_max_streams_uni transport parameter is ~16,
    * and 3 are consumed by HTTP/3 internals (control, QPACK encoder/decoder),
-   * leaving only ~13 for application use. The binary protocol already
-   * carries streamId in each frame header so the client can demux.
+   * leaving only ~13 for application use.
    */
   videoWriter: WritableStreamDefaultWriter<Uint8Array> | null;
   /** Set of subscribed stream IDs */
@@ -129,16 +102,10 @@ interface ManagedStream {
   id: number;
   source: string;
   sourceType: 'rtsp' | 'file';
-  client: FFmpegSource;
-  spsInfo: SPSInfo | null;
-  /** Stored SPS NAL unit for sending to new subscribers */
-  spsNALU: Uint8Array | null;
-  /** Stored PPS NAL unit for sending to new subscribers */
-  ppsNALU: Uint8Array | null;
+  client: RTPSource;
+  sdpInfo: SDPInfo | null;
   /** Map of clientId → video subscription for this stream */
   subscribers: Map<number, VideoSubscription>;
-  /** Pending access unit accumulator for VCL NAL units */
-  pendingAU: PendingAccessUnit | null;
 }
 
 /** Client subscribe/unsubscribe message format */
@@ -147,59 +114,15 @@ interface ClientMessage {
   streamId: number;
 }
 
-/**
- * Build a binary frame for the streaming protocol.
- *
- * Wire format:
- * ```
- * +---------+----------+-----------+----------+-------------+
- * | Version | StreamID | Timestamp | Flags    | Payload     |
- * | 1 byte  | 2 bytes  | 8 bytes   | 1 byte   | Variable    |
- * | (0x01)  | uint16BE | uint64BE  |          | H.264 NALUs |
- * +---------+----------+-----------+----------+-------------+
- * ```
- *
- * @param streamId - Stream identifier
- * @param timestamp - Timestamp in microseconds
- * @param flags - Bitfield (bit 0 = keyframe, bit 1 = config)
- * @param payload - H.264 NAL unit data
- * @returns Binary frame as Buffer
- */
-function buildFrame(
-  streamId: number,
-  timestamp: bigint,
-  flags: number,
-  payload: Uint8Array
-): Buffer {
-  const header = Buffer.alloc(12);
-  header.writeUInt8(PROTOCOL_VERSION, 0);
-  header.writeUInt16BE(streamId, 1);
-  header.writeBigUInt64BE(timestamp, 3);
-  header.writeUInt8(flags, 11);
-  return Buffer.concat([header, payload]);
-}
-
 let nextClientId = 1;
 
 /**
- * Manages multiple RTSP stream connections and distributes H.264 data
- * to subscribed WebTransport clients via per-stream unidirectional QUIC streams.
+ * Manages multiple video stream sources and distributes raw RTP packets
+ * to subscribed WebTransport and WebSocket clients.
  *
- * Each stream is backed by an RTSPClient that connects to an RTSP source
- * via FFmpeg. When clients subscribe to a stream over the control channel,
- * the server opens a dedicated unidirectional stream for that subscription,
- * providing per-stream flow control and eliminating head-of-line blocking
- * between different video feeds.
- *
- * @example
- * ```typescript
- * const manager = new StreamManager();
- * await manager.addStream(1, 'rtsp://localhost:8554/stream1');
- * // When a WebTransport session connects:
- * manager.handleSession(session);
- * // Client opens bidirectional stream, sends: { "type": "subscribe", "streamId": 1 }
- * // Server opens unidirectional stream and pushes H.264 frames
- * ```
+ * The server is a transparent RTP relay — it does not parse H.264 data.
+ * Codec configuration (SPS/PPS) is extracted from FFmpeg's SDP output
+ * and sent as JSON control messages.
  */
 export class StreamManager {
   private readonly streams: Map<number, ManagedStream> = new Map();
@@ -208,13 +131,9 @@ export class StreamManager {
   /**
    * Add and connect a new stream from an RTSP URL or local file path.
    *
-   * Auto-detects source type: strings starting with `rtsp://` create an
-   * RTSPClient; file paths create a LocalFileSource.
-   *
    * @param id - Unique stream identifier
    * @param source - RTSP URL or local file path
-   * @returns Stream information (dimensions may be 0 until SPS is received)
-   * @throws Error if a stream with the given ID already exists
+   * @returns Stream information (dimensions may be 0 until SDP is received)
    */
   async addStream(id: number, source: string): Promise<StreamInfo> {
     if (this.streams.has(id)) {
@@ -222,38 +141,30 @@ export class StreamManager {
     }
 
     const isRtsp = source.startsWith('rtsp://');
-    const client: FFmpegSource = isRtsp
-      ? new RTSPClient(source)
-      : new LocalFileSource(source);
+    const client: RTPSource = isRtsp
+      ? new RTSPRTPSource(source)
+      : new LocalRTPSource(source);
 
     const managed: ManagedStream = {
       id,
       source,
       sourceType: isRtsp ? 'rtsp' : 'file',
       client,
-      spsInfo: null,
-      spsNALU: null,
-      ppsNALU: null,
+      sdpInfo: null,
       subscribers: new Map(),
-      pendingAU: null,
     };
 
     this.streams.set(id, managed);
 
-    client.on('sps', (info: SPSInfo) => {
-      managed.spsInfo = info;
+    client.on('sdp', (info: SDPInfo) => {
+      managed.sdpInfo = info;
       console.log(
-        `[Stream ${id}] SPS: ${info.width}x${info.height} ${info.codecString}`
+        `[Stream ${id}] SDP: ${info.width}x${info.height} ${info.codecString}`
       );
     });
 
-    client.on('nalu', (event: NALUEvent) => {
-      if (event.type === 7) {
-        managed.spsNALU = new Uint8Array(event.nalUnit);
-      } else if (event.type === 8) {
-        managed.ppsNALU = new Uint8Array(event.nalUnit);
-      }
-      this.handleNALU(managed, event);
+    client.on('rtp', (event: RTPPacketEvent) => {
+      this.handleRTPPacket(managed, event);
     });
 
     client.on('error', (err: Error) => {
@@ -277,21 +188,17 @@ export class StreamManager {
 
   /**
    * Remove and disconnect a stream.
-   *
-   * @param id - Stream identifier to remove
    */
   removeStream(id: number): void {
     const managed = this.streams.get(id);
     if (!managed) return;
 
-    managed.pendingAU = null;
     managed.client.close();
 
     for (const [clientId] of managed.subscribers) {
       const client = this.clients.get(clientId);
       if (client) {
         client.subscribedStreams.delete(id);
-        // For WT: close the shared video stream when no subscriptions remain
         if (
           client.type === 'webtransport' &&
           client.subscribedStreams.size === 0 &&
@@ -314,12 +221,6 @@ export class StreamManager {
 
   /**
    * Handle a new WebTransport session.
-   *
-   * Waits for the session to be ready, reads the first incoming
-   * bidirectional stream as the control channel, and processes
-   * subscribe/unsubscribe commands.
-   *
-   * @param session - WebTransport session from the Http3Server
    */
   async handleSession(session: any): Promise<void> {
     const clientId = nextClientId++;
@@ -345,7 +246,6 @@ export class StreamManager {
       return;
     }
 
-    // Monitor session close
     session.closed
       .then((info: any) => {
         console.log(`[WT] Client ${clientId} session closed:`, info);
@@ -356,7 +256,6 @@ export class StreamManager {
         this.handleClientDisconnect(clientId);
       });
 
-    // Read incoming bidirectional streams — first one is the control channel
     try {
       const biReader = session.incomingBidirectionalStreams.getReader();
       const { value: controlStream, done } = await biReader.read();
@@ -370,13 +269,11 @@ export class StreamManager {
 
       client.controlWriter = controlStream.writable.getWriter();
 
-      // Send the list of available streams on connect
       await this.sendControlMessage(client, {
         type: 'streams',
         streams: this.getStreams(),
       });
 
-      // Process control messages
       await this.processControlMessages(client, controlStream.readable);
     } catch (err) {
       if (client.connected) {
@@ -388,8 +285,6 @@ export class StreamManager {
 
   /**
    * Get information about all managed streams.
-   *
-   * @returns Array of stream information objects
    */
   getStreams(): StreamInfo[] {
     const result: StreamInfo[] = [];
@@ -400,9 +295,7 @@ export class StreamManager {
   }
 
   /**
-   * Get the number of currently connected WebTransport clients.
-   *
-   * @returns Client count
+   * Get the number of currently connected clients.
    */
   getClientCount(): number {
     return this.clients.size;
@@ -431,13 +324,6 @@ export class StreamManager {
 
   /**
    * Handle a new WebSocket client connection.
-   *
-   * Provides the same subscribe/unsubscribe semantics as WebTransport
-   * sessions but over a single WebSocket connection. Binary frames are
-   * sent directly without length-prefix framing since WebSocket provides
-   * native message boundaries.
-   *
-   * @param ws - WebSocket connection from the ws library
    */
   handleWebSocketClient(ws: WSSocket): void {
     const clientId = nextClientId++;
@@ -453,7 +339,6 @@ export class StreamManager {
     this.clients.set(clientId, client);
     console.log(`[WS] Client ${clientId} connected`);
 
-    // Send available streams list
     this.sendControlMessage(client, {
       type: 'streams',
       streams: this.getStreams(),
@@ -487,9 +372,6 @@ export class StreamManager {
 
   /**
    * Read length-prefixed JSON control messages from a WebTransport client.
-   *
-   * @param client - Client state
-   * @param readable - Readable side of the control bidirectional stream
    */
   private async processControlMessages(
     client: WTClient,
@@ -517,12 +399,6 @@ export class StreamManager {
 
   /**
    * Send a JSON control message to a client (transport-agnostic).
-   *
-   * For WebTransport: length-prefixed write on the control bidirectional stream.
-   * For WebSocket: JSON text message.
-   *
-   * @param client - Target client
-   * @param message - JSON-serializable message
    */
   private async sendControlMessage(client: BridgeClient, message: unknown): Promise<void> {
     if (!client.connected) return;
@@ -545,14 +421,8 @@ export class StreamManager {
   /**
    * Subscribe a client to a stream.
    *
-   * Creates a transport-appropriate video subscription, sends cached
-   * SPS/PPS, and begins forwarding H.264 access units.
-   *
-   * For WebTransport: opens a dedicated unidirectional QUIC stream.
-   * For WebSocket: sends binary frames directly on the WS connection.
-   *
-   * @param client - Connected client (WT or WS)
-   * @param streamId - Stream to subscribe to
+   * Sends the SDP configuration as a control message, then begins
+   * forwarding raw RTP packets.
    */
   private async subscribeClient(client: BridgeClient, streamId: number): Promise<void> {
     const managed = this.streams.get(streamId);
@@ -572,7 +442,6 @@ export class StreamManager {
       let subscription: VideoSubscription;
 
       if (client.type === 'webtransport') {
-        // Create the shared video uni stream on first subscription
         if (!client.videoWriter) {
           const sendStream = await client.session.createUnidirectionalStream();
           client.videoWriter = sendStream.getWriter();
@@ -592,7 +461,6 @@ export class StreamManager {
             writer.desiredSize !== null && writer.desiredSize <= 0,
         };
       } else {
-        // WebSocket: send raw binary frames (WS has message boundaries)
         const ws = client.ws;
         subscription = {
           clientId: client.id,
@@ -619,7 +487,8 @@ export class StreamManager {
         stream: this.getStreamInfo(managed),
       });
 
-      this.sendConfigToSubscriber(subscription, managed);
+      // Send SDP config as a control message so client can set up the decoder
+      this.sendSDPToSubscriber(client, managed);
     } catch (err) {
       const tag = client.type === 'webtransport' ? 'WT' : 'WS';
       console.error(
@@ -630,40 +499,27 @@ export class StreamManager {
   }
 
   /**
-   * Send cached SPS and PPS NAL units to a subscriber.
-   *
-   * Uses the subscriber's transport-agnostic `send` callback so
-   * it works for both WebTransport and WebSocket clients.
-   *
-   * @param sub - Target video subscription
-   * @param managed - Stream with cached config data
+   * Send SDP configuration to a subscriber as a control message.
    */
-  private sendConfigToSubscriber(
-    sub: VideoSubscription,
-    managed: ManagedStream
-  ): void {
-    if (!managed.spsNALU || !managed.ppsNALU) return;
+  private sendSDPToSubscriber(client: BridgeClient, managed: ManagedStream): void {
+    if (!managed.sdpInfo) return;
 
-    // Send SPS and PPS as separate CONFIG frames (matching handleNALU behavior).
-    // Combining them into one Annex B frame with start codes causes re-parsing
-    // ambiguity: the client's 3-byte start code scanner would absorb a trailing
-    // zero from the SPS into the next start code boundary.
-    const startCode = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
-
-    const spsPayload = Buffer.concat([startCode, managed.spsNALU]);
-    const spsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, spsPayload);
-    sub.send(spsFrame);
-
-    const ppsPayload = Buffer.concat([startCode, managed.ppsNALU]);
-    const ppsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, ppsPayload);
-    sub.send(ppsFrame);
+    const sdp = managed.sdpInfo;
+    this.sendControlMessage(client, {
+      type: 'codec-config',
+      streamId: managed.id,
+      spsB64: sdp.spsB64,
+      ppsB64: sdp.ppsB64,
+      codecString: sdp.codecString,
+      width: sdp.width,
+      height: sdp.height,
+      payloadType: sdp.payloadType,
+      clockRate: sdp.clockRate,
+    }).catch(() => {});
   }
 
   /**
    * Unsubscribe a client from a stream.
-   *
-   * @param client - Connected client (WT or WS)
-   * @param streamId - Stream to unsubscribe from
    */
   private unsubscribeClient(client: BridgeClient, streamId: number): void {
     const managed = this.streams.get(streamId);
@@ -678,7 +534,6 @@ export class StreamManager {
 
     client.subscribedStreams.delete(streamId);
 
-    // For WT: close the shared video stream when no subscriptions remain
     if (
       client.type === 'webtransport' &&
       client.subscribedStreams.size === 0 &&
@@ -695,8 +550,6 @@ export class StreamManager {
 
   /**
    * Handle client disconnection cleanup.
-   *
-   * @param clientId - Disconnected client identifier
    */
   private handleClientDisconnect(clientId: number): void {
     const client = this.clients.get(clientId);
@@ -730,7 +583,6 @@ export class StreamManager {
         }
       }
     }
-    // WS clients: socket cleanup is handled by ws 'close' event
 
     this.clients.delete(clientId);
     const tag = client.type === 'webtransport' ? 'WT' : 'WS';
@@ -738,75 +590,84 @@ export class StreamManager {
   }
 
   /**
-   * Route a NAL unit to the appropriate handler.
+   * Handle an incoming RTP packet from a source.
    *
-   * @param managed - Source stream
-   * @param event - NAL unit event to handle
+   * Prepends a 2-byte big-endian stream ID to the raw RTP packet and
+   * forwards to all subscribers. No H.264 parsing is performed.
+   *
+   * Wire format per forwarded packet:
+   *
+   * +--2 bytes--+--variable--+
+   * | Stream ID  | RTP Packet |
+   * | uint16 BE  | Raw bytes  |
+   * +--2 bytes--+--variable--+
+   *
+   * For WebTransport: wrapped in length-prefix framing.
+   * For WebSocket: sent as-is (WS has message boundaries).
    */
-  private handleNALU(managed: ManagedStream, event: NALUEvent): void {
-    if (isConfigNAL(event.type)) {
-      if (managed.subscribers.size === 0) return;
+  private handleRTPPacket(managed: ManagedStream, event: RTPPacketEvent): void {
+    if (managed.subscribers.size === 0) return;
 
-      const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-      const payload = Buffer.concat([startCode, event.nalUnit]);
-      const frame = buildFrame(managed.id, event.timestamp, FLAG_CONFIG, payload);
-      this.sendToSubscribers(managed, frame, false);
-      return;
+    // Prepend 2-byte stream ID to raw RTP packet
+    const header = Buffer.alloc(2);
+    header.writeUInt16BE(managed.id, 0);
+    const frame = Buffer.concat([header, event.packet]);
+
+    // Determine if this RTP packet contains a keyframe for backpressure decisions
+    const isKeyframe = this.isRTPKeyframe(event.packet);
+
+    this.sendToSubscribers(managed, frame, isKeyframe);
+  }
+
+  /**
+   * Quick check if an RTP packet contains a keyframe (IDR) NAL unit.
+   *
+   * Parses the minimal RTP header to find the H.264 payload, then checks
+   * the NAL unit type. Handles Single NAL, STAP-A, and FU-A packet types.
+   */
+  private isRTPKeyframe(packet: Buffer): boolean {
+    if (packet.length < 13) return false;
+
+    // RTP header: V(2) P(1) X(1) CC(4) M(1) PT(7) seq(16) ts(32) ssrc(32)
+    const cc = packet[0] & 0x0f;
+    const hasExtension = (packet[0] & 0x10) !== 0;
+    let offset = 12 + cc * 4;
+
+    // Skip header extension if present
+    if (hasExtension && offset + 4 <= packet.length) {
+      const extLength = packet.readUInt16BE(offset + 2);
+      offset += 4 + extLength * 4;
     }
 
-    if (!isVCLNAL(event.type)) return;
+    if (offset >= packet.length) return false;
 
-    const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-    const naluBuf = Buffer.concat([startCode, event.nalUnit]);
+    const nalByte = packet[offset];
+    const nalType = nalByte & 0x1f;
 
-    if (isFirstSliceInPicture(event.nalUnit)) {
-      this.flushAccessUnit(managed);
-      managed.pendingAU = {
-        payload: naluBuf,
-        timestamp: event.timestamp,
-        isKeyframe: event.isKeyframe,
-      };
-    } else if (managed.pendingAU) {
-      managed.pendingAU.payload = Buffer.concat([
-        managed.pendingAU.payload,
-        naluBuf,
-      ]);
-      if (event.isKeyframe) {
-        managed.pendingAU.isKeyframe = true;
+    if (nalType >= 1 && nalType <= 23) {
+      // Single NAL unit packet — type 5 = IDR
+      return nalType === 5;
+    } else if (nalType === 24) {
+      // STAP-A — check first aggregated NAL
+      if (offset + 3 < packet.length) {
+        const innerType = packet[offset + 3] & 0x1f;
+        return innerType === 5;
+      }
+    } else if (nalType === 28) {
+      // FU-A — check FU header
+      if (offset + 1 < packet.length) {
+        const fuHeader = packet[offset + 1];
+        const startBit = (fuHeader & 0x80) !== 0;
+        const fuType = fuHeader & 0x1f;
+        return startBit && fuType === 5;
       }
     }
+
+    return false;
   }
 
   /**
-   * Flush the pending access unit to all subscribers.
-   *
-   * @param managed - Stream with pending access unit to flush
-   */
-  private flushAccessUnit(managed: ManagedStream): void {
-    const au = managed.pendingAU;
-    managed.pendingAU = null;
-
-    if (!au || managed.subscribers.size === 0) return;
-
-    let flags = 0;
-    if (au.isKeyframe) {
-      flags |= FLAG_KEYFRAME;
-    }
-
-    const frame = buildFrame(managed.id, au.timestamp, flags, au.payload);
-    this.sendToSubscribers(managed, frame, au.isKeyframe);
-  }
-
-  /**
-   * Send a length-prefixed binary frame to all subscribers of a stream.
-   *
-   * Applies backpressure detection: non-keyframes are dropped for
-   * clients whose QUIC stream write buffer is full. Keyframes are
-   * always sent since they're required for decoder recovery.
-   *
-   * @param managed - Source stream
-   * @param frame - Binary frame to send
-   * @param isKeyframe - Whether this frame is an IDR keyframe
+   * Send a frame to all subscribers of a stream.
    */
   private sendToSubscribers(
     managed: ManagedStream,
@@ -820,7 +681,6 @@ export class StreamManager {
         continue;
       }
 
-      // Backpressure: skip non-keyframes when subscriber is saturated
       if (!isKeyframe && sub.isBackpressured()) {
         continue;
       }
@@ -831,9 +691,6 @@ export class StreamManager {
 
   /**
    * Build a StreamInfo object from internal managed stream state.
-   *
-   * @param managed - Internal stream state
-   * @returns Public stream information
    */
   private getStreamInfo(managed: ManagedStream): StreamInfo {
     return {
@@ -841,9 +698,9 @@ export class StreamManager {
       source: managed.source,
       sourceType: managed.sourceType,
       rtspUrl: managed.source,
-      width: managed.spsInfo?.width ?? 0,
-      height: managed.spsInfo?.height ?? 0,
-      codecString: managed.spsInfo?.codecString ?? '',
+      width: managed.sdpInfo?.width ?? 0,
+      height: managed.sdpInfo?.height ?? 0,
+      codecString: managed.sdpInfo?.codecString ?? '',
       active: managed.client.isRunning(),
     };
   }

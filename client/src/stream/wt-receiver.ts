@@ -1,49 +1,54 @@
 /**
- * WebTransport receiver for the VMS binary streaming protocol.
+ * WebTransport receiver for the VMS RTP streaming protocol.
  *
  * Connects to the bridge server over HTTP/3 WebTransport, using a single
  * QUIC connection with multiplexed streams:
  * - One bidirectional stream for control (subscribe/unsubscribe JSON messages)
- * - One server→client unidirectional stream per subscribed video feed
+ * - One server→client unidirectional stream for video data (raw RTP packets)
  *
- * This eliminates head-of-line blocking between different video streams
- * that WebSocket (TCP) suffers from. Each video feed has independent
- * QUIC flow control and congestion handling.
- *
+ * The server forwards raw RTP packets with a 2-byte stream ID prefix.
  * Messages on all streams use 4-byte big-endian length-prefix framing
- * since QUIC streams are byte-oriented (no message boundaries).
+ * since QUIC streams are byte-oriented.
+ *
+ * Codec configuration (SPS/PPS) is received via JSON control messages
+ * from the server when subscribing to a stream.
  */
 
 import { Logger } from '../utils/logger';
 
-/** A parsed frame received over the WebTransport binary protocol */
-export interface ReceivedFrame {
-  /** Numeric stream identifier */
+/** Codec configuration received from the server via SDP/control channel */
+export interface CodecConfig {
+  /** Stream ID this config belongs to */
   streamId: number;
-  /** Presentation timestamp in microseconds */
-  timestamp: bigint;
-  /** Whether this frame is an IDR keyframe */
-  isKeyframe: boolean;
-  /** Whether this frame carries SPS/PPS configuration data */
-  isConfig: boolean;
-  /** Raw H.264 Annex B payload data */
-  data: Uint8Array;
+  /** Base64-encoded SPS NAL unit */
+  spsB64: string;
+  /** Base64-encoded PPS NAL unit */
+  ppsB64: string;
+  /** AVC codec string (e.g., "avc1.640028") */
+  codecString: string;
+  /** Video width from SPS */
+  width: number;
+  /** Video height from SPS */
+  height: number;
+  /** RTP payload type number */
+  payloadType: number;
+  /** RTP clock rate (typically 90000) */
+  clockRate: number;
 }
 
-/** Callback invoked when a frame is received for a subscribed stream */
-export type FrameCallback = (frame: ReceivedFrame) => void;
+/** A received RTP packet with stream identification */
+export interface ReceivedRTPPacket {
+  /** Numeric stream identifier */
+  streamId: number;
+  /** Raw RTP packet bytes (including RTP header) */
+  packet: Uint8Array;
+}
 
-/**
- * Binary protocol header layout:
- *
- * - Version:   1 byte  (0x01)
- * - StreamID:  2 bytes (uint16 big-endian)
- * - Timestamp: 8 bytes (uint64 big-endian, microseconds)
- * - Flags:     1 byte  (bit 0 = keyframe, bit 1 = config/SPS+PPS)
- * - Payload:   remaining bytes (H.264 Annex B)
- */
-const HEADER_SIZE = 12;
-const PROTOCOL_VERSION = 0x01;
+/** Callback invoked when an RTP packet is received for a subscribed stream */
+export type RTPPacketCallback = (packet: ReceivedRTPPacket) => void;
+
+/** Callback invoked when codec configuration is received for a stream */
+export type CodecConfigCallback = (config: CodecConfig) => void;
 
 /** Maximum reconnection delay in milliseconds */
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -67,7 +72,7 @@ async function writeLengthPrefixed(
 /** Accumulation buffer initial size (64 KB) */
 const ACCUM_BUFFER_INITIAL_SIZE = 65_536;
 
-/** BYOB read buffer size (32 KB) — recycled by browser on each read */
+/** BYOB read buffer size (32 KB) */
 const BYOB_READ_BUFFER_SIZE = 32_768;
 
 /**
@@ -85,18 +90,12 @@ function growBuffer(buf: Uint8Array, filled: number, minCapacity: number): Uint8
 /**
  * Async generator that reads length-prefixed messages from a ReadableStream.
  *
- * Tries BYOB reader to eliminate browser-side per-read Uint8Array allocation.
- * BYOB uses a separate small read buffer (recycled via ownership transfer)
- * and copies into a stable accumulation buffer. Falls back to default reader
- * if the stream doesn't support BYOB mode.
- *
- * The accumulation buffer uses doubling growth + copyWithin compaction to
- * avoid the O(N²) concat+slice pattern.
+ * Tries BYOB reader to eliminate browser-side per-read allocation.
+ * Falls back to default reader if BYOB is unsupported.
  */
 async function* readLengthPrefixed(
   readable: ReadableStream<Uint8Array>
 ): AsyncGenerator<Uint8Array> {
-  // Try BYOB reader; fall back to default reader
   let byobReader: ReadableStreamBYOBReader | null = null;
   let defaultReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   try {
@@ -105,25 +104,15 @@ async function* readLengthPrefixed(
     defaultReader = readable.getReader();
   }
 
-  // Stable accumulation buffer — never transferred to BYOB
   let buf: Uint8Array<ArrayBufferLike> = new Uint8Array(ACCUM_BUFFER_INITIAL_SIZE);
   let filled = 0;
-
-  // Separate BYOB read buffer — ownership is transferred to/from the browser
-  // on each read call, eliminating browser-side allocation.
   let readBuf: ArrayBuffer | null = byobReader ? new ArrayBuffer(BYOB_READ_BUFFER_SIZE) : null;
 
-  /**
-   * Read more data into the accumulation buffer.
-   * Returns false when the stream ends.
-   */
   async function readMore(): Promise<boolean> {
     if (byobReader) {
-      // BYOB: read into the separate recycled buffer, then copy to accum
       const view = new Uint8Array(readBuf!, 0, readBuf!.byteLength);
       const result = await byobReader.read(view);
       if (result.done) return false;
-      // The browser transfers the buffer back — recycle it for next read
       readBuf = result.value.buffer;
       const bytesRead = result.value.byteLength;
       if (filled + bytesRead > buf.byteLength) {
@@ -132,7 +121,6 @@ async function* readLengthPrefixed(
       buf.set(new Uint8Array(readBuf!, result.value.byteOffset, bytesRead), filled);
       filled += bytesRead;
     } else {
-      // Default reader: copy chunk into accum buffer
       const { value, done } = await defaultReader!.read();
       if (done || !value) return false;
       if (filled + value.byteLength > buf.byteLength) {
@@ -146,7 +134,6 @@ async function* readLengthPrefixed(
 
   try {
     while (true) {
-      // Accumulate until we have the 4-byte length prefix
       while (filled < 4) {
         if (!(await readMore())) return;
       }
@@ -155,20 +142,16 @@ async function* readLengthPrefixed(
         ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0;
       const totalNeeded = 4 + length;
 
-      // Pre-grow if the message exceeds current buffer capacity
       if (totalNeeded > buf.byteLength) {
         buf = growBuffer(buf, filled, totalNeeded);
       }
 
-      // Accumulate until we have the complete message
       while (filled < totalNeeded) {
         if (!(await readMore())) return;
       }
 
-      // Yield a copy (data escapes into ReceivedFrame.data)
       yield buf.slice(4, totalNeeded);
 
-      // Compact remaining data to front of buffer
       const remaining = filled - totalNeeded;
       if (remaining > 0) {
         buf.copyWithin(0, totalNeeded, filled);
@@ -194,19 +177,19 @@ function hexToBytes(hex: string): Uint8Array {
 
 /**
  * WebTransport receiver that connects to the bridge server and dispatches
- * H.264 frame data to registered stream callbacks.
+ * raw RTP packets to registered stream callbacks.
  *
  * Uses a single QUIC connection with multiplexed streams:
  * - Bidirectional stream #0 = control channel (JSON subscribe/unsubscribe)
- * - Multiple unidirectional server→client streams for video data
+ * - Unidirectional server→client stream for video RTP packets
  *
- * Each video stream gets its own QUIC stream, eliminating head-of-line
- * blocking between feeds and providing independent flow control.
+ * Codec configuration is received as JSON on the control channel.
  */
 export class WTReceiver {
   private transport: WebTransport | null = null;
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
-  private readonly callbacks: Map<number, FrameCallback> = new Map();
+  private readonly rtpCallbacks: Map<number, RTPPacketCallback> = new Map();
+  private readonly configCallbacks: Map<number, CodecConfigCallback> = new Map();
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
   private _bytesReceived = 0;
@@ -215,19 +198,10 @@ export class WTReceiver {
   private readonly log: Logger;
   private certHash: Uint8Array | null = null;
 
-  /** Pooled ReceivedFrame object reused across parseBinaryFrame calls */
-  private readonly _pooledFrame: ReceivedFrame = {
-    streamId: 0,
-    timestamp: 0n,
-    isKeyframe: false,
-    isConfig: false,
-    data: new Uint8Array(0),
-  };
-
   /**
    * Create a new WTReceiver.
    *
-   * @param wtUrl - WebTransport server URL (e.g., "https://localhost:9001/streams")
+   * @param wtUrl - WebTransport server URL
    * @param certHashUrl - REST API URL for fetching the certificate hash
    */
   constructor(
@@ -239,10 +213,6 @@ export class WTReceiver {
 
   /**
    * Connect to the WebTransport server.
-   *
-   * Fetches the server's TLS certificate hash for pinning, establishes
-   * the WebTransport session, opens the control bidirectional stream,
-   * and begins accepting incoming unidirectional video streams.
    */
   async connect(): Promise<void> {
     this.closing = false;
@@ -253,7 +223,6 @@ export class WTReceiver {
     }
 
     try {
-      // Fetch the certificate hash from the REST API
       if (!this.certHash) {
         this.log.info(`Fetching certificate hash from ${this.certHashUrl}`);
         const response = await fetch(this.certHashUrl);
@@ -280,7 +249,6 @@ export class WTReceiver {
       this.log.info('WebTransport session established');
       this.reconnectAttempt = 0;
 
-      // Monitor session close
       this.transport.closed
         .then(() => {
           this.log.warn('WebTransport session closed');
@@ -303,24 +271,23 @@ export class WTReceiver {
       const controlStream = await this.transport.createBidirectionalStream();
       this.controlWriter = controlStream.writable.getWriter();
 
-      // Read control messages from server (stream list, subscription confirmations)
+      // Read control messages from server
       this.readControlMessages(controlStream.readable).catch((err) => {
         this.log.error('Control channel read error', err);
       });
 
       // Re-subscribe to any previously registered streams
-      for (const streamId of this.callbacks.keys()) {
+      for (const streamId of this.rtpCallbacks.keys()) {
         await this.sendSubscribe(streamId);
       }
 
-      // Start accepting incoming unidirectional streams (video data)
+      // Start accepting incoming unidirectional streams (RTP data)
       this.acceptVideoStreams().catch((err) => {
         if (!this.closing) {
           this.log.error('Video stream acceptor error', err);
         }
       });
     } catch (err) {
-      // Log detailed WebTransportError info for debugging handshake failures
       if (err instanceof Error) {
         const details: string[] = [`message=${err.message}`];
         if ('source' in err) details.push(`source=${(err as any).source}`);
@@ -338,13 +305,21 @@ export class WTReceiver {
   }
 
   /**
-   * Subscribe to a stream and register a frame callback.
+   * Subscribe to a stream's RTP packets and register callbacks.
    *
    * @param streamId - Numeric stream identifier
-   * @param callback - Function invoked for each received frame
+   * @param rtpCallback - Function invoked for each received RTP packet
+   * @param configCallback - Function invoked when codec config is received
    */
-  subscribe(streamId: number, callback: FrameCallback): void {
-    this.callbacks.set(streamId, callback);
+  subscribe(
+    streamId: number,
+    rtpCallback: RTPPacketCallback,
+    configCallback?: CodecConfigCallback
+  ): void {
+    this.rtpCallbacks.set(streamId, rtpCallback);
+    if (configCallback) {
+      this.configCallbacks.set(streamId, configCallback);
+    }
     if (this.controlWriter) {
       this.sendSubscribe(streamId).catch((err) => {
         this.log.error(`Failed to subscribe to stream ${streamId}`, err);
@@ -354,11 +329,10 @@ export class WTReceiver {
 
   /**
    * Unsubscribe from a stream.
-   *
-   * @param streamId - Numeric stream identifier to unsubscribe from
    */
   unsubscribe(streamId: number): void {
-    this.callbacks.delete(streamId);
+    this.rtpCallbacks.delete(streamId);
+    this.configCallbacks.delete(streamId);
     if (this.controlWriter) {
       this.sendControlMessage({ type: 'unsubscribe', streamId }).catch(() => {});
     }
@@ -389,7 +363,8 @@ export class WTReceiver {
       }
       this.transport = null;
     }
-    this.callbacks.clear();
+    this.rtpCallbacks.clear();
+    this.configCallbacks.clear();
     this.log.info('Closed');
   }
 
@@ -398,7 +373,7 @@ export class WTReceiver {
     return this._bytesReceived;
   }
 
-  /** Total number of binary frames received */
+  /** Total number of messages received */
   get messageCount(): number {
     return this._messageCount;
   }
@@ -409,11 +384,7 @@ export class WTReceiver {
   }
 
   /**
-   * Accept incoming unidirectional streams from the server (video data).
-   *
-   * Each stream carries length-prefixed binary frames for a specific
-   * video subscription. Frames are parsed and dispatched to the
-   * appropriate per-stream callback.
+   * Accept incoming unidirectional streams from the server.
    */
   private async acceptVideoStreams(): Promise<void> {
     if (!this.transport) return;
@@ -425,7 +396,6 @@ export class WTReceiver {
         const { value: stream, done } = await reader.read();
         if (done) break;
 
-        // Process each video stream independently (don't block the accept loop)
         this.processVideoStream(stream).catch((err) => {
           if (!this.closing) {
             this.log.warn('Video stream read error', err);
@@ -438,78 +408,44 @@ export class WTReceiver {
   }
 
   /**
-   * Read length-prefixed binary frames from a single unidirectional video stream.
+   * Read length-prefixed messages from a unidirectional video stream.
    *
-   * @param readable - ReadableStream from a server→client unidirectional QUIC stream
+   * Each message is: [2-byte stream ID BE][raw RTP packet]
    */
   private async processVideoStream(readable: ReadableStream<Uint8Array>): Promise<void> {
     for await (const frameBytes of readLengthPrefixed(readable)) {
       this._bytesReceived += frameBytes.byteLength;
       this._messageCount++;
 
-      this.parseBinaryFrame(frameBytes);
+      this.parseRTPMessage(frameBytes);
     }
   }
 
   /**
-   * Parse a binary frame and dispatch to the appropriate callback.
+   * Parse a received message and dispatch the RTP packet to the callback.
    *
-   * @param buffer - Raw frame bytes (12-byte header + payload)
+   * Wire format: [2-byte stream ID BE][raw RTP packet]
    */
-  /**
-   * Parse a binary frame and dispatch to the appropriate callback.
-   *
-   * Uses manual byte reads instead of DataView to avoid per-frame
-   * DataView allocation. Reuses a single ReceivedFrame object (pooled)
-   * to eliminate per-frame object creation — safe because callbacks
-   * consume the frame synchronously.
-   *
-   * @param buffer - Raw frame bytes (12-byte header + payload)
-   */
-  private parseBinaryFrame(buffer: Uint8Array): void {
-    if (buffer.byteLength < HEADER_SIZE) {
-      this.log.warn(`Frame too short: ${buffer.byteLength} bytes`);
+  private parseRTPMessage(buffer: Uint8Array): void {
+    if (buffer.byteLength < 14) {
+      // 2 bytes stream ID + minimum 12 bytes RTP header
+      this.log.warn(`Message too short: ${buffer.byteLength} bytes`);
       return;
     }
 
-    const off = buffer.byteOffset;
-    const b = buffer;
+    const streamId = (buffer[0] << 8) | buffer[1];
+    const rtpPacket = buffer.subarray(2);
 
-    const version = b[off];
-    if (version !== PROTOCOL_VERSION) {
-      this.log.warn(`Unknown protocol version: ${version}`);
-      return;
-    }
-
-    const streamId = (b[off + 1] << 8) | b[off + 2];
-
-    // Read 64-bit timestamp as BigInt via two 32-bit halves (manual bytes)
-    const hi = ((b[off + 3] << 24) | (b[off + 4] << 16) | (b[off + 5] << 8) | b[off + 6]) >>> 0;
-    const lo = ((b[off + 7] << 24) | (b[off + 8] << 16) | (b[off + 9] << 8) | b[off + 10]) >>> 0;
-    const timestamp = (BigInt(hi) << 32n) | BigInt(lo);
-
-    const flags = b[off + 11];
-    const isKeyframe = (flags & 0x01) !== 0;
-    const isConfig = (flags & 0x02) !== 0;
-    const data = buffer.subarray(HEADER_SIZE);
-
-    const callback = this.callbacks.get(streamId);
+    const callback = this.rtpCallbacks.get(streamId);
     if (callback) {
-      // Reuse pooled frame object to avoid per-frame allocation.
-      // Safe because callbacks process synchronously.
-      this._pooledFrame.streamId = streamId;
-      this._pooledFrame.timestamp = timestamp;
-      this._pooledFrame.isKeyframe = isKeyframe;
-      this._pooledFrame.isConfig = isConfig;
-      this._pooledFrame.data = data;
-      callback(this._pooledFrame);
+      callback({ streamId, packet: rtpPacket });
     }
   }
 
   /**
    * Read JSON control messages from the server.
    *
-   * @param readable - Readable side of the control bidirectional stream
+   * Handles codec-config messages by dispatching to registered callbacks.
    */
   private async readControlMessages(readable: ReadableStream<Uint8Array>): Promise<void> {
     for await (const msgBytes of readLengthPrefixed(readable)) {
@@ -517,6 +453,23 @@ export class WTReceiver {
         const text = new TextDecoder().decode(msgBytes);
         const msg = JSON.parse(text);
         this.log.info(`Control message: ${msg.type}`);
+
+        if (msg.type === 'codec-config') {
+          const config: CodecConfig = {
+            streamId: msg.streamId,
+            spsB64: msg.spsB64,
+            ppsB64: msg.ppsB64,
+            codecString: msg.codecString,
+            width: msg.width,
+            height: msg.height,
+            payloadType: msg.payloadType,
+            clockRate: msg.clockRate,
+          };
+          const cb = this.configCallbacks.get(config.streamId);
+          if (cb) {
+            cb(config);
+          }
+        }
       } catch {
         this.log.warn('Invalid control message from server');
       }
@@ -525,8 +478,6 @@ export class WTReceiver {
 
   /**
    * Send a subscribe message over the control channel.
-   *
-   * @param streamId - Stream to subscribe to
    */
   private async sendSubscribe(streamId: number): Promise<void> {
     await this.sendControlMessage({ type: 'subscribe', streamId });
@@ -535,8 +486,6 @@ export class WTReceiver {
 
   /**
    * Send a JSON message on the control bidirectional stream.
-   *
-   * @param message - JSON-serializable message
    */
   private async sendControlMessage(message: unknown): Promise<void> {
     if (!this.controlWriter) return;
@@ -560,7 +509,6 @@ export class WTReceiver {
     this.log.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
     this.reconnectTimer = self.setTimeout(() => {
       this.reconnectTimer = null;
-      // Reset cert hash to force re-fetch (cert may have been regenerated)
       this.certHash = null;
       this.connect();
     }, delay);
