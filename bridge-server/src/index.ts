@@ -19,6 +19,8 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
 import * as net from 'net';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Http3Server } from '@fails-components/webtransport';
 import { StreamManager } from './stream-manager.js';
 import { probeRTSPStream } from './rtsp-client.js';
@@ -29,6 +31,16 @@ const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
 const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
 const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://localhost:8554';
 const MAX_DISCOVER_STREAMS = parseInt(process.env.MAX_DISCOVER_STREAMS ?? '16', 10);
+
+/**
+ * Stream mode:
+ * - 'local': Read video files directly via FFmpeg (no MediaMTX needed)
+ * - 'rtsp':  Connect to RTSP server (MediaMTX or IP cameras)
+ *
+ * Defaults to 'local' if a test-videos directory exists, 'rtsp' otherwise.
+ */
+const STREAM_MODE = process.env.STREAM_MODE ?? 'auto';
+const VIDEO_DIR = process.env.VIDEO_DIR ?? path.resolve(process.cwd(), '..', 'test-videos');
 
 const streamManager = new StreamManager();
 let nextStreamId = 1;
@@ -117,16 +129,23 @@ async function handleRequest(
   }
 
   // POST /streams — add a new stream
+  // Accepts { rtspUrl } for RTSP streams or { filePath } for local files
   if (url.pathname === '/streams' && method === 'POST') {
     try {
-      const body = (await parseBody(req)) as { rtspUrl?: string };
-      if (!body.rtspUrl || typeof body.rtspUrl !== 'string') {
-        sendJSON(res, 400, { error: 'rtspUrl is required' });
+      const body = (await parseBody(req)) as { rtspUrl?: string; filePath?: string };
+
+      const id = nextStreamId++;
+      let info;
+
+      if (body.filePath && typeof body.filePath === 'string') {
+        info = await streamManager.addLocalStream(id, body.filePath);
+      } else if (body.rtspUrl && typeof body.rtspUrl === 'string') {
+        info = await streamManager.addStream(id, body.rtspUrl);
+      } else {
+        sendJSON(res, 400, { error: 'rtspUrl or filePath is required' });
         return;
       }
 
-      const id = nextStreamId++;
-      const info = await streamManager.addStream(id, body.rtspUrl);
       sendJSON(res, 201, { stream: info });
     } catch (err) {
       const message =
@@ -184,6 +203,73 @@ function checkTcpReachable(host: string, port: number, timeoutMs = 3000): Promis
       resolve(false);
     });
   });
+}
+
+/**
+ * Find video files (MP4) recursively in a directory.
+ */
+function findVideoFiles(dir: string): string[] {
+  const videos: string[] = [];
+  if (!fs.existsSync(dir)) return videos;
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      videos.push(...findVideoFiles(full));
+    } else if (entry.isFile() && /\.mp4$/i.test(entry.name)) {
+      videos.push(full);
+    }
+  }
+  return videos;
+}
+
+/**
+ * Determine whether to use local or RTSP mode.
+ */
+function resolveStreamMode(): 'local' | 'rtsp' {
+  if (STREAM_MODE === 'local') return 'local';
+  if (STREAM_MODE === 'rtsp') return 'rtsp';
+  // 'auto': use local if test-videos directory has MP4 files
+  const videos = findVideoFiles(VIDEO_DIR);
+  if (videos.length > 0) {
+    console.log(`[Discovery] Auto-detected ${videos.length} local video(s) in ${VIDEO_DIR}`);
+    return 'local';
+  }
+  return 'rtsp';
+}
+
+/**
+ * Auto-discover local video files and add them as streams.
+ */
+async function discoverLocalStreams(): Promise<void> {
+  const videos = findVideoFiles(VIDEO_DIR);
+
+  if (videos.length === 0) {
+    console.error(
+      `[Discovery] No MP4 files found in ${VIDEO_DIR}. ` +
+      `Add test videos or set STREAM_MODE=rtsp to use RTSP.`
+    );
+    return;
+  }
+
+  // Limit to MAX_DISCOVER_STREAMS
+  const toAdd = videos.slice(0, MAX_DISCOVER_STREAMS);
+
+  console.log(
+    `[Discovery] Loading ${toAdd.length} local stream(s) from ${VIDEO_DIR}`
+  );
+
+  for (const videoPath of toAdd) {
+    const id = nextStreamId++;
+    try {
+      await streamManager.addLocalStream(id, videoPath);
+      console.log(`[Discovery] Added local stream ID ${id}: ${path.basename(videoPath)}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[Discovery] Failed to add ${path.basename(videoPath)}: ${message}`);
+    }
+  }
 }
 
 /**
@@ -357,8 +443,14 @@ async function main(): Promise<void> {
     console.error('[Bridge] Fatal: session acceptor crashed:', err);
   });
 
-  // Auto-discover RTSP streams
-  await discoverStreams();
+  // Auto-discover streams based on mode
+  const mode = resolveStreamMode();
+  console.log(`[Bridge] Stream mode: ${mode}`);
+  if (mode === 'local') {
+    await discoverLocalStreams();
+  } else {
+    await discoverStreams();
+  }
 
   // Graceful shutdown
   const shutdown = (): void => {

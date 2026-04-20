@@ -18,6 +18,8 @@
 
 import { WebSocket as WSSocket } from 'ws';
 import { RTSPClient, type NALUEvent } from './rtsp-client.js';
+import type { StreamSource } from './stream-source.js';
+import { LocalStreamSource } from './local-stream-source.js';
 import { readLengthPrefixed, writeLengthPrefixed } from './framing.js';
 import {
   isKeyframe,
@@ -47,8 +49,8 @@ const textDecoder = new TextDecoder();
 export interface StreamInfo {
   /** Unique stream identifier */
   id: number;
-  /** RTSP source URL */
-  rtspUrl: string;
+  /** Source URL or file path */
+  source: string;
   /** Video width in pixels (0 if SPS not yet received) */
   width: number;
   /** Video height in pixels (0 if SPS not yet received) */
@@ -121,8 +123,8 @@ type BridgeClient = WTClient | WSClient;
 /** Internal state for a managed stream */
 interface ManagedStream {
   id: number;
-  rtspUrl: string;
-  client: RTSPClient;
+  source: string;
+  client: StreamSource;
   spsInfo: SPSInfo | null;
   /** Stored SPS NAL unit for sending to new subscribers */
   spsNALU: Uint8Array | null;
@@ -246,15 +248,38 @@ export class StreamManager {
    * @throws Error if a stream with the given ID already exists
    */
   async addStream(id: number, rtspUrl: string): Promise<StreamInfo> {
+    const client = new RTSPClient(rtspUrl);
+    return this.addSource(id, rtspUrl, client);
+  }
+
+  /**
+   * Add and connect a new local file stream (no RTSP/MediaMTX needed).
+   *
+   * @param id - Unique stream identifier
+   * @param filePath - Path to local video file
+   * @returns Stream information (dimensions may be 0 until SPS is received)
+   * @throws Error if a stream with the given ID already exists
+   */
+  async addLocalStream(id: number, filePath: string): Promise<StreamInfo> {
+    const client = new LocalStreamSource(filePath);
+    return this.addSource(id, filePath, client);
+  }
+
+  /**
+   * Add and connect a stream from any StreamSource.
+   *
+   * @param id - Unique stream identifier
+   * @param source - Source description (URL or file path)
+   * @param client - StreamSource that produces H.264 NAL units
+   */
+  private async addSource(id: number, source: string, client: StreamSource): Promise<StreamInfo> {
     if (this.streams.has(id)) {
       throw new Error(`Stream ${id} already exists`);
     }
 
-    const client = new RTSPClient(rtspUrl);
-
     const managed: ManagedStream = {
       id,
-      rtspUrl,
+      source,
       client,
       spsInfo: null,
       spsNALU: null,
@@ -325,7 +350,7 @@ export class StreamManager {
 
     try {
       await client.connect();
-      console.log(`[Stream ${id}] Connected to ${rtspUrl}`);
+      console.log(`[Stream ${id}] Connected to ${source}`);
     } catch (err) {
       this.streams.delete(id);
       throw err;
@@ -943,7 +968,7 @@ export class StreamManager {
   private getStreamInfo(managed: ManagedStream): StreamInfo {
     return {
       id: managed.id,
-      rtspUrl: managed.rtspUrl,
+      source: managed.source,
       width: managed.spsInfo?.width ?? 0,
       height: managed.spsInfo?.height ?? 0,
       codecString: managed.spsInfo?.codecString ?? '',

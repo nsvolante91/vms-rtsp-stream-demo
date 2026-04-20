@@ -21,18 +21,9 @@ import {
   parseRtspUrl,
   type RtspAuthProxy,
 } from './rtsp-auth-proxy.js';
+import type { StreamSource, NALUEvent } from './stream-source.js';
 
-/** Event emitted when a complete NAL unit is extracted from the stream */
-export interface NALUEvent {
-  /** Raw NAL unit data including NAL header byte */
-  nalUnit: Uint8Array;
-  /** NAL unit type (5-bit field) */
-  type: number;
-  /** Timestamp in microseconds from stream start */
-  timestamp: bigint;
-  /** Whether this NAL unit is an IDR keyframe */
-  isKeyframe: boolean;
-}
+export type { NALUEvent } from './stream-source.js';
 
 /** Events emitted by RTSPClient */
 export interface RTSPClientEvents {
@@ -62,7 +53,7 @@ export interface RTSPClientEvents {
  * await client.connect();
  * ```
  */
-export class RTSPClient extends EventEmitter {
+export class RTSPClient extends EventEmitter implements StreamSource {
   private ffmpeg: ChildProcess | null = null;
   /** Pre-allocated accumulation buffer — grows by doubling, never shrinks */
   private buffer: Buffer = Buffer.allocUnsafe(1024 * 1024);
