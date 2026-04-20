@@ -203,7 +203,6 @@ Not possible within browser security constraints. Browsers cannot open raw UDP s
 | 9000 | HTTP/1.1 + WebSocket | REST API (stream list, cert hash, health) + WS fallback at `/ws` |
 | 9001 | HTTP/3 (QUIC) | WebTransport sessions |
 | 5173 | HTTP/1.1 | Vite dev server (client) |
-| 8554 | RTSP | MediaMTX camera streams (Docker) |
 
 All servers bind to `0.0.0.0` for LAN accessibility.
 

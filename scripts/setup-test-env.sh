@@ -47,15 +47,5 @@ generate_variant "$VIDEO_DIR/BigBuckBunny.mp4" "$VIDEO_DIR/bbb_720p.mp4" "1280:7
 generate_variant "$VIDEO_DIR/BigBuckBunny.mp4" "$VIDEO_DIR/bbb_480p.mp4" "854:480"
 
 echo ""
-echo "=== Starting Docker environment ==="
-docker compose -f "$PROJECT_DIR/docker/docker-compose.yml" up -d
-
-echo ""
-echo "=== Waiting for MediaMTX to start ==="
-sleep 3
-
-echo ""
-echo "=== Test environment ready ==="
-echo "MediaMTX RTSP: rtsp://localhost:8554"
-echo ""
-echo "Run ./scripts/generate-streams.sh <N> to start N simulated camera streams"
+echo "=== Test videos ready ==="
+echo "Run 'npm run bridge:local' to start the bridge server with local files."

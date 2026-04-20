@@ -8,8 +8,8 @@ A browser-based Video Management System prototype demonstrating maximum video st
 
 Three main components:
 
-1. **Test Environment** (Docker): MediaMTX RTSP server + FFmpeg looping test videos as simulated cameras
-2. **Bridge Server** (Node.js/TypeScript): Reads RTSP streams, extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) with a binary protocol. One unidirectional QUIC stream per video subscription eliminates cross-stream head-of-line blocking.
+1. **Video Sources**: Either local MP4 files (FFmpeg demux, no re-encoding) or RTSP streams from IP cameras. Controlled via `SOURCE_MODE` env var (`local`, `rtsp`, or `auto`).
+2. **Bridge Server** (Node.js/TypeScript): Reads video sources via FFmpeg (`FFmpegSource` base class with `RTSPClient` and `LocalFileSource` subclasses), extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) with a binary protocol. One unidirectional QUIC stream per video subscription eliminates cross-stream head-of-line blocking.
 3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebTransport, decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics
 
 ## Key Technical Constraints
@@ -28,16 +28,20 @@ Three main components:
 # Install
 npm install
 
-# Start Docker (MediaMTX)
-docker compose -f docker/docker-compose.yml up -d
+# Download test videos
+./scripts/setup-test-env.sh
 
-# Start test streams
-./scripts/generate-streams.sh 4
-
-# Start bridge server
-npm run bridge
+# Start bridge server (local file mode — no Docker needed)
+npm run bridge:local
 
 # Start client dev server
+npm run dev
+```
+
+### RTSP mode (optional, requires IP cameras)
+
+```bash
+RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bridge
 npm run dev
 ```
 
@@ -52,9 +56,8 @@ npm run typecheck        # TypeScript type checking
 
 ## Project Layout
 
-- `bridge-server/` — Node.js TypeScript WebSocket server
+- `bridge-server/` — Node.js TypeScript WebTransport server
 - `client/` — Vite TypeScript browser application
-- `docker/` — Docker Compose + MediaMTX config
 - `scripts/` — Setup and automation scripts
 - `test-videos/` — Downloaded test video files (gitignored)
 - `.ralph/` — Ralph autonomous development configuration

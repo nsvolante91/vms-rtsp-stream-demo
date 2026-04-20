@@ -17,7 +17,9 @@
  */
 
 import type { WebSocket as WSSocket } from 'ws';
-import { RTSPClient, type NALUEvent } from './rtsp-client.js';
+import { FFmpegSource, type NALUEvent } from './ffmpeg-source.js';
+import { RTSPClient } from './rtsp-client.js';
+import { LocalFileSource } from './local-file-source.js';
 import { frameLengthPrefixed, readLengthPrefixed, writeLengthPrefixed } from './framing.js';
 import {
   isKeyframe,
@@ -40,8 +42,10 @@ const FLAG_CONFIG = 0x02;
 export interface StreamInfo {
   /** Unique stream identifier */
   id: number;
-  /** RTSP source URL */
-  rtspUrl: string;
+  /** Source URL or file path */
+  source: string;
+  /** Source type */
+  sourceType: 'rtsp' | 'file';
   /** Video width in pixels (0 if SPS not yet received) */
   width: number;
   /** Video height in pixels (0 if SPS not yet received) */
@@ -50,6 +54,11 @@ export interface StreamInfo {
   codecString: string;
   /** Whether the stream is currently receiving data */
   active: boolean;
+  /**
+   * RTSP source URL.
+   * @deprecated Use `source` and `sourceType` instead
+   */
+  rtspUrl: string;
 }
 
 /** A pending access unit being accumulated from VCL NAL units */
@@ -118,8 +127,9 @@ type BridgeClient = WTClient | WSClient;
 /** Internal state for a managed stream */
 interface ManagedStream {
   id: number;
-  rtspUrl: string;
-  client: RTSPClient;
+  source: string;
+  sourceType: 'rtsp' | 'file';
+  client: FFmpegSource;
   spsInfo: SPSInfo | null;
   /** Stored SPS NAL unit for sending to new subscribers */
   spsNALU: Uint8Array | null;
@@ -196,23 +206,30 @@ export class StreamManager {
   private readonly clients: Map<number, BridgeClient> = new Map();
 
   /**
-   * Add and connect a new RTSP stream.
+   * Add and connect a new stream from an RTSP URL or local file path.
+   *
+   * Auto-detects source type: strings starting with `rtsp://` create an
+   * RTSPClient; file paths create a LocalFileSource.
    *
    * @param id - Unique stream identifier
-   * @param rtspUrl - RTSP source URL
+   * @param source - RTSP URL or local file path
    * @returns Stream information (dimensions may be 0 until SPS is received)
    * @throws Error if a stream with the given ID already exists
    */
-  async addStream(id: number, rtspUrl: string): Promise<StreamInfo> {
+  async addStream(id: number, source: string): Promise<StreamInfo> {
     if (this.streams.has(id)) {
       throw new Error(`Stream ${id} already exists`);
     }
 
-    const client = new RTSPClient(rtspUrl);
+    const isRtsp = source.startsWith('rtsp://');
+    const client: FFmpegSource = isRtsp
+      ? new RTSPClient(source)
+      : new LocalFileSource(source);
 
     const managed: ManagedStream = {
       id,
-      rtspUrl,
+      source,
+      sourceType: isRtsp ? 'rtsp' : 'file',
       client,
       spsInfo: null,
       spsNALU: null,
@@ -249,7 +266,7 @@ export class StreamManager {
 
     try {
       await client.connect();
-      console.log(`[Stream ${id}] Connected to ${rtspUrl}`);
+      console.log(`[Stream ${id}] Connected to ${source} (${managed.sourceType})`);
     } catch (err) {
       this.streams.delete(id);
       throw err;
@@ -821,7 +838,9 @@ export class StreamManager {
   private getStreamInfo(managed: ManagedStream): StreamInfo {
     return {
       id: managed.id,
-      rtspUrl: managed.rtspUrl,
+      source: managed.source,
+      sourceType: managed.sourceType,
+      rtspUrl: managed.source,
       width: managed.spsInfo?.width ?? 0,
       height: managed.spsInfo?.height ?? 0,
       codecString: managed.spsInfo?.codecString ?? '',

@@ -18,16 +18,23 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import { readdir } from 'fs/promises';
+import { resolve as pathResolve, dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { Http3Server } from '@fails-components/webtransport';
 import { StreamManager } from './stream-manager.js';
-import { probeRTSPStream } from './rtsp-client.js';
+import { probeLocalFile } from './local-file-source.js';
 import { generateCertificate, type CertMaterial } from './cert-utils.js';
 import { attachWebSocketServer } from './ws-handler.js';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = pathResolve(__dirname, '..', '..');
+
 const HTTP_PORT = parseInt(process.env.BRIDGE_PORT ?? '9000', 10);
 const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
-const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? 'rtsp://adminbob:Test123.@10.10.33.32:554/live/0582abb4-1cd7-469e-9b7c-b0c1cffab49b';
-const MAX_DISCOVER_STREAMS = 1;
+const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? '';
+const SOURCE_MODE = process.env.SOURCE_MODE ?? 'auto';
+const VIDEO_DIR = process.env.VIDEO_DIR ?? join(PROJECT_ROOT, 'test-videos');
 
 const streamManager = new StreamManager();
 let nextStreamId = 1;
@@ -118,14 +125,15 @@ async function handleRequest(
   // POST /streams — add a new stream
   if (url.pathname === '/streams' && method === 'POST') {
     try {
-      const body = (await parseBody(req)) as { rtspUrl?: string };
-      if (!body.rtspUrl || typeof body.rtspUrl !== 'string') {
-        sendJSON(res, 400, { error: 'rtspUrl is required' });
+      const body = (await parseBody(req)) as { rtspUrl?: string; filePath?: string };
+      const source = body.rtspUrl ?? body.filePath;
+      if (!source || typeof source !== 'string') {
+        sendJSON(res, 400, { error: 'rtspUrl or filePath is required' });
         return;
       }
 
       const id = nextStreamId++;
-      const info = await streamManager.addStream(id, body.rtspUrl);
+      const info = await streamManager.addStream(id, source);
       sendJSON(res, 201, { stream: info });
     } catch (err) {
       const message =
@@ -159,73 +167,76 @@ async function handleRequest(
 }
 
 /**
- * Auto-discover active RTSP streams.
+ * Auto-discover local video files in VIDEO_DIR.
  *
- * If RTSP_BASE_URL looks like a MediaMTX local server (contains localhost or
- * 127.0.0.1), probes stream1..stream16 as sub-paths. Otherwise, treats the
- * base URL as a single direct RTSP stream (e.g. a real IP camera).
+ * Scans the directory for .mp4 files containing H.264 video and adds
+ * each as a stream source.
+ *
+ * @returns true if any local streams were added
  */
-async function discoverStreams(): Promise<void> {
-  const isLocalMediaMTX =
-    RTSP_BASE_URL.includes('localhost') ||
-    RTSP_BASE_URL.includes('127.0.0.1');
+async function discoverLocalFiles(): Promise<boolean> {
+  const absDir = pathResolve(VIDEO_DIR);
+  console.log(`[Discovery] Scanning local directory: ${absDir}`);
 
-  if (!isLocalMediaMTX) {
-    // Direct camera URL — probe and add as a single stream
-    console.log(`[Discovery] Probing direct RTSP URL: ${RTSP_BASE_URL}`);
-    const available = true; // await probeRTSPStream(RTSP_BASE_URL, 10000);
-    if (available) {
-      const id = nextStreamId++;
-      try {
-        await streamManager.addStream(id, RTSP_BASE_URL);
-        console.log(`[Discovery] Added direct stream as ID ${id}`);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Unknown error';
-        console.error(`[Discovery] Failed to add direct stream: ${message}`);
-      }
-    } else {
-      console.error(`[Discovery] Could not connect to ${RTSP_BASE_URL}`);
-    }
-    return;
+  let entries: string[];
+  try {
+    entries = await readdir(absDir);
+  } catch {
+    console.warn(`[Discovery] Cannot read VIDEO_DIR: ${absDir}`);
+    return false;
   }
 
-  // MediaMTX local server — probe stream
-  console.log(
-    `[Discovery] Probing ${RTSP_BASE_URL}`
-  );
+  const mp4Files = entries
+    .filter((f) => f.endsWith('.mp4'))
+    .map((f) => pathResolve(absDir, f));
 
-  const probePromises: Promise<{ index: number; available: boolean }>[] = [];
-
-  for (let i = 1; i <= MAX_DISCOVER_STREAMS; i++) {
-    const url = `${RTSP_BASE_URL}/stream${i}`;
-    probePromises.push(
-      probeRTSPStream(url, 5000).then((available) => ({
-        index: i,
-        available,
-      }))
-    );
+  if (mp4Files.length === 0) {
+    console.warn(`[Discovery] No .mp4 files found in ${absDir}`);
+    return false;
   }
 
-  const results = await Promise.all(probePromises);
-  const available = results.filter((r) => r.available);
-
-  console.log(
-    `[Discovery] Found ${available.length} active stream(s): ${available.map((r) => `stream${r.index}`).join(', ') || 'none'}`
+  // Probe files in parallel to check for H.264 video
+  const probeResults = await Promise.all(
+    mp4Files.map(async (filePath) => ({
+      filePath,
+      valid: await probeLocalFile(filePath),
+    }))
   );
 
-  for (const result of available) {
-    const url = `${RTSP_BASE_URL}/stream${result.index}`;
+  const valid = probeResults.filter((r) => r.valid);
+  console.log(
+    `[Discovery] Found ${valid.length} H.264 file(s) out of ${mp4Files.length} MP4(s)`
+  );
+
+  for (const { filePath } of valid) {
     const id = nextStreamId++;
     try {
-      await streamManager.addStream(id, url);
-      console.log(`[Discovery] Added stream${result.index} as stream ID ${id}`);
+      await streamManager.addStream(id, filePath);
+      const name = filePath.split('/').pop();
+      console.log(`[Discovery] Added local file ${name} as stream ID ${id}`);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Unknown error';
-      console.error(
-        `[Discovery] Failed to add stream${result.index}: ${message}`
-      );
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      console.error(`[Discovery] Failed to add ${filePath}: ${message}`);
     }
+  }
+
+  return valid.length > 0;
+}
+
+/**
+ * Auto-discover an RTSP stream from RTSP_BASE_URL.
+ *
+ * Treats the URL as a direct camera stream and attempts to connect.
+ */
+async function discoverRtspStreams(): Promise<void> {
+  console.log(`[Discovery] Connecting to RTSP URL: ${RTSP_BASE_URL}`);
+  const id = nextStreamId++;
+  try {
+    await streamManager.addStream(id, RTSP_BASE_URL);
+    console.log(`[Discovery] Added RTSP stream as ID ${id}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    console.error(`[Discovery] Failed to add RTSP stream: ${message}`);
   }
 }
 
@@ -313,8 +324,22 @@ async function main(): Promise<void> {
     console.error('[Bridge] Fatal: session acceptor crashed:', err);
   });
 
-  // Auto-discover RTSP streams
-  await discoverStreams();
+  // Auto-discover streams based on SOURCE_MODE
+  if (SOURCE_MODE === 'local') {
+    const found = await discoverLocalFiles();
+    if (!found) {
+      console.warn('[Bridge] No local streams found. Add .mp4 files to VIDEO_DIR or switch SOURCE_MODE.');
+    }
+  } else if (SOURCE_MODE === 'rtsp') {
+    await discoverRtspStreams();
+  } else {
+    // auto: try local files first, fall back to RTSP
+    const foundLocal = await discoverLocalFiles();
+    if (!foundLocal) {
+      console.log('[Discovery] No local files found, falling back to RTSP discovery');
+      await discoverRtspStreams();
+    }
+  }
 
   // Graceful shutdown
   const shutdown = (): void => {

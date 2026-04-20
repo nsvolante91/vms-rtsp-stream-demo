@@ -17,26 +17,32 @@ A technology demonstrator showing that modern browsers can hardware-decode and r
 ## Architecture
 
 ```
-FFmpeg loops ──RTSP──▶ MediaMTX ──RTSP──▶ Bridge Server ──WebSocket──▶ Browser
-  (test videos)        (RTSP server)     (Node.js)                    (WebCodecs + Canvas2D)
+Local MP4 files ─────────▶ Bridge Server ──WebSocket/WebTransport──▶ Browser
+  (FFmpeg demux, no re-encode)  (Node.js)                           (WebCodecs + Canvas2D)
+
+   ── or ──
+
+RTSP cameras ──RTSP──▶ Bridge Server ──WebSocket/WebTransport──▶ Browser
+  (IP cameras)              (Node.js)                              (WebCodecs + Canvas2D)
 ```
 
-1. **Test Environment** (Docker): MediaMTX RTSP server + FFmpeg looping test videos as simulated cameras
-2. **Bridge Server** (Node.js/TypeScript): Reads RTSP streams via FFmpeg, extracts H.264 NAL units, accumulates them into complete access units, and serves them over WebSocket with a binary protocol
-3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebSocket, demuxes Annex B into `EncodedVideoChunk`s, decodes via WebCodecs `VideoDecoder` (hardware-accelerated), renders each stream to its own canvas via `ctx.drawImage(VideoFrame)`, displays in a CSS grid with real-time performance metrics
+The bridge server supports two source types:
+1. **Local files** (default): FFmpeg demuxes MP4 files directly to H.264 Annex B — no re-encoding, no external servers
+2. **RTSP streams**: Reads directly from IP cameras via FFmpeg
+
+Both source types produce identical output to the browser client — the same 12-byte binary frame header with H.264 access units.
 
 ## Prerequisites
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
 | **Node.js** | 20+ | Bridge server + build tooling |
-| **Docker** + Docker Compose | Any recent | Runs MediaMTX RTSP server |
-| **FFmpeg** | 5+ (on host) | Generates simulated camera streams |
+| **FFmpeg** | 5+ (on host) | Demuxes video files / reads RTSP streams |
 | **Chrome** or **Edge** | 113+ | WebCodecs `VideoDecoder` support |
 
 ## Quick Start
 
-You need **4 terminal windows** (or use background processes).
+You need **3 terminal windows** (or use background processes).
 
 ### 1. Clone and install
 
@@ -46,9 +52,9 @@ cd vms-rtsp-stream-demo
 npm install
 ```
 
-### 2. Set up test environment
+### 2. Set up test videos
 
-Downloads sample videos and starts the MediaMTX RTSP server in Docker:
+Downloads sample videos:
 
 ```bash
 ./scripts/setup-test-env.sh
@@ -57,36 +63,45 @@ Downloads sample videos and starts the MediaMTX RTSP server in Docker:
 This will:
 - Download Big Buck Bunny and Tears of Steel sample videos to `test-videos/`
 - Generate 720p and 480p resolution variants
-- Start the MediaMTX Docker container (RTSP on port 8554)
 
-### 3. Start simulated camera streams
-
-```bash
-./scripts/generate-streams.sh 4
-```
-
-This spawns 4 FFmpeg processes, each looping a test video and publishing to MediaMTX as an RTSP stream (`stream1` through `stream4`). You can pass a different number for more/fewer streams.
-
-Verify a stream is working:
-```bash
-ffprobe -rtsp_transport tcp rtsp://localhost:8554/stream1
-```
-
-### 4. Start the bridge server
+### 3. Start the bridge server (local mode)
 
 ```bash
-npm run bridge
+npm run bridge:local
 ```
 
-The bridge server connects to the RTSP streams, extracts H.264 NAL units, and serves them over WebSocket on `ws://localhost:9000`. It also exposes `http://localhost:9000/streams` for the client to discover available streams.
+The bridge server scans `test-videos/` for `.mp4` files, probes them for H.264 video, and starts streaming each one via FFmpeg (demux only, no re-encoding). One stream per file, looped at real-time rate.
 
-### 5. Start the browser client
+To add more streams from the same files, use the REST API:
+```bash
+curl -X POST http://localhost:9000/streams -H 'Content-Type: application/json' \
+  -d '{"filePath": "/path/to/test-videos/BigBuckBunny.mp4"}'
+```
+
+### 4. Start the browser client
 
 ```bash
 npm run dev
 ```
 
-Open **Chrome** at `http://localhost:5173`. The client auto-detects available streams and begins playing up to 4 streams in a 2x2 grid.
+Open **Chrome** at `http://localhost:5173`. The client auto-detects available streams and begins playing.
+
+### RTSP cameras
+
+To stream from real IP cameras instead of local files:
+```bash
+RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bridge
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SOURCE_MODE` | `auto` | `local` = scan VIDEO_DIR for MP4s, `rtsp` = probe RTSP URLs, `auto` = try local first, fall back to RTSP |
+| `VIDEO_DIR` | `<project>/test-videos` | Directory to scan for local MP4 files |
+| `RTSP_BASE_URL` | *(IP camera URL)* | RTSP base URL for RTSP mode |
+| `BRIDGE_PORT` | `9000` | HTTP REST API port |
+| `WT_PORT` | `9001` | WebTransport (HTTP/3) port |
 
 ## Usage
 
@@ -100,12 +115,6 @@ Open **Chrome** at `http://localhost:5173`. The client auto-detects available st
 ## Stopping Everything
 
 ```bash
-# Stop simulated streams
-pkill -f 'ffmpeg.*rtsp.*stream'
-
-# Stop Docker (MediaMTX)
-docker compose -f docker/docker-compose.yml down
-
 # Stop bridge server and client dev server
 # Ctrl+C in their respective terminals
 ```
@@ -113,18 +122,20 @@ docker compose -f docker/docker-compose.yml down
 ## Project Layout
 
 ```
-├── bridge-server/          # Node.js WebSocket bridge (RTSP → WS)
+├── bridge-server/          # Node.js bridge (file/RTSP → WebSocket/WebTransport)
 │   ├── src/
-│   │   ├── server.ts           # HTTP + WebSocket server
-│   │   ├── stream-manager.ts   # RTSP stream lifecycle + access unit packaging
-│   │   ├── rtsp-client.ts      # FFmpeg subprocess for RTSP reading
+│   │   ├── index.ts            # HTTP + WebTransport server, stream discovery
+│   │   ├── stream-manager.ts   # Stream lifecycle + access unit packaging
+│   │   ├── ffmpeg-source.ts    # Abstract base: FFmpeg process + NAL parsing
+│   │   ├── rtsp-client.ts      # RTSP source (extends FFmpegSource)
+│   │   ├── local-file-source.ts # Local MP4 source (extends FFmpegSource)
 │   │   └── h264-parser.ts      # NAL unit parsing, SPS decode, codec string
 │   └── tests/
 ├── client/                 # Vite TypeScript browser app (zero runtime deps)
 │   ├── src/
 │   │   ├── main.ts             # App controller, CSS grid management
 │   │   ├── stream/
-│   │   │   ├── ws-receiver.ts      # WebSocket client + binary protocol parser
+│   │   │   ├── wt-receiver.ts      # WebTransport client + binary protocol parser
 │   │   │   ├── stream-pipeline.ts  # Per-stream decode pipeline
 │   │   │   ├── h264-demuxer.ts     # Annex B → EncodedVideoChunk
 │   │   │   └── decoder.ts         # VideoDecoder wrapper with backpressure + auto-recovery
@@ -140,12 +151,9 @@ docker compose -f docker/docker-compose.yml down
 │   │       ├── controls.ts
 │   │       └── styles.css
 │   └── tests/
-├── docker/                 # Docker Compose + MediaMTX config
-│   ├── docker-compose.yml
-│   └── mediamtx.yml
 ├── scripts/
-│   ├── setup-test-env.sh       # One-time setup (download videos, start Docker)
-│   └── generate-streams.sh     # Spawn FFmpeg RTSP stream publishers
+│   ├── setup-test-env.sh       # One-time setup (download test videos)
+│   └── serve-local.sh          # Start bridge in local file mode
 ├── CLAUDE.md               # AI assistant context
 └── package.json            # Monorepo root (npm workspaces)
 ```
