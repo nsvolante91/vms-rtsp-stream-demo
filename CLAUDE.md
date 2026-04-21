@@ -9,18 +9,17 @@ A browser-based Video Management System prototype demonstrating maximum video st
 Three main components:
 
 1. **Video Sources**: Either local MP4 files (FFmpeg demux, no re-encoding) or RTSP streams from IP cameras. Controlled via `SOURCE_MODE` env var (`local`, `rtsp`, or `auto`).
-2. **Bridge Server** (Node.js/TypeScript): Spawns FFmpeg to output RTP packets to local UDP ports (`RTPSource` base class with `RTSPRTPSource` and `LocalRTPSource` subclasses), captures raw RTP packets via UDP sockets, forwards them over WebTransport (HTTP/3 QUIC) with a minimal 2-byte stream ID prefix. The server is a transparent RTP relay — no H.264 parsing is performed. Codec configuration (SPS/PPS) is extracted from FFmpeg's SDP output and sent as JSON control messages.
-3. **Browser Client** (TypeScript/Vite): Receives raw RTP packets over WebTransport, depacketizes H.264 per RFC 6184 (`RTPDepacketizer` handles Single NAL, STAP-A, FU-A), converts to AVCC format for WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics
+2. **Bridge Server** (Node.js/TypeScript): Reads video sources via FFmpeg (`FFmpegSource` base class with `RTSPClient` and `LocalFileSource` subclasses), extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) with a binary protocol. One unidirectional QUIC stream per video subscription eliminates cross-stream head-of-line blocking.
+3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebTransport, decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics
 
 ## Key Technical Constraints
 
 - **VideoFrame.close() is mandatory** — every frame from the decoder MUST be closed after rendering, or GPU memory leaks catastrophically
 - **importExternalTexture lifetime** — the GPUExternalTexture is only valid until the current microtask completes; must use it in the same synchronous render pass
 - **Backpressure** — check `decoder.decodeQueueSize` before feeding frames; drop non-keyframes when queue > 3
-- **H.264 codec string** — derived from SPS NAL unit (available in SDP `profile-level-id` or SPS bytes): `avc1.{profile}{constraints}{level}` in hex
-- **RTP depacketization** — client handles RFC 6184 packet types: Single NAL (1-23), STAP-A (24), FU-A (28); uses marker bit for access unit boundaries
+- **H.264 codec string** — must be derived from SPS NAL unit: `avc1.{profile}{constraints}{level}` in hex
 - **Chrome-first** — target Chrome 114+; WebTransport + WebGPU importExternalTexture require Chrome
-- **WebTransport framing** — QUIC streams are byte-oriented; all messages use 4-byte big-endian length prefix; video data is `[2-byte stream ID][raw RTP packet]`
+- **WebTransport framing** — QUIC streams are byte-oriented; all messages use 4-byte big-endian length prefix
 - **Self-signed certs** — WebTransport requires TLS; bridge server generates ECDSA P-256 cert at startup (≤14 days validity); client pins via `serverCertificateHashes`
 
 ## Build & Run
@@ -69,6 +68,6 @@ npm run typecheck        # TypeScript type checking
 - All public functions have JSDoc comments
 - No runtime dependencies in the browser client (all native APIs)
 - Prefer `performance.now()` for timing, not `Date.now()`
-- All WebTransport control messages are length-prefixed JSON on a bidirectional stream (including `codec-config` messages with base64 SPS/PPS from SDP)
-- All video data (raw RTP packets with 2-byte stream ID prefix) is multiplexed over a single unidirectional QUIC stream per client
+- All WebTransport control messages are length-prefixed JSON on a bidirectional stream
+- All video data is currently multiplexed over a single unidirectional QUIC stream per client using the binary protocol (per-stream unidirectional QUIC streams remain a future optimization target)
 - Use `const` by default, `let` only when reassignment is needed
