@@ -5,7 +5,12 @@
  * to browser clients via multiplexed QUIC streams. Also provides an HTTP/1.1
  * REST API on port 9000 for stream management and certificate hash retrieval.
  *
- * REST Endpoints (HTTP/1.1 on port 9000):
+ * The REST API runs over plain HTTP because regular fetch() cannot pin
+ * self-signed certificates (unlike WebTransport). Chrome exempts 127.0.0.1
+ * from mixed-content blocking, so an HTTPS page can safely fetch from
+ * http://127.0.0.1:9000.
+ *
+ * REST Endpoints (HTTP on port 9000):
  * - GET  /streams     — List all available streams
  * - POST /streams     — Add a new stream { rtspUrl }
  * - DELETE /streams/:id — Remove a stream
@@ -17,7 +22,8 @@
  * - Server opens one unidirectional stream per subscribed video feed
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'http';
+import type { IncomingMessage, ServerResponse } from 'http';
+import { createServer } from 'http';
 import { readdir } from 'fs/promises';
 import { resolve as pathResolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -35,6 +41,14 @@ const WT_PORT = parseInt(process.env.WT_PORT ?? '9001', 10);
 const RTSP_BASE_URL = process.env.RTSP_BASE_URL ?? '';
 const SOURCE_MODE = process.env.SOURCE_MODE ?? 'auto';
 const VIDEO_DIR = process.env.VIDEO_DIR ?? join(PROJECT_ROOT, 'test-videos');
+
+/**
+ * Publicly reachable hostname or IP for remote clients.
+ * Set HOST=192.168.1.100 (or a domain name) when running on a remote machine
+ * so the TLS certificate SAN covers the address clients connect from.
+ * Defaults to 'localhost' for local-only access.
+ */
+const HOST = process.env.HOST ?? 'localhost';
 
 const streamManager = new StreamManager();
 let nextStreamId = 1;
@@ -91,7 +105,7 @@ async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://192.168.3.123:${HTTP_PORT}`);
+  const url = new URL(req.url ?? '/', `http://127.0.0.1:${HTTP_PORT}`);
   const method = req.method ?? 'GET';
 
   // CORS preflight
@@ -110,7 +124,7 @@ async function handleRequest(
     sendJSON(res, 200, {
       hash: certMaterial.hashHex,
       algorithm: 'sha-256',
-      wtUrl: `https://localhost:${WT_PORT}/streams`,
+      wtUrl: `https://${HOST}:${WT_PORT}/streams`,
     });
     return;
   }
@@ -274,17 +288,25 @@ async function acceptSessions(
 /**
  * Start the bridge server.
  *
- * Creates an HTTP/1.1 REST API server and an HTTP/3 WebTransport server.
- * Generates a self-signed TLS certificate for WebTransport and exposes
- * its SHA-256 hash via the REST API. Auto-discovers RTSP streams on startup.
+ * Creates an HTTP/1.1 REST API server (plain HTTP) and an HTTP/3 WebTransport
+ * server. Both use the same self-signed TLS certificate; the REST API stays
+ * plain HTTP because fetch() cannot pin self-signed certificates. The Vite
+ * dev server proxies /api and /ws through itself (HTTPS), eliminating
+ * mixed-content and certificate trust issues for remote clients.
+ * Auto-discovers video sources on startup.
  */
 async function main(): Promise<void> {
-  // Generate self-signed ECDSA certificate for WebTransport
+  // Generate self-signed ECDSA certificate for WebTransport.
+  // Pass HOST so the SAN covers the address remote clients connect from.
   console.log('[Bridge] Generating self-signed TLS certificate...');
-  certMaterial = generateCertificate();
+  certMaterial = generateCertificate(HOST !== 'localhost' ? HOST : undefined);
   console.log(`[Bridge] Certificate hash: ${certMaterial.hashHex}`);
+  if (HOST !== 'localhost') {
+    console.log(`[Bridge] Certificate covers remote host: ${HOST}`);
+  }
 
-  // Create HTTP/1.1 REST API server
+  // Create HTTP/1.1 REST API server (plain HTTP — fetch() cannot pin self-signed certs,
+  // but Chrome exempts 127.0.0.1 from mixed-content blocking so HTTPS pages can reach it)
   const httpServer = createServer((req, res) => {
     handleRequest(req, res).catch((err) => {
       console.error('[HTTP] Request handler error:', err);
@@ -294,7 +316,7 @@ async function main(): Promise<void> {
     });
   });
 
-  // Create HTTP/3 WebTransport server
+  // Create HTTP/3 WebTransport server (TLS required by the protocol)
   const wtServer = new Http3Server({
     port: WT_PORT,
     host: '0.0.0.0',

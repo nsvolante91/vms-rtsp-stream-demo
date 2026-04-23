@@ -17,19 +17,27 @@ import { Controls } from './ui/controls';
 import type { WorkerToMainMessage, MainToWorkerMessage } from './worker/messages';
 
 /**
- * REST API base URL.
- * Uses 127.0.0.1 instead of 'localhost' because macOS resolves localhost
- * to IPv6 (::1) first, but the QUIC/UDP server binds to IPv4 (0.0.0.0).
- * Chrome's Happy Eyeballs prefers IPv6 and fails when no UDP listener exists on ::1.
+ * REST API base URL — relative, proxied by the Vite dev server.
+ * The Vite server rewrites /api/* → bridge:9000/* over plain HTTP internally,
+ * so the browser never sees the plain HTTP origin and there are no mixed-content
+ * or certificate trust issues. Works identically for local and remote access.
  */
-const API_URL = 'http://127.0.0.1:9000';
+const API_URL = '/api';
 
 /**
- * WebTransport bridge server URL.
- * Must use 127.0.0.1 to match the server's IPv4 UDP socket binding.
- * The server's TLS certificate includes IP:127.0.0.1 in its SAN.
+ * WebTransport URL — uses the same hostname the page was served from so the
+ * bridge server's TLS certificate (which lists that host in its SAN) is valid.
+ * Falls back to localhost when running locally.
  */
-const WT_URL = 'https://127.0.0.1:9001/streams';
+const WT_URL = `https://${window.location.hostname}:9001/streams`;
+
+/**
+ * WebSocket URL for Safari/Firefox fallback.
+ * Routes through the Vite dev server proxy (/ws → ws://bridge:9000/ws),
+ * so TLS is handled by Vite and no additional cert trust is needed.
+ */
+const WS_PROTO = window.location.protocol === 'https:' ? 'wss' : 'ws';
+const WS_URL = `${WS_PROTO}://${window.location.host}/ws`;
 
 /** REST endpoint for certificate hash (for WebTransport pinning) */
 const CERT_HASH_URL = `${API_URL}/cert-hash`;
@@ -180,7 +188,7 @@ class VMSApp {
       reject = (e) => { initDone(); origReject(e); };
 
       // Send init message to worker
-      this.postWorker({ type: 'init', wtUrl: WT_URL, certHashUrl: CERT_HASH_URL });
+      this.postWorker({ type: 'init', wtUrl: WT_URL, certHashUrl: CERT_HASH_URL, wsUrl: WS_URL });
     });
   }
 

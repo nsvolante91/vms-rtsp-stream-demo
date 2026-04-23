@@ -13,6 +13,7 @@
 
 import { Logger } from '../utils/logger';
 import { WTReceiver } from '../stream/wt-receiver';
+import { WSReceiver } from '../stream/ws-receiver';
 import { StreamPipeline } from '../stream/stream-pipeline';
 import type { StreamReceiver } from '../stream/stream-pipeline';
 import {
@@ -85,7 +86,7 @@ function stopMetricsReporter(): void {
 
 // ─── Message Handlers ──────────────────────────────────────────
 
-async function handleInit(wtUrl: string, certHashUrl: string): Promise<void> {
+async function handleInit(wtUrl: string, certHashUrl: string, wsUrl: string): Promise<void> {
   log.info('Initializing worker pipeline...');
 
   // 1. WebGPU
@@ -98,17 +99,31 @@ async function handleInit(wtUrl: string, certHashUrl: string): Promise<void> {
     return;
   }
 
-  // 2. WebTransport
-  const wt = new WTReceiver(wtUrl, certHashUrl);
-  try {
-    await wt.connect();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log.error('WebTransport connect failed', e);
-    postMsg({ type: 'error', message: `WebTransport connect failed: ${msg}` });
-    return;
+  // 2. Transport: WebTransport (Chrome/Edge) or WebSocket fallback (Safari/Firefox)
+  if (typeof WebTransport !== 'undefined') {
+    log.info('WebTransport available — using WebTransport');
+    const wt = new WTReceiver(wtUrl, certHashUrl);
+    try {
+      await wt.connect();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log.error('WebTransport connect failed', e);
+      postMsg({ type: 'error', message: `WebTransport connect failed: ${msg}` });
+      return;
+    }
+    receiver = wt;
+  } else {
+    log.info('WebTransport not available — falling back to WebSocket');
+    const ws = new WSReceiver(wsUrl);
+    try {
+      await ws.connect();
+    } catch (e) {
+      // WSReceiver schedules reconnects internally; proceed to 'connected' so the
+      // main thread can add streams. Frames will arrive once WS reconnects.
+      log.warn('WebSocket initial connect failed, will retry automatically');
+    }
+    receiver = ws;
   }
-  receiver = wt;
 
   // 3. Start metrics reporter
   startMetricsReporter();
@@ -200,7 +215,7 @@ self.onmessage = (e: MessageEvent<MainToWorkerMessage>) => {
 
   switch (msg.type) {
     case 'init':
-      handleInit(msg.wtUrl, msg.certHashUrl).catch((err) => {
+      handleInit(msg.wtUrl, msg.certHashUrl, msg.wsUrl).catch((err) => {
         log.error('Init failed', err);
         postMsg({ type: 'error', message: `Init failed: ${err}` });
       });

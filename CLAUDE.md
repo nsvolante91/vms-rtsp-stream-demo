@@ -9,8 +9,8 @@ A browser-based Video Management System prototype demonstrating maximum video st
 Three main components:
 
 1. **Video Sources**: Either local MP4 files (FFmpeg demux, no re-encoding) or RTSP streams from IP cameras. Controlled via `SOURCE_MODE` env var (`local`, `rtsp`, or `auto`).
-2. **Bridge Server** (Node.js/TypeScript): Reads video sources via FFmpeg (`FFmpegSource` base class with `RTSPClient` and `LocalFileSource` subclasses), extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) with a binary protocol. One unidirectional QUIC stream per video subscription eliminates cross-stream head-of-line blocking.
-3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebTransport, decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics
+2. **Bridge Server** (Node.js/TypeScript): Reads video sources via FFmpeg (`FFmpegSource` base class with `RTSPClient` and `LocalFileSource` subclasses), extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) or WebSocket with a binary protocol. Generates a self-signed TLS certificate at startup (ECDSA P-256, ≤14 days). REST API runs on plain HTTP (port 9000); WebTransport on HTTPS/QUIC (port 9001).
+3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebTransport (Chrome/Edge) or WebSocket fallback (Safari/Firefox), decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics. All REST and WebSocket traffic is proxied through the Vite HTTPS server, so only one certificate trust prompt is needed.
 
 ## Key Technical Constraints
 
@@ -18,9 +18,10 @@ Three main components:
 - **importExternalTexture lifetime** — the GPUExternalTexture is only valid until the current microtask completes; must use it in the same synchronous render pass
 - **Backpressure** — check `decoder.decodeQueueSize` before feeding frames; drop non-keyframes when queue > 3
 - **H.264 codec string** — must be derived from SPS NAL unit: `avc1.{profile}{constraints}{level}` in hex
-- **Chrome-first** — target Chrome 114+; WebTransport + WebGPU importExternalTexture require Chrome
 - **WebTransport framing** — QUIC streams are byte-oriented; all messages use 4-byte big-endian length prefix
-- **Self-signed certs** — WebTransport requires TLS; bridge server generates ECDSA P-256 cert at startup (≤14 days validity); client pins via `serverCertificateHashes`
+- **Self-signed certs** — WebTransport requires TLS; bridge server generates ECDSA P-256 cert at startup (≤14 days validity); client pins via `serverCertificateHashes`. Vite reads the same cert from `.certs/`.
+- **HOST env var** — set to the server's IP/hostname for remote access; included in the cert SAN so WebTransport certificate hash pinning works. Vite also binds to `0.0.0.0` when HOST is set.
+- **Transport fallback** — `stream-worker.ts` detects `typeof WebTransport`; uses `WSReceiver` (WebSocket via Vite proxy) for Safari/Firefox automatically.
 
 ## Build & Run
 
@@ -31,14 +32,25 @@ npm install
 # Download test videos
 ./scripts/setup-test-env.sh
 
-# Start bridge server (local file mode — no Docker needed)
+# Start bridge server first (generates .certs/ for Vite)
 npm run bridge:local
 
 # Start client dev server
 npm run dev
+# → open https://localhost:5173 (accept the self-signed cert warning)
 ```
 
-### RTSP mode (optional, requires IP cameras)
+### Remote access (LAN / server)
+
+```bash
+export HOST=192.168.1.100   # replace with your server's IP or hostname
+
+SOURCE_MODE=local HOST=$HOST npm run bridge:local   # terminal 1
+HOST=$HOST npm run dev                               # terminal 2
+# → open https://192.168.1.100:5173 from any device on the network
+```
+
+### RTSP mode
 
 ```bash
 RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bridge

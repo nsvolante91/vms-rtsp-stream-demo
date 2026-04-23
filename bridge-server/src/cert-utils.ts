@@ -32,23 +32,35 @@ const CERT_DIR = join(process.cwd(), '.certs');
  * Generate a self-signed ECDSA P-256 certificate for WebTransport.
  *
  * Uses OpenSSL to create a short-lived (13-day) certificate with
- * SAN entries for localhost and 127.0.0.1. The certificate is written
+ * SAN entries for localhost, 127.0.0.1, and an optional additional host
+ * (set via the HOST env var for remote access). The certificate is written
  * to disk in `.certs/` and regenerated on every startup.
  *
  * Chrome's WebTransport certificate hash pinning requires:
  * - Validity period ≤ 14 days (we use 13 for margin)
  * - basicConstraints CA:FALSE (NOT a CA cert)
  * - ECDSA with P-256 curve
+ * - SAN must include the hostname used to connect (required even with hash pinning)
  *
+ * @param extraHost - Additional hostname or IP to include in the SAN (e.g. a LAN IP for remote access)
  * @returns Certificate material including PEM cert, key, and SHA-256 hash
  */
-export function generateCertificate(): CertMaterial {
+export function generateCertificate(extraHost?: string): CertMaterial {
   if (!existsSync(CERT_DIR)) {
     mkdirSync(CERT_DIR, { recursive: true });
   }
 
   const certPath = join(CERT_DIR, 'cert.pem');
   const keyPath = join(CERT_DIR, 'key.pem');
+
+  // Build the SAN list. Always include localhost and 127.0.0.1.
+  // Append the extra host as DNS or IP depending on format.
+  const sanEntries = ['DNS:localhost', 'IP:127.0.0.1'];
+  if (extraHost && extraHost !== 'localhost' && extraHost !== '127.0.0.1') {
+    const isIp = /^[\d.]+$/.test(extraHost) || extraHost.includes(':');
+    sanEntries.push(isIp ? `IP:${extraHost}` : `DNS:${extraHost}`);
+  }
+  const san = sanEntries.join(',');
 
   // Generate ECDSA P-256 self-signed cert valid for 13 days
   // CRITICAL: basicConstraints=CA:FALSE is required for Chrome's WebTransport
@@ -59,7 +71,7 @@ export function generateCertificate(): CertMaterial {
       `-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ` +
       `-keyout "${keyPath}" -out "${certPath}" ` +
       `-days 13 -subj "/CN=localhost" ` +
-      `-addext "subjectAltName=DNS:localhost,IP:127.0.0.1" ` +
+      `-addext "subjectAltName=${san}" ` +
       `-addext "basicConstraints=critical,CA:FALSE"`,
     { stdio: 'pipe' }
   );

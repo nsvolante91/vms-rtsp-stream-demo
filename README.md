@@ -38,11 +38,14 @@ Both source types produce identical output to the browser client — the same 12
 |------------|---------|---------|
 | **Node.js** | 20+ | Bridge server + build tooling |
 | **FFmpeg** | 5+ (on host) | Demuxes video files / reads RTSP streams |
-| **Chrome** or **Edge** | 113+ | WebCodecs `VideoDecoder` support |
+| **OpenSSL** | 1.1.1+ | Generates self-signed TLS certificate |
+| **Chrome / Edge** | 113+ | WebTransport + WebCodecs (best performance) |
+| **Safari** | 17+ | WebCodecs + WebSocket fallback (no WebTransport needed) |
+| **Firefox** | 113+ | WebCodecs + WebSocket fallback |
 
-## Quick Start
+## Quick Start (local, single machine)
 
-You need **3 terminal windows** (or use background processes).
+You need **2 terminal windows**.
 
 ### 1. Clone and install
 
@@ -54,29 +57,21 @@ npm install
 
 ### 2. Set up test videos
 
-Downloads sample videos:
-
 ```bash
 ./scripts/setup-test-env.sh
 ```
 
-This will:
-- Download Big Buck Bunny and Tears of Steel sample videos to `test-videos/`
-- Generate 720p and 480p resolution variants
+Downloads Big Buck Bunny and Tears of Steel sample videos to `test-videos/` and generates 720p/480p variants.
 
-### 3. Start the bridge server (local mode)
+### 3. Start the bridge server
 
 ```bash
 npm run bridge:local
 ```
 
-The bridge server scans `test-videos/` for `.mp4` files, probes them for H.264 video, and starts streaming each one via FFmpeg (demux only, no re-encoding). One stream per file, looped at real-time rate.
-
-To add more streams from the same files, use the REST API:
-```bash
-curl -X POST http://localhost:9000/streams -H 'Content-Type: application/json' \
-  -d '{"filePath": "/path/to/test-videos/BigBuckBunny.mp4"}'
-```
+The bridge server will:
+- Generate a self-signed TLS certificate in `.certs/` (required for WebTransport)
+- Scan `test-videos/` for `.mp4` files and start streaming them
 
 ### 4. Start the browser client
 
@@ -84,24 +79,104 @@ curl -X POST http://localhost:9000/streams -H 'Content-Type: application/json' \
 npm run dev
 ```
 
-Open **Chrome** at `http://localhost:5173`. The client auto-detects available streams and begins playing.
+Open **`https://localhost:5173`** in your browser.
 
-### RTSP cameras
+> **⚠️ HTTPS is required.** The Vite dev server uses the same self-signed certificate from `.certs/`. Your browser will show a certificate warning on first load — click "Advanced → Proceed" to accept it. You only need to do this once per certificate rotation (every 13 days).
 
-To stream from real IP cameras instead of local files:
+The client auto-detects available streams and begins playing.
+
+## Running on a Remote Machine (LAN / server access)
+
+When the bridge server and Vite run on a different machine than the browser, set the `HOST` env var to the machine's IP address (or hostname). This ensures:
+1. The TLS certificate SAN covers the remote host (required by Chrome's WebTransport)
+2. The Vite dev server binds to all interfaces instead of just localhost
+
+**On the server:**
+
 ```bash
-RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bridge
+# Replace 192.168.1.100 with your server's IP or hostname
+export HOST=192.168.1.100
+
+# Start bridge server (generates cert with SAN for 192.168.1.100)
+SOURCE_MODE=local HOST=$HOST npm run bridge:local
+
+# In a second terminal — start Vite dev server
+HOST=$HOST npm run dev
 ```
+
+**On the client machine**, open:
+```
+https://192.168.1.100:5173
+```
+
+Accept the certificate warning on first load. Both REST API calls and WebSocket streaming are proxied through the Vite server, so you only need to accept one certificate.
+
+> **Note for Chrome/Edge (WebTransport):** The WebTransport connection goes directly to `https://192.168.1.100:9001`. Make sure port `9001/UDP` is reachable from the client (not firewalled).
+>
+> **Note for Safari/Firefox (WebSocket fallback):** All traffic goes through the Vite proxy on port `5173`. Only port `5173/TCP` needs to be reachable.
+
+### RTSP cameras (remote)
+
+```bash
+HOST=192.168.1.100 RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bridge
+HOST=192.168.1.100 npm run dev
+```
+
+## Certificate Trust
+
+This prototype uses self-signed ECDSA P-256 certificates (13-day validity, required by Chrome's WebTransport spec). There are two trust steps:
+
+| Step | What to do | Frequency |
+|------|-----------|-----------|
+| **Vite HTTPS page** | Click "Advanced → Proceed to …" in browser | Once per cert rotation |
+| **WebTransport (Chrome/Edge only)** | Uses certificate hash pinning — no manual trust needed | Automatic |
+
+The bridge server must be started **before** `npm run dev` so the certificate exists when Vite reads it from `.certs/`.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SOURCE_MODE` | `auto` | `local` = scan VIDEO_DIR for MP4s, `rtsp` = probe RTSP URLs, `auto` = try local first, fall back to RTSP |
+| `HOST` | `localhost` | Hostname or IP for the bridge server. Included in the TLS certificate SAN and used as the WebTransport URL sent to clients. Set to your machine's LAN IP for remote access. |
+| `SOURCE_MODE` | `auto` | `local` = scan VIDEO_DIR for MP4s, `rtsp` = probe RTSP URLs, `auto` = try local first |
 | `VIDEO_DIR` | `<project>/test-videos` | Directory to scan for local MP4 files |
-| `RTSP_BASE_URL` | *(IP camera URL)* | RTSP base URL for RTSP mode |
+| `RTSP_BASE_URL` | *(required for rtsp mode)* | RTSP URL for IP camera |
 | `BRIDGE_PORT` | `9000` | HTTP REST API port |
-| `WT_PORT` | `9001` | WebTransport (HTTP/3) port |
+| `WT_PORT` | `9001` | WebTransport (HTTP/3 QUIC) port |
+
+## Browser Transport Support
+
+| Browser | Transport | Notes |
+|---------|-----------|-------|
+| Chrome 113+ | WebTransport (HTTP/3) | Best performance — multiplexed QUIC streams |
+| Edge 113+ | WebTransport (HTTP/3) | Same as Chrome |
+| Safari 17+ | WebSocket (WSS) | Automatic fallback via Vite proxy |
+| Firefox 113+ | WebSocket (WSS) | Automatic fallback via Vite proxy |
+
+No configuration is needed — the client detects `typeof WebTransport` and selects the best available transport automatically.
+
+## REST API
+
+The REST API runs on `http://localhost:9000` (plain HTTP, proxied through Vite as `/api/*`).
+
+```bash
+# List available streams
+curl http://localhost:9000/streams
+
+# Add a stream manually
+curl -X POST http://localhost:9000/streams -H 'Content-Type: application/json' \
+  -d '{"filePath": "/path/to/test-videos/BigBuckBunny.mp4"}'
+
+# Add an RTSP stream
+curl -X POST http://localhost:9000/streams -H 'Content-Type: application/json' \
+  -d '{"rtspUrl": "rtsp://user:pass@camera-ip:554/stream"}'
+
+# Remove a stream
+curl -X DELETE http://localhost:9000/streams/1
+
+# Health check
+curl http://localhost:9000/health
+```
 
 ## Usage
 
@@ -112,20 +187,15 @@ RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bri
 - **Benchmark**: Click "Run Benchmark" to auto-test stream scaling limits
 - **Export**: Click "Export Metrics" to download performance data as JSON
 
-## Stopping Everything
-
-```bash
-# Stop bridge server and client dev server
-# Ctrl+C in their respective terminals
-```
-
 ## Project Layout
 
 ```
 ├── bridge-server/          # Node.js bridge (file/RTSP → WebSocket/WebTransport)
 │   ├── src/
 │   │   ├── index.ts            # HTTP + WebTransport server, stream discovery
+│   │   ├── cert-utils.ts       # Self-signed TLS certificate generation
 │   │   ├── stream-manager.ts   # Stream lifecycle + access unit packaging
+│   │   ├── ws-handler.ts       # WebSocket server (Safari/Firefox fallback)
 │   │   ├── ffmpeg-source.ts    # Abstract base: FFmpeg process + NAL parsing
 │   │   ├── rtsp-client.ts      # RTSP source (extends FFmpegSource)
 │   │   ├── local-file-source.ts # Local MP4 source (extends FFmpegSource)
@@ -136,6 +206,7 @@ RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bri
 │   │   ├── main.ts             # App controller, CSS grid management
 │   │   ├── stream/
 │   │   │   ├── wt-receiver.ts      # WebTransport client + binary protocol parser
+│   │   │   ├── ws-receiver.ts      # WebSocket fallback (Safari/Firefox)
 │   │   │   ├── stream-pipeline.ts  # Per-stream decode pipeline
 │   │   │   ├── h264-demuxer.ts     # Annex B → EncodedVideoChunk
 │   │   │   └── decoder.ts         # VideoDecoder wrapper with backpressure + auto-recovery
@@ -143,6 +214,9 @@ RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bri
 │   │   │   ├── stream-tile.ts     # Per-stream canvas + label overlay (Canvas2D)
 │   │   │   ├── gpu-renderer.ts    # WebGPU renderer (partial, not yet active)
 │   │   │   └── shaders.wgsl       # WGSL vertex/fragment shaders for WebGPU
+│   │   ├── worker/
+│   │   │   ├── stream-worker.ts   # Web Worker: transport → decode → render pipeline
+│   │   │   └── messages.ts        # Main ↔ worker message types
 │   │   ├── perf/
 │   │   │   ├── metrics-collector.ts
 │   │   │   ├── dashboard.ts
@@ -150,10 +224,15 @@ RTSP_BASE_URL=rtsp://user:pass@camera-ip:554/stream SOURCE_MODE=rtsp npm run bri
 │   │   └── ui/
 │   │       ├── controls.ts
 │   │       └── styles.css
+│   ├── vite.config.ts          # HTTPS + proxy config
 │   └── tests/
+├── .certs/                 # Auto-generated TLS certificates (gitignored)
+│   ├── cert.pem                # Self-signed ECDSA P-256 certificate
+│   └── key.pem                 # Private key
 ├── scripts/
 │   ├── setup-test-env.sh       # One-time setup (download test videos)
 │   └── serve-local.sh          # Start bridge in local file mode
+├── test-videos/            # Downloaded test videos (gitignored)
 ├── CLAUDE.md               # AI assistant context
 └── package.json            # Monorepo root (npm workspaces)
 ```
