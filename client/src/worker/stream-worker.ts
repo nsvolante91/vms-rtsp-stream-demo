@@ -16,6 +16,7 @@ import { WTReceiver } from '../stream/wt-receiver';
 import { WSReceiver } from '../stream/ws-receiver';
 import { StreamPipeline } from '../stream/stream-pipeline';
 import type { StreamReceiver } from '../stream/stream-pipeline';
+import { DecodeScheduler } from './decode-scheduler';
 import {
   OffscreenRenderer,
   initWorkerGPU,
@@ -36,6 +37,9 @@ const log = new Logger('StreamWorker');
 let receiver: StreamReceiver | null = null;
 let workerGPU: WorkerGPU | null = null;
 let gpuFailReason: GPUFailReason | null = null;
+
+/** Global decode scheduler — throttles FPS to stay within hardware decode budget */
+const scheduler = new DecodeScheduler();
 
 interface StreamEntry {
   pipeline: StreamPipeline | null;
@@ -72,22 +76,42 @@ let rafScheduled = false;
 /** Count of frames superseded in pendingFrames before rAF (render-dropped) */
 let renderDroppedFrames = 0;
 
-/** Batch-render all pending frames in a single rAF callback.
- *  Collects GPUCommandBuffers from all streams and submits once.
+/**
+ * Maximum number of streams to render per rAF tick.
+ * Rendering all 16 4K streams in a single rAF callback can exceed the
+ * vsync budget (16ms). Staggering across multiple rAF ticks keeps the
+ * GPU responsive and prevents long blocking on device.queue.submit().
+ */
+const MAX_RENDERS_PER_RAF = 6;
+
+/** Batch-render pending frames in a staggered rAF callback.
+ *  Renders up to MAX_RENDERS_PER_RAF streams per vsync, cycling
+ *  through all pending streams via Map insertion order (rendered keys
+ *  are deleted and re-added at the end on their next queueFrame, so
+ *  unrendered streams get priority next tick).
  *  Frames are closed AFTER submit because GPUExternalTexture references
  *  the VideoFrame data and becomes invalid if closed before submit. */
 function renderLoop(): void {
   rafScheduled = false;
 
-  // Skip GPU busy gate — at 4K 60fps, onSubmittedWorkDone latency can
-  // exceed a full vsync interval, causing multi-frame stalls. WebGPU
-  // already pipelines command buffers internally; submitting while the
-  // previous batch is in-flight is safe and keeps the GPU fed.
-  // Tearing is prevented by the browser's compositor, not by our gating.
+  const pendingIds = Array.from(pendingFrames.keys());
+  const total = pendingIds.length;
+
+  if (total === 0) return;
+
+  // If few enough streams, render all; otherwise stagger
+  const batch = total <= MAX_RENDERS_PER_RAF
+    ? pendingIds
+    : pendingIds.slice(0, MAX_RENDERS_PER_RAF);
 
   const cmdBuffers: GPUCommandBuffer[] = [];
   const framesToClose: VideoFrame[] = [];
-  for (const [streamId, frame] of pendingFrames) {
+
+  for (const streamId of batch) {
+    const frame = pendingFrames.get(streamId);
+    if (!frame) continue;
+    pendingFrames.delete(streamId);
+
     const entry = streams.get(streamId);
     if (entry) {
       try {
@@ -97,17 +121,21 @@ function renderLoop(): void {
         }
       } catch { /* frame will still be closed below */ }
     }
-    // Always close the frame after encoding (whether it succeeded or not)
     framesToClose.push(frame);
   }
-  pendingFrames.clear();
-  // Single batched GPU submit for all streams
+
+  // Single batched GPU submit for this batch
   if (cmdBuffers.length > 0 && workerGPU) {
     workerGPU.device.queue.submit(cmdBuffers);
   }
   // Close all frames AFTER submit to keep GPUExternalTextures valid
   for (const frame of framesToClose) {
     try { frame.close(); } catch { /* already closed */ }
+  }
+
+  // If there are still pending frames from other streams, schedule another rAF
+  if (pendingFrames.size > 0) {
+    scheduleRender();
   }
 }
 
@@ -120,10 +148,31 @@ function scheduleRender(): void {
 }
 
 /** Queue a decoded frame for rendering on the next rAF tick */
+/**
+ * Maximum frame age in microseconds. Frames older than this threshold
+ * relative to the newest frame for the same stream are closed immediately
+ * to prevent stale frame buildup during decode recovery periods.
+ */
+const MAX_FRAME_AGE_US = 500_000;
+
+/** Track the newest timestamp per stream for frame age comparison */
+const newestTimestamp = new Map<number, number>();
+
 function queueFrame(streamId: number, frame: VideoFrame): void {
   // If stream is paused, close the frame immediately to prevent GPU memory buildup
   if (pausedStreams.has(streamId)) {
     frame.close();
+    return;
+  }
+
+  // Frame age limiting: drop frames that are too old relative to the newest
+  const ts = frame.timestamp;
+  const newest = newestTimestamp.get(streamId) ?? 0;
+  if (ts > newest) {
+    newestTimestamp.set(streamId, ts);
+  } else if (newest - ts > MAX_FRAME_AGE_US) {
+    frame.close();
+    renderDroppedFrames++;
     return;
   }
 
@@ -245,6 +294,17 @@ function startMetricsReporter(): void {
     }
     postMsg({ type: 'metrics', streams: updates });
     renderDroppedFrames = 0;
+
+    // Log scheduler diagnostics periodically
+    const diag = scheduler.diagnostics;
+    if (diag.streamCount > 0 && diag.budgetUtilization > 0.5) {
+      log.info(
+        `Scheduler: ${diag.streamCount} streams, ` +
+        `${(diag.totalPixelsPerSec / 1e9).toFixed(2)}B px/s demand, ` +
+        `${(diag.budgetUtilization * 100).toFixed(0)}% util, ` +
+        `targets: [${diag.streamTargets.map(s => `s${s.streamId}:${s.targetFps}fps(-${s.skippedFrames})`).join(', ')}]`
+      );
+    }
   }, 1000);
 }
 
@@ -258,8 +318,15 @@ function stopMetricsReporter(): void {
 
 // ─── Message Handlers ──────────────────────────────────────────
 
-async function handleInit(wtUrl: string, certHashUrl: string, wsUrl: string, gpuPowerPreference?: GPUPowerPreference): Promise<void> {
+async function handleInit(wtUrl: string, certHashUrl: string, wsUrl: string, gpuPowerPreference?: GPUPowerPreference, workerCount?: number): Promise<void> {
   log.info('Initializing worker pipeline...');
+
+  // Set decode budget based on how many workers share the hardware decoder
+  if (workerCount && workerCount > 1) {
+    const perWorkerBudget = 2_000_000_000 / workerCount;
+    scheduler.setBudget(perWorkerBudget);
+    log.info(`Decode budget: ${(perWorkerBudget / 1e9).toFixed(2)}B px/s (1/${workerCount} of total)`);
+  }
 
   // 1. WebGPU (optional — Canvas2D fallback used if unavailable)
   const gpuResult = await initWorkerGPU(handleDeviceLost, gpuPowerPreference);
@@ -352,6 +419,14 @@ function handleAddStream(
       postMsg({ type: 'error', streamId, message: error.message });
     }
   );
+
+  // Wire decode throttle callbacks for global FPS coordination
+  pipeline.setThrottleCallbacks(
+    (sid) => scheduler.shouldDecodeDelta(sid),
+    (sid) => scheduler.recordKeyframe(sid),
+    (sid, w, h, fps) => scheduler.registerStream(sid, w, h, fps),
+  );
+
   pipeline.start();
 
   streams.set(streamId, { pipeline, renderer });
@@ -377,7 +452,9 @@ function handleRemoveStream(streamId: number): void {
   entry.renderer.destroy();
   streams.delete(streamId);
   lastDecodedFrames.delete(streamId);
+  newestTimestamp.delete(streamId);
   pausedStreams.delete(streamId);
+  scheduler.unregisterStream(streamId);
   // Close any pending frame for this stream
   const pending = pendingFrames.get(streamId);
   if (pending) {
@@ -425,7 +502,7 @@ self.onmessage = (e: MessageEvent<MainToWorkerMessage>) => {
 
   switch (msg.type) {
     case 'init':
-      handleInit(msg.wtUrl, msg.certHashUrl, msg.wsUrl, msg.gpuPowerPreference).catch((err) => {
+      handleInit(msg.wtUrl, msg.certHashUrl, msg.wsUrl, msg.gpuPowerPreference, msg.workerCount).catch((err) => {
         log.error('Init failed', err);
         postMsg({ type: 'error', message: `Init failed: ${err}` });
       });

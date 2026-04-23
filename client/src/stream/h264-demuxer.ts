@@ -570,6 +570,10 @@ export class H264Demuxer {
         this.bitDepthChromaMinus8 = info.bitDepthChromaMinus8;
         this._fps = info.fps;
         this.codec = buildCodecString(newSps);
+        if (this.width <= 0 || this.height <= 0) {
+          this.log.error(`Invalid SPS dimensions: ${this.width}x${this.height}`);
+          return null;
+        }
         this.log.info(`SPS parsed: ${this.codec}, ${this.width}x${this.height}, chroma=${this.chromaFormatIdc}, fps=${this._fps ?? 'unknown'}`);
       } catch (e) {
         this.log.error('Failed to parse SPS', e);

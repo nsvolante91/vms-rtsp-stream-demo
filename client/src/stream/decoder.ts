@@ -14,12 +14,15 @@ import { getResolutionProfile, type ResolutionProfile, type ResolutionTier } fro
 export type FrameOutputCallback = (frame: VideoFrame) => void;
 
 /** Default thresholds used until resolution is known (HD-tier values) */
-const DEFAULT_NORMAL_THRESHOLD = 3;
-const DEFAULT_SOFT_THRESHOLD = 5;
-const DEFAULT_HARD_THRESHOLD = 8;
+const DEFAULT_NORMAL_THRESHOLD = 4;
+const DEFAULT_SOFT_THRESHOLD = 7;
+const DEFAULT_HARD_THRESHOLD = 12;
 
 /** Minimum interval between recovery attempts in milliseconds */
 const RECOVERY_COOLDOWN_MS = 1000;
+
+/** Maximum consecutive decode errors before giving up on current config */
+const MAX_CONSECUTIVE_ERRORS = 5;
 
 /**
  * VideoDecoder wrapper that manages decoding lifecycle, backpressure,
@@ -32,14 +35,19 @@ const RECOVERY_COOLDOWN_MS = 1000;
 export class VideoStreamDecoder {
   private decoder: VideoDecoder | null = null;
   private config: VideoDecoderConfig | null = null;
+  /** Cached fps from last configure() call so recovery uses correct thresholds */
+  private _fps = 0;
   private _droppedFrames = 0;
   private _decodedFrames = 0;
   private _lastDecodeTime = 0;
   private _waitingForKeyframe = true;
   private _lastRecoveryTime = 0;
-  private _softwareFallback = false;
   /** Previous queue size for tracking derivative (proactive dropping) */
   private _prevQueueSize = 0;
+  /** Consecutive decode errors for escalating recovery */
+  private _consecutiveErrors = 0;
+  /** Whether this decoder has fallen back to software decode */
+  private _usingSoftwareFallback = false;
   private readonly log: Logger;
 
   // ── Resolution-adaptive thresholds ─────────────────────────
@@ -109,9 +117,13 @@ export class VideoStreamDecoder {
       this.log.info(`avcC description: ${desc.length} bytes, hex=${Array.from(desc.subarray(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')}...`);
     }
 
-    // Check isConfigSupported asynchronously (non-blocking diagnostic)
+    // Check isConfigSupported — if hardware is unsupported, fall back to software immediately
     VideoDecoder.isConfigSupported(config).then(result => {
-      this.log.info(`isConfigSupported: ${result.supported}`);
+      if (!result.supported && !this._usingSoftwareFallback) {
+        this.log.warn(`Config not supported (${config.codec} ${config.codedWidth}x${config.codedHeight} hw=${config.hardwareAcceleration}) — retrying with software decode`);
+        this._usingSoftwareFallback = true;
+        this.configure({ ...config, hardwareAcceleration: 'prefer-software' }, fps);
+      }
     }).catch(err => {
       this.log.error('isConfigSupported error', err);
     });
@@ -125,25 +137,15 @@ export class VideoStreamDecoder {
     }
 
     this.config = config;
+    this._fps = fps;
     this._waitingForKeyframe = true;
-    this._softwareFallback = false;
 
     this.decoder = new VideoDecoder({
       output: (frame: VideoFrame) => this.handleDecoderOutput(frame),
       error: (error: DOMException) => {
-        this.log.error('Decoder error', error);
-        // On first error, try software decoding before reporting to pipeline
-        if (!this._softwareFallback && this.config) {
-          this._softwareFallback = true;
-          this.log.info('Hardware decode failed, trying software fallback...');
-          try {
-            const swConfig = { ...this.config, hardwareAcceleration: 'prefer-software' as HardwareAcceleration };
-            this.configureDirect(swConfig);
-            return;
-          } catch (e) {
-            this.log.error('Software fallback configure failed', e);
-          }
-        }
+        this.log.error(`Decoder error (${config.codec} ${config.codedWidth}x${config.codedHeight} hw=${config.hardwareAcceleration}):`, error);
+        this._consecutiveErrors++;
+
         this.onError(new Error(`Decoder error: ${error.message}`));
         this.recoverFromError();
       },
@@ -155,6 +157,7 @@ export class VideoStreamDecoder {
   /** Shared output handler for decoded VideoFrames. */
   private handleDecoderOutput(frame: VideoFrame): void {
     this._decodedFrames++;
+    this._consecutiveErrors = 0; // successful decode resets error counter
     this._lastDecodeTime = performance.now();
     // Record decode time from oldest pending submit
     if (this._decodeSubmitTimes.length > 0) {
@@ -173,35 +176,6 @@ export class VideoStreamDecoder {
     } catch {
       try { frame.close(); } catch { /* already closed */ }
     }
-  }
-
-  /**
-   * Direct configure without diagnostics (used by software fallback).
-   */
-  private configureDirect(config: VideoDecoderConfig): void {
-    this.log.info(`Configuring decoder (fallback): ${config.codec} ${config.codedWidth}x${config.codedHeight} hw=${config.hardwareAcceleration}`);
-
-    if (this.decoder) {
-      try {
-        this.decoder.close();
-      } catch {
-        // Ignore
-      }
-    }
-
-    this.config = config;
-    this._waitingForKeyframe = true;
-
-    this.decoder = new VideoDecoder({
-      output: (frame: VideoFrame) => this.handleDecoderOutput(frame),
-      error: (error: DOMException) => {
-        this.log.error('Decoder error (fallback)', error);
-        this.onError(new Error(`Decoder error: ${error.message}`));
-        this.recoverFromError();
-      },
-    });
-
-    this.decoder.configure(config);
   }
 
   /**
@@ -224,9 +198,20 @@ export class VideoStreamDecoder {
     }
     this._lastRecoveryTime = now;
 
-    this.log.info('Attempting decoder recovery...');
+    // Escalating recovery: after persistent hardware failures, fall back to
+    // software decode for this stream. WebCodecs software decode is still
+    // async (runs on browser-internal threads), so it won't block the worker.
+    // Only 1-2 streams typically need this; the rest stay on hardware.
+    let recoveryConfig = this.config;
+    if (this._consecutiveErrors >= MAX_CONSECUTIVE_ERRORS && !this._usingSoftwareFallback) {
+      this.log.warn(`${this._consecutiveErrors} consecutive errors — falling back to software decode`);
+      this._usingSoftwareFallback = true;
+      recoveryConfig = { ...this.config, hardwareAcceleration: 'prefer-software' };
+    }
+
+    this.log.info(`Attempting decoder recovery (${this._usingSoftwareFallback ? 'software' : 'hardware'})...`);
     try {
-      this.configure(this.config);
+      this.configure(recoveryConfig, this._fps);
       this.log.info('Decoder recovered, waiting for next keyframe');
     } catch (e) {
       this.log.error('Recovery failed', e);

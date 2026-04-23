@@ -243,7 +243,7 @@ async function discoverStreams(): Promise<void> {
   for (let i = 1; i <= MAX_DISCOVER_STREAMS; i++) {
     const url = `${RTSP_BASE_URL}/stream${i}`;
     probePromises.push(
-      probeRTSPStream(url, 5000).then((available) => ({
+      probeRTSPStream(url, 8000).then((available) => ({
         index: i,
         available,
       }))
@@ -252,10 +252,48 @@ async function discoverStreams(): Promise<void> {
 
   const results = await Promise.all(probePromises);
   const available = results.filter((r) => r.available);
+  let failed = results.filter((r) => !r.available);
 
   console.log(
     `[Discovery] Found ${available.length} active stream(s): ${available.map((r) => `stream${r.index}`).join(', ') || 'none'}`
   );
+
+  // Retry failed streams with exponential backoff (useful when FFmpeg
+  // publishers haven't finished registering with MediaMTX yet)
+  const retryDelays = [3000, 6000, 12000];
+  for (let attempt = 0; attempt < retryDelays.length && failed.length > 0; attempt++) {
+    console.log(
+      `[Discovery] Retrying ${failed.length} stream(s) in ${retryDelays[attempt] / 1000}s: ` +
+      failed.map((r) => `stream${r.index}`).join(', ')
+    );
+    await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
+
+    const retryPromises = failed.map((r) => {
+      const url = `${RTSP_BASE_URL}/stream${r.index}`;
+      return probeRTSPStream(url, 8000).then((avail) => ({
+        index: r.index,
+        available: avail,
+      }));
+    });
+    const retryResults = await Promise.all(retryPromises);
+    const newlyAvailable = retryResults.filter((r) => r.available);
+    failed = retryResults.filter((r) => !r.available);
+
+    if (newlyAvailable.length > 0) {
+      console.log(
+        `[Discovery] Retry ${attempt + 1}: found ${newlyAvailable.length} stream(s): ` +
+        newlyAvailable.map((r) => `stream${r.index}`).join(', ')
+      );
+      available.push(...newlyAvailable);
+    }
+  }
+
+  if (failed.length > 0) {
+    console.log(
+      `[Discovery] Gave up on ${failed.length} stream(s) after retries: ` +
+      failed.map((r) => `stream${r.index}`).join(', ')
+    );
+  }
 
   for (const result of available) {
     const url = `${RTSP_BASE_URL}/stream${result.index}`;

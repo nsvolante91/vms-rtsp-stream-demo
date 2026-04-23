@@ -30,9 +30,9 @@ export interface ResolutionProfile {
 
 /** Base thresholds per resolution tier (calibrated for 30 fps) */
 const BASE_PROFILES = {
-  uhd: { normalThreshold: 4, softThreshold: 6, hardThreshold: 10, maxJitterCorrectionUs: 25_000, hardwareAcceleration: 'prefer-hardware' as HardwareAcceleration },
-  hd:  { normalThreshold: 3, softThreshold: 5, hardThreshold: 8,  maxJitterCorrectionUs: 20_000, hardwareAcceleration: 'no-preference' as HardwareAcceleration },
-  sd:  { normalThreshold: 2, softThreshold: 3, hardThreshold: 5,  maxJitterCorrectionUs: 10_000, hardwareAcceleration: 'no-preference' as HardwareAcceleration },
+  uhd: { normalThreshold: 4,  softThreshold: 6,  hardThreshold: 10, maxJitterCorrectionUs: 25_000, hardwareAcceleration: 'prefer-hardware' as HardwareAcceleration },
+  hd:  { normalThreshold: 3,  softThreshold: 5,  hardThreshold: 8,  maxJitterCorrectionUs: 20_000, hardwareAcceleration: 'prefer-hardware' as HardwareAcceleration },
+  sd:  { normalThreshold: 2,  softThreshold: 3,  hardThreshold: 5,  maxJitterCorrectionUs: 10_000, hardwareAcceleration: 'prefer-hardware' as HardwareAcceleration },
 } as const;
 
 /**
@@ -63,9 +63,11 @@ export function getResolutionProfile(width: number, height: number, fps = 0): Re
   }
 
   const base = BASE_PROFILES[tier];
-  // Scale by fps relative to 30 fps baseline; clamp minimum at 0.8
+  // Scale by fps relative to 30 fps baseline; clamp to [0.8, 1.5] to prevent
+  // excessive queue depth at high fps (13 concurrent 4K@60fps streams can
+  // saturate the hardware decoder if thresholds are too generous).
   const effectiveFps = fps > 0 ? fps : 30;
-  const scale = Math.max(0.8, effectiveFps / 30);
+  const scale = Math.max(0.8, Math.min(1.5, effectiveFps / 30));
 
   return {
     tier,

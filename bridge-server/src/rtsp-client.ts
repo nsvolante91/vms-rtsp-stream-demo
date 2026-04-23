@@ -208,14 +208,14 @@ export class RTSPClient extends EventEmitter {
         this.emit('close');
       });
 
-      // Timeout if FFmpeg doesn't produce output within 10 seconds
+      // Timeout if FFmpeg doesn't produce output within 15 seconds
       connectTimeout = setTimeout(() => {
         if (!resolved) {
           resolved = true;
           this.close();
           reject(new Error(`FFmpeg timed out connecting to ${this.rtspUrl}`));
         }
-      }, 10000);
+      }, 15000);
     });
   }
 

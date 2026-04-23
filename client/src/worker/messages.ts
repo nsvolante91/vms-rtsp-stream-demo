@@ -18,6 +18,8 @@ export interface InitMessage {
   certHashUrl: string;
   /** GPU adapter power preference (defaults to 'high-performance' if absent) */
   gpuPowerPreference?: GPUPowerPreference;
+  /** Total number of workers sharing the hardware decoder (for budget division) */
+  workerCount?: number;
 }
 
 /** Add a stream: transfer an OffscreenCanvas and start decode+render */

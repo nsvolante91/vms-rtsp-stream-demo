@@ -83,8 +83,13 @@ interface WorkerStreamMetrics {
  * Main thread only handles DOM manipulation and UI events.
  */
 class VMSApp {
-  private worker: Worker | null = null;
-  private workerReady = false;
+  /** Number of decode workers sharing the hardware video decoder */
+  private static readonly WORKER_COUNT = 4;
+
+  private readonly workers: Worker[] = [];
+  private workersReady = false;
+  private readonly streamToWorkerIndex: Map<number, number> = new Map();
+  private nextWorkerRR = 0; // round-robin counter for stream assignment
   private readonly streams: Map<number, StreamEntry> = new Map();
   private readonly workerMetrics: Map<number, WorkerStreamMetrics> = new Map();
   private readonly metrics: MetricsCollector;
@@ -154,9 +159,9 @@ class VMSApp {
       return;
     }
 
-    // Spawn worker and wait for WebTransport connection
+    // Spawn workers and wait for transport connections
     try {
-      await this.initWorker();
+      await this.initWorkers();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.showError(`Connection failed: ${msg}`);
@@ -183,7 +188,7 @@ class VMSApp {
           log.warn(`Upscale mode "${mode}" too heavy for mobile — ignoring`);
           return;
         }
-        this.postWorker({ type: 'setUpscale', mode });
+        this.postToAllWorkers({ type: 'setUpscale', mode });
       },
       () => this.toggleMetricsOverlay(),
       () => this.resetMetrics(),
@@ -224,57 +229,65 @@ class VMSApp {
   }
 
   /**
-   * Spawn the stream worker and wait for WebTransport connection.
+   * Spawn N stream workers and wait for all transport connections.
    */
-  private initWorker(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      this.worker = new Worker(
+  private async initWorkers(): Promise<void> {
+    const workerCount = VMSApp.WORKER_COUNT;
+    const promises: Promise<void>[] = [];
+
+    for (let i = 0; i < workerCount; i++) {
+      const worker = new Worker(
         new URL('./worker/stream-worker.ts', import.meta.url),
         { type: 'module' }
       );
+      this.workers.push(worker);
 
-      const onMessage = (e: MessageEvent<WorkerToMainMessage>) => {
-        const msg = e.data;
-        if (msg.type === 'connected') {
-          this.workerReady = true;
-          log.info(`Worker connected via ${msg.transport}`);
-          resolve();
-        } else if (msg.type === 'error') {
-          log.error(`Worker init error: ${msg.message}`);
-          reject(new Error(msg.message));
-        }
-      };
+      const promise = new Promise<void>((resolve, reject) => {
+        const onMessage = (e: MessageEvent<WorkerToMainMessage>) => {
+          const msg = e.data;
+          if (msg.type === 'connected') {
+            log.info(`Worker ${i} connected via ${msg.transport}`);
+            resolve();
+          } else if (msg.type === 'error') {
+            log.error(`Worker ${i} init error: ${msg.message}`);
+            reject(new Error(msg.message));
+          }
+        };
 
-      // Temporary handler for init phase
-      this.worker.addEventListener('message', onMessage);
-      this.worker.addEventListener('error', (err) => {
-        log.error('Worker error', err);
-        reject(new Error('Worker failed to load'));
-      }, { once: true });
+        worker.addEventListener('message', onMessage);
+        worker.addEventListener('error', (err) => {
+          log.error(`Worker ${i} error`, err);
+          reject(new Error(`Worker ${i} failed to load`));
+        }, { once: true });
 
-      // Switch to the steady-state handler after init completes
-      const initDone = () => {
-        this.worker?.removeEventListener('message', onMessage);
-        this.worker?.addEventListener('message', (e: MessageEvent<WorkerToMainMessage>) => {
-          this.handleWorkerMessage(e.data);
-        });
-      };
+        // Switch to steady-state handler after init
+        const origResolve = resolve;
+        const origReject = reject;
+        const switchToSteadyState = () => {
+          worker.removeEventListener('message', onMessage);
+          worker.addEventListener('message', (ev: MessageEvent<WorkerToMainMessage>) => {
+            this.handleWorkerMessage(ev.data);
+          });
+        };
+        resolve = (v) => { switchToSteadyState(); origResolve(v); };
+        reject = (e) => { switchToSteadyState(); origReject(e); };
+      });
 
-      // Resolve/reject both trigger switching to steady-state
-      const origResolve = resolve;
-      const origReject = reject;
-      resolve = (v) => { initDone(); origResolve(v); };
-      reject = (e) => { initDone(); origReject(e); };
-
-      // Send init message to worker
-      this.postWorker({
+      worker.postMessage({
         type: 'init',
         wtUrl: WT_URL,
         wsUrl: WS_URL,
         certHashUrl: CERT_HASH_URL,
         gpuPowerPreference: this.deviceProfile.gpuPowerPreference,
+        workerCount,
       });
-    });
+
+      promises.push(promise);
+    }
+
+    await Promise.all(promises);
+    this.workersReady = true;
+    log.info(`All ${workerCount} workers initialized`);
   }
 
   /**
@@ -284,7 +297,7 @@ class VMSApp {
     switch (msg.type) {
       case 'connected':
         // Reconnection
-        this.workerReady = true;
+        this.workersReady = true;
         log.info(`Worker reconnected via ${msg.transport}`);
         break;
 
@@ -349,18 +362,40 @@ class VMSApp {
   }
 
   /**
-   * Post a message to the worker with proper typing.
+   * Post a message to a specific worker by index.
    */
-  private postWorker(msg: MainToWorkerMessage, transfer?: Transferable[]): void {
-    if (!this.worker) {
-      log.warn('Worker not available');
+  private postToWorker(workerIndex: number, msg: MainToWorkerMessage, transfer?: Transferable[]): void {
+    const worker = this.workers[workerIndex];
+    if (!worker) {
+      log.warn(`Worker ${workerIndex} not available`);
       return;
     }
     if (transfer) {
-      this.worker.postMessage(msg, transfer);
+      worker.postMessage(msg, transfer);
     } else {
-      this.worker.postMessage(msg);
+      worker.postMessage(msg);
     }
+  }
+
+  /**
+   * Post a message to all workers (broadcast).
+   */
+  private postToAllWorkers(msg: MainToWorkerMessage): void {
+    for (const worker of this.workers) {
+      worker.postMessage(msg);
+    }
+  }
+
+  /**
+   * Post a message to the worker that owns a specific stream.
+   */
+  private postToStreamWorker(streamId: number, msg: MainToWorkerMessage, transfer?: Transferable[]): void {
+    const workerIndex = this.streamToWorkerIndex.get(streamId);
+    if (workerIndex === undefined) {
+      log.warn(`No worker assigned for stream ${streamId}`);
+      return;
+    }
+    this.postToWorker(workerIndex, msg, transfer);
   }
 
   /**
@@ -371,7 +406,7 @@ class VMSApp {
    * decode+render for this stream.
    */
   async addStream(): Promise<void> {
-    if (!this.workerReady || !this.gridContainer) {
+    if (!this.workersReady || !this.gridContainer) {
       log.warn('Not ready to add stream');
       return;
     }
@@ -406,27 +441,33 @@ class VMSApp {
 
     // Register resize callback to notify worker
     tile.onResize((w, h) => {
-      this.postWorker({ type: 'resize', streamId, width: w, height: h });
+      this.postToStreamWorker(streamId, { type: 'resize', streamId, width: w, height: h });
     });
 
     // Register zoom callback
     tile.onZoom((sid, crop) => {
-      this.postWorker({ type: 'setZoom', streamId: sid, crop });
+      this.postToStreamWorker(sid, { type: 'setZoom', streamId: sid, crop });
       // Sync zoom to companion tile if in comparison mode
       const companion = this.companions.get(sid);
       if (companion) {
-        this.postWorker({ type: 'setZoom', streamId: companion.companionId, crop });
+        this.postToStreamWorker(companion.companionId, { type: 'setZoom', streamId: companion.companionId, crop });
         companion.tile.setZoomExternal(crop);
       }
     });
 
     // Register pause callback
     tile.onPause((sid, paused) => {
-      this.postWorker({ type: 'pauseStream', streamId: sid, paused });
+      this.postToStreamWorker(sid, { type: 'pauseStream', streamId: sid, paused });
     });
 
+    // Assign stream to a worker via round-robin
+    const workerIndex = this.nextWorkerRR % this.workers.length;
+    this.nextWorkerRR++;
+    this.streamToWorkerIndex.set(streamId, workerIndex);
+
     // Tell the worker to start decode+render for this stream
-    this.postWorker(
+    this.postToWorker(
+      workerIndex,
       { type: 'addStream', streamId, canvas, width, height },
       [canvas]
     );
@@ -462,10 +503,11 @@ class VMSApp {
       // Remove companion first if it exists
       this.removeCompanionForStream(removeId);
 
-      this.postWorker({ type: 'removeStream', streamId: removeId });
+      this.postToStreamWorker(removeId, { type: 'removeStream', streamId: removeId });
       entry.overlay.destroy();
       entry.tile.destroy();
       this.streams.delete(removeId);
+      this.streamToWorkerIndex.delete(removeId);
       this.workerMetrics.delete(removeId);
       this.metrics.removeStream(removeId);
     }
@@ -484,13 +526,14 @@ class VMSApp {
   removeAllStreams(): void {
     for (const [streamId, entry] of this.streams) {
       this.removeCompanionForStream(streamId);
-      this.postWorker({ type: 'removeStream', streamId });
+      this.postToStreamWorker(streamId, { type: 'removeStream', streamId });
       entry.overlay.destroy();
       entry.tile.destroy();
       this.workerMetrics.delete(streamId);
       this.metrics.removeStream(streamId);
     }
     this.streams.clear();
+    this.streamToWorkerIndex.clear();
     this.focusId = null;
     log.info('All streams removed');
   }
@@ -693,7 +736,7 @@ class VMSApp {
    * so it appears on the left in the 2-column grid.
    */
   private addCompanionForStream(primaryId: number): void {
-    if (!this.workerReady || !this.gridContainer) return;
+    if (!this.workersReady || !this.gridContainer) return;
     if (this.companions.has(primaryId)) return;
 
     const companionId = primaryId + VMSApp.COMPANION_ID_OFFSET;
@@ -713,24 +756,31 @@ class VMSApp {
 
     // Register resize callback
     tile.onResize((w, h) => {
-      this.postWorker({ type: 'resize', streamId: companionId, width: w, height: h });
+      this.postToStreamWorker(companionId, { type: 'resize', streamId: companionId, width: w, height: h });
     });
 
     // Register zoom callback — sync zoom to both tiles
     tile.onZoom((sid, crop) => {
-      this.postWorker({ type: 'setZoom', streamId: sid, crop });
+      this.postToStreamWorker(sid, { type: 'setZoom', streamId: sid, crop });
       // Also sync zoom to the primary tile
-      this.postWorker({ type: 'setZoom', streamId: primaryId, crop });
+      this.postToStreamWorker(primaryId, { type: 'setZoom', streamId: primaryId, crop });
       primaryEntry?.tile.setZoomExternal(crop);
     });
 
     // Register pause callback
     tile.onPause((sid, paused) => {
-      this.postWorker({ type: 'pauseStream', streamId: sid, paused });
+      this.postToStreamWorker(sid, { type: 'pauseStream', streamId: sid, paused });
     });
 
+    // Companion lives on the same worker as the primary
+    const primaryWorkerIndex = this.streamToWorkerIndex.get(primaryId);
+    if (primaryWorkerIndex !== undefined) {
+      this.streamToWorkerIndex.set(companionId, primaryWorkerIndex);
+    }
+
     // Tell worker to create companion renderer
-    this.postWorker(
+    this.postToStreamWorker(
+      primaryId,
       { type: 'addCompanion', primaryStreamId: primaryId, companionStreamId: companionId, canvas, width, height },
       [canvas]
     );
@@ -757,9 +807,10 @@ class VMSApp {
     const companion = this.companions.get(primaryId);
     if (!companion) return;
 
-    this.postWorker({ type: 'removeCompanion', companionStreamId: companion.companionId });
+    this.postToStreamWorker(companion.companionId, { type: 'removeCompanion', companionStreamId: companion.companionId });
     companion.overlay.destroy();
     companion.tile.destroy();
+    this.streamToWorkerIndex.delete(companion.companionId);
     this.companions.delete(primaryId);
 
     // Clear the comparison label on the primary tile

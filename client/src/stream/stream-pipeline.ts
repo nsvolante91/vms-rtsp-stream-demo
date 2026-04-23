@@ -67,6 +67,19 @@ export class StreamPipeline {
   /** Timestamp of last bitrate reset */
   private _bytesTimestamp = 0;
 
+  /** Throttle callback: returns false if this delta frame should be skipped */
+  private _shouldDecodeDelta: ((streamId: number) => boolean) | null = null;
+  /** Callback to record a keyframe decode for throttle accounting */
+  private _recordKeyframe: ((streamId: number) => void) | null = null;
+  /** Callback to register stream resolution with throttle scheduler */
+  private _registerWithScheduler: ((streamId: number, width: number, height: number, fps: number) => void) | null = null;
+  /** Total frames throttled by the decode scheduler */
+  private _throttledFrames = 0;
+
+  /** Frames received before config — replayed once decoder is configured */
+  private _preConfigBuffer: ReceivedFrame[] = [];
+  private static readonly MAX_PRE_CONFIG_FRAMES = 5;
+
   /**
    * Create a new StreamPipeline.
    * @param streamId - Numeric stream identifier
@@ -82,6 +95,25 @@ export class StreamPipeline {
   ) {
     this.demuxer = new H264Demuxer();
     this.log = new Logger(`Pipeline[${streamId}]`);
+  }
+
+  /**
+   * Set the decode throttle callbacks for global FPS coordination.
+   * Must be called before start() for throttling to take effect.
+   */
+  setThrottleCallbacks(
+    shouldDecodeDelta: (streamId: number) => boolean,
+    recordKeyframe: (streamId: number) => void,
+    registerWithScheduler: (streamId: number, width: number, height: number, fps: number) => void,
+  ): void {
+    this._shouldDecodeDelta = shouldDecodeDelta;
+    this._recordKeyframe = recordKeyframe;
+    this._registerWithScheduler = registerWithScheduler;
+  }
+
+  /** Total frames skipped by global decode throttle */
+  get throttledFrames(): number {
+    return this._throttledFrames;
   }
 
   /**
@@ -226,6 +258,10 @@ export class StreamPipeline {
       if (config && this.decoder) {
         const fps = this.demuxer.fps ?? 0;
         this.decoder.configure(config, fps);
+        // Register with the global decode scheduler for FPS throttling
+        if (config.codedWidth && config.codedHeight && this._registerWithScheduler) {
+          this._registerWithScheduler(this.streamId, config.codedWidth, config.codedHeight, fps);
+        }
         // Adapt thresholds to the detected resolution and fps
         if (config.codedWidth && config.codedHeight) {
           const fps = this.demuxer.fps ?? 0;
@@ -243,11 +279,24 @@ export class StreamPipeline {
             `discontinuity=${this._discontinuityThresholdUs}µs, intervalWindow=${this._frameIntervalWindow}`
           );
         }
+        // Replay any frames that arrived before config
+        if (this._preConfigBuffer.length > 0) {
+          this.log.info(`Replaying ${this._preConfigBuffer.length} pre-config frame(s)`);
+          const buffered = this._preConfigBuffer;
+          this._preConfigBuffer = [];
+          for (const f of buffered) {
+            this.handleReceivedFrame(f);
+          }
+        }
       }
       return;
     }
 
     if (!this.demuxer.isConfigured || !this.decoder) {
+      // Buffer video frames that arrive before config (up to limit)
+      if (this._preConfigBuffer.length < StreamPipeline.MAX_PRE_CONFIG_FRAMES) {
+        this._preConfigBuffer.push(frame);
+      }
       return;
     }
 
@@ -258,6 +307,15 @@ export class StreamPipeline {
     const smoothedFrame = this.smoothTimestamp(frame);
     const chunk = this.demuxer.createChunk(smoothedFrame);
     if (chunk) {
+      // Throttle delta frames based on global decode budget
+      if (chunk.type === 'key') {
+        // Keyframes always decode — record for accounting
+        this._recordKeyframe?.(this.streamId);
+      } else if (this._shouldDecodeDelta && !this._shouldDecodeDelta(this.streamId)) {
+        // Over FPS budget — skip this delta frame
+        this._throttledFrames++;
+        return;
+      }
       this.decoder.decode(chunk);
     }
   }

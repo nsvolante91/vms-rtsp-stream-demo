@@ -140,6 +140,8 @@ interface ManagedStream {
   auFrameCount: number;
   /** Frame duration in µs — defaults to 33333 (30fps), updated from SPS if available */
   frameDurationUs: bigint;
+  /** Previous SPS bytes for deduplication — only log/resize when SPS actually changes */
+  prevSpsBytes: Buffer | null;
 }
 
 /** Client subscribe/unsubscribe message format */
@@ -265,6 +267,7 @@ export class StreamManager {
       auFilled: 0,
       auFrameCount: 0,
       frameDurationUs: 33333n, // default 30fps, updated from SPS if available
+      prevSpsBytes: null,
     };
 
     this.streams.set(id, managed);
@@ -284,6 +287,18 @@ export class StreamManager {
         : pixels > 921_600 ? 512 * 1024
         : 128 * 1024;
       const targetSize = Math.round(baseSize * fpsScale);
+
+      // Deduplicate: only log and resize when SPS actually changes
+      const spsBytes = managed.spsNALU ? Buffer.from(managed.spsNALU) : null;
+      const spsChanged = !spsBytes || !managed.prevSpsBytes || !spsBytes.equals(managed.prevSpsBytes);
+      if (spsBytes) {
+        managed.prevSpsBytes = spsBytes;
+      }
+
+      if (!spsChanged) {
+        return;
+      }
+
       if (managed.auBuffer.length < targetSize) {
         // Flush any in-progress access unit before resizing to avoid data loss
         if (managed.pendingAU) {
