@@ -243,6 +243,11 @@ export class WTReceiver {
    * Fetches the server's TLS certificate hash for pinning, establishes
    * the WebTransport session, opens the control bidirectional stream,
    * and begins accepting incoming unidirectional video streams.
+   *
+   * Throws on connection failure. The caller can decide whether to retry
+   * (via {@link scheduleReconnect}) or fall back to a different transport
+   * (e.g. WebSocket on Safari where WebTransport is unreliable with
+   * self-signed certs).
    */
   async connect(): Promise<void> {
     this.closing = false;
@@ -280,7 +285,8 @@ export class WTReceiver {
       this.log.info('WebTransport session established');
       this.reconnectAttempt = 0;
 
-      // Monitor session close
+      // Monitor session close — these happen after initial connect,
+      // so they still schedule reconnects (no fallback at this stage)
       this.transport.closed
         .then(() => {
           this.log.warn('WebTransport session closed');
@@ -331,9 +337,7 @@ export class WTReceiver {
       }
       this.transport = null;
       this.controlWriter = null;
-      if (!this.closing) {
-        this.scheduleReconnect();
-      }
+      throw err instanceof Error ? err : new Error(String(err));
     }
   }
 
@@ -562,7 +566,12 @@ export class WTReceiver {
       this.reconnectTimer = null;
       // Reset cert hash to force re-fetch (cert may have been regenerated)
       this.certHash = null;
-      this.connect();
+      // connect() now throws on failure; catch here and schedule the next attempt.
+      this.connect().catch(() => {
+        if (!this.closing) {
+          this.scheduleReconnect();
+        }
+      });
     }, delay);
   }
 }

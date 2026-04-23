@@ -99,25 +99,34 @@ async function handleInit(wtUrl: string, certHashUrl: string, wsUrl: string): Pr
     return;
   }
 
-  // 2. Transport: WebTransport (Chrome/Edge) or WebSocket fallback (Safari/Firefox)
-  if (typeof WebTransport !== 'undefined') {
-    log.info('WebTransport available — using WebTransport');
+  // 2. Transport: try WebTransport first (Chrome/Edge — fastest path).
+  //    Fall back to WebSocket if unavailable OR if the connection fails.
+  //    Safari 17+ exposes the WebTransport API but its implementation is
+  //    unreliable with self-signed certs, so we can't trust feature detection
+  //    alone — we must also catch initial-connect failures and fall back.
+  let useWebSocket = typeof WebTransport === 'undefined';
+
+  if (!useWebSocket) {
+    log.info('WebTransport available — attempting connection');
     const wt = new WTReceiver(wtUrl, certHashUrl);
     try {
       await wt.connect();
+      receiver = wt;
+      log.info('WebTransport connected');
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      log.error('WebTransport connect failed', e);
-      postMsg({ type: 'error', message: `WebTransport connect failed: ${msg}` });
-      return;
+      log.warn(`WebTransport failed (${msg}) — falling back to WebSocket`);
+      wt.close();
+      useWebSocket = true;
     }
-    receiver = wt;
-  } else {
-    log.info('WebTransport not available — falling back to WebSocket');
+  }
+
+  if (useWebSocket) {
+    log.info('Using WebSocket transport');
     const ws = new WSReceiver(wsUrl);
     try {
       await ws.connect();
-    } catch (e) {
+    } catch {
       // WSReceiver schedules reconnects internally; proceed to 'connected' so the
       // main thread can add streams. Frames will arrive once WS reconnects.
       log.warn('WebSocket initial connect failed, will retry automatically');
