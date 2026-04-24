@@ -13,7 +13,7 @@
 import { FFmpegSource, type NALUEvent } from './ffmpeg-source.js';
 import { RTSPClient } from './rtsp-client.js';
 import { LocalFileSource } from './local-file-source.js';
-import { frameLengthPrefixed, readLengthPrefixed, writeLengthPrefixed } from './framing.js';
+import { frameLengthPrefixed, readLengthPrefixed } from './framing.js';
 import {
   isKeyframe,
   isConfigNAL,
@@ -80,8 +80,6 @@ interface WTClient {
   id: number;
   /** The WebTransport session */
   session: any;
-  /** Writer for the control bidirectional stream */
-  controlWriter: WritableStreamDefaultWriter<Uint8Array> | null;
   /**
    * Single shared writer for all video data (one unidirectional QUIC stream).
    *
@@ -288,9 +286,17 @@ export class StreamManager {
   /**
    * Handle a new WebTransport session.
    *
-   * Waits for the session to be ready, reads the first incoming
-   * bidirectional stream as the control channel, and processes
-   * subscribe/unsubscribe commands.
+   * Immediately auto-subscribes the client to all currently available
+   * streams without requiring any client-initiated control stream.
+   *
+   * Safari's WebTransport does not grant QUIC stream credits for
+   * client-initiated streams (neither bidirectional nor unidirectional),
+   * so any approach that requires the client to open a stream hangs.
+   * By pushing video immediately from the server side we avoid the issue
+   * entirely — only server-initiated unidirectional streams are used.
+   *
+   * The client can still optionally send subscribe/unsubscribe messages
+   * via a unidirectional stream if it opens one, but this is not required.
    *
    * @param session - WebTransport session from the Http3Server
    */
@@ -300,7 +306,6 @@ export class StreamManager {
     const client: WTClient = {
       id: clientId,
       session,
-      controlWriter: null,
       videoWriter: null,
       subscribedStreams: new Set(),
       connected: true,
@@ -328,34 +333,19 @@ export class StreamManager {
         this.handleClientDisconnect(clientId);
       });
 
-    // Read incoming bidirectional streams — first one is the control channel
-    try {
-      const biReader = session.incomingBidirectionalStreams.getReader();
-      const { value: controlStream, done } = await biReader.read();
-      biReader.releaseLock();
-
-      if (done || !controlStream) {
-        console.warn(`[WT] Client ${clientId} disconnected before control stream`);
-        this.handleClientDisconnect(clientId);
-        return;
-      }
-
-      client.controlWriter = controlStream.writable.getWriter();
-
-      // Send the list of available streams on connect
-      await this.sendControlMessage(client, {
-        type: 'streams',
-        streams: this.getStreams(),
-      });
-
-      // Process control messages
-      await this.processControlMessages(client, controlStream.readable);
-    } catch (err) {
-      if (client.connected) {
-        console.error(`[WT] Client ${clientId} control error:`, err);
-        this.handleClientDisconnect(clientId);
-      }
+    // Auto-subscribe to all currently available streams immediately.
+    // This avoids requiring any client-initiated stream, which Safari
+    // cannot open due to QUIC stream credit constraints.
+    for (const streamId of this.streams.keys()) {
+      await this.subscribeClient(client, streamId);
     }
+
+    // Optionally accept a control stream if the client opens one
+    // (Chrome/Edge only — Safari will never open this).
+    // Accept in background so we don't block the session.
+    this.acceptOptionalControlStream(client).catch(() => {
+      // Ignore — control stream is optional
+    });
   }
 
   /**
@@ -398,10 +388,28 @@ export class StreamManager {
   }
 
   /**
+   * Optionally accept a unidirectional control stream from the client.
+   *
+   * Chrome/Edge clients open a unidirectional stream for subscribe/unsubscribe
+   * messages. Safari clients cannot open any streams, so this is purely
+   * optional and runs in the background.
+   */
+  private async acceptOptionalControlStream(client: WTClient): Promise<void> {
+    const uniReader = client.session.incomingUnidirectionalStreams.getReader();
+    try {
+      const { value: controlStream, done } = await uniReader.read();
+      if (done || !controlStream || !client.connected) return;
+      await this.processControlMessages(client, controlStream);
+    } finally {
+      uniReader.releaseLock();
+    }
+  }
+
+  /**
    * Read length-prefixed JSON control messages from a WebTransport client.
    *
    * @param client - Client state
-   * @param readable - Readable side of the control bidirectional stream
+   * @param readable - Readable side of the control stream
    */
   private async processControlMessages(
     client: WTClient,
@@ -428,24 +436,6 @@ export class StreamManager {
   }
 
   /**
-   * Send a JSON control message to a WebTransport client.
-   *
-   * @param client - Target client
-   * @param message - JSON-serializable message
-   */
-  private async sendControlMessage(client: WTClient, message: unknown): Promise<void> {
-    if (!client.connected) return;
-
-    try {
-      if (!client.controlWriter) return;
-      const bytes = new TextEncoder().encode(JSON.stringify(message));
-      await writeLengthPrefixed(client.controlWriter, bytes);
-    } catch {
-      // Client may have disconnected
-    }
-  }
-
-  /**
    * Subscribe a client to a stream.
    *
    * Opens a dedicated unidirectional QUIC stream, sends cached SPS/PPS,
@@ -457,10 +447,7 @@ export class StreamManager {
   private async subscribeClient(client: WTClient, streamId: number): Promise<void> {
     const managed = this.streams.get(streamId);
     if (!managed) {
-      await this.sendControlMessage(client, {
-        type: 'error',
-        message: `Stream ${streamId} not found`,
-      });
+      console.warn(`[WT] Client ${client.id} subscribed to unknown stream ${streamId}`);
       return;
     }
 
@@ -496,11 +483,6 @@ export class StreamManager {
         `[WT] Client ${client.id} subscribed to stream ${streamId} ` +
           `(${managed.subscribers.size} subscribers)`
       );
-
-      await this.sendControlMessage(client, {
-        type: 'subscribed',
-        stream: this.getStreamInfo(managed),
-      });
 
       this.sendConfigToSubscriber(subscription, managed);
     } catch (err) {
@@ -598,13 +580,6 @@ export class StreamManager {
       client.videoWriter = null;
     }
 
-    if (client.controlWriter) {
-      try {
-        client.controlWriter.close().catch(() => {});
-      } catch {
-        // Already closed
-      }
-    }
     this.clients.delete(clientId);
     console.log(`[WT] Client ${clientId} disconnected`);
   }
