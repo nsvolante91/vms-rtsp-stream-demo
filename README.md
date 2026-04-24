@@ -17,13 +17,13 @@ A technology demonstrator showing that modern browsers can hardware-decode and r
 ## Architecture
 
 ```
-Local MP4 files ─────────▶ Bridge Server ──WebSocket/WebTransport──▶ Browser
-  (FFmpeg demux, no re-encode)  (Node.js)                           (WebCodecs + Canvas2D)
+Local MP4 files ─────────▶ Bridge Server ──WebTransport──▶ Browser
+  (FFmpeg demux, no re-encode)  (Node.js)                  (WebCodecs + Canvas2D)
 
    ── or ──
 
-RTSP cameras ──RTSP──▶ Bridge Server ──WebSocket/WebTransport──▶ Browser
-  (IP cameras)              (Node.js)                              (WebCodecs + Canvas2D)
+RTSP cameras ──RTSP──▶ Bridge Server ──WebTransport──▶ Browser
+  (IP cameras)              (Node.js)                  (WebCodecs + Canvas2D)
 ```
 
 The bridge server supports two source types:
@@ -39,9 +39,9 @@ Both source types produce identical output to the browser client — the same 12
 | **Node.js** | 20+ | Bridge server + build tooling |
 | **FFmpeg** | 5+ (on host) | Demuxes video files / reads RTSP streams |
 | **OpenSSL** | 1.1.1+ | Generates self-signed TLS certificate |
-| **Chrome / Edge** | 113+ | WebTransport + WebCodecs (best performance) |
-| **Safari** | 17+ | WebCodecs + WebSocket fallback (no WebTransport needed) |
-| **Firefox** | 113+ | WebCodecs + WebSocket fallback |
+| **Chrome / Edge** | 113+ | WebTransport + WebCodecs (required) |
+| **Safari** | — | Unsupported (no WebTransport) |
+| **Firefox** | — | Unsupported (no WebTransport) |
 
 ## Quick Start (local, single machine)
 
@@ -109,11 +109,9 @@ HOST=$HOST npm run dev
 https://192.168.1.100:5173
 ```
 
-Accept the certificate warning on first load. Both REST API calls and WebSocket streaming are proxied through the Vite server, so you only need to accept one certificate.
+Accept the certificate warning on first load. The REST API is proxied through the Vite server; WebTransport connects directly to port 9001.
 
-> **Note for Chrome/Edge (WebTransport):** The WebTransport connection goes directly to `https://192.168.1.100:9001`. Make sure port `9001/UDP` is reachable from the client (not firewalled).
->
-> **Note for Safari/Firefox (WebSocket fallback):** All traffic goes through the Vite proxy on port `5173`. Only port `5173/TCP` needs to be reachable.
+> **Note:** The WebTransport connection goes directly to `https://192.168.1.100:9001`. Make sure port `9001/UDP` is reachable from the client (not firewalled). Port `5173/TCP` must also be reachable for the Vite page and REST API proxy.
 
 ### RTSP cameras (remote)
 
@@ -150,10 +148,10 @@ The bridge server must be started **before** `npm run dev` so the certificate ex
 |---------|-----------|-------|
 | Chrome 113+ | WebTransport (HTTP/3) | Best performance — multiplexed QUIC streams |
 | Edge 113+ | WebTransport (HTTP/3) | Same as Chrome |
-| Safari 17+ | WebSocket (WSS) | Automatic fallback via Vite proxy |
-| Firefox 113+ | WebSocket (WSS) | Automatic fallback via Vite proxy |
+| Safari | Unsupported | No WebTransport support |
+| Firefox | Unsupported | No WebTransport support |
 
-No configuration is needed — the client detects `typeof WebTransport` and selects the best available transport automatically.
+This system requires WebTransport. Chrome or Edge 113+ is needed.
 
 ## REST API
 
@@ -190,12 +188,11 @@ curl http://localhost:9000/health
 ## Project Layout
 
 ```
-├── bridge-server/          # Node.js bridge (file/RTSP → WebSocket/WebTransport)
+├── bridge-server/          # Node.js bridge (file/RTSP → WebTransport)
 │   ├── src/
 │   │   ├── index.ts            # HTTP + WebTransport server, stream discovery
 │   │   ├── cert-utils.ts       # Self-signed TLS certificate generation
 │   │   ├── stream-manager.ts   # Stream lifecycle + access unit packaging
-│   │   ├── ws-handler.ts       # WebSocket server (Safari/Firefox fallback)
 │   │   ├── ffmpeg-source.ts    # Abstract base: FFmpeg process + NAL parsing
 │   │   ├── rtsp-client.ts      # RTSP source (extends FFmpegSource)
 │   │   ├── local-file-source.ts # Local MP4 source (extends FFmpegSource)
@@ -206,7 +203,6 @@ curl http://localhost:9000/health
 │   │   ├── main.ts             # App controller, CSS grid management
 │   │   ├── stream/
 │   │   │   ├── wt-receiver.ts      # WebTransport client + binary protocol parser
-│   │   │   ├── ws-receiver.ts      # WebSocket fallback (Safari/Firefox)
 │   │   │   ├── stream-pipeline.ts  # Per-stream decode pipeline
 │   │   │   ├── h264-demuxer.ts     # Annex B → EncodedVideoChunk
 │   │   │   └── decoder.ts         # VideoDecoder wrapper with backpressure + auto-recovery
@@ -248,7 +244,7 @@ npm run typecheck        # TypeScript type checking (both packages)
 
 ## Key Technical Details
 
-- **Binary WebSocket protocol**: 12-byte header (version + streamId + timestamp + flags) followed by H.264 Annex B payload. Config frames carry SPS/PPS for decoder initialization; video frames carry complete access units.
+- **Binary WebTransport protocol**: 12-byte header (version + streamId + timestamp + flags) followed by H.264 Annex B payload, with 4-byte big-endian length-prefix framing for QUIC byte streams. Config frames carry SPS/PPS for decoder initialization; video frames carry complete access units.
 - **Access unit packaging**: The bridge server accumulates H.264 NAL units into complete access units (all slices for one picture) before sending, using `first_mb_in_slice` detection for slice boundary detection.
 - **Decoder auto-recovery**: If the WebCodecs `VideoDecoder` hits an error, it automatically resets, reconfigures, and resumes decoding on the next keyframe.
 - **Backpressure**: Non-keyframes are dropped when `decodeQueueSize > 3` to prevent queue buildup. Keyframes are never dropped.

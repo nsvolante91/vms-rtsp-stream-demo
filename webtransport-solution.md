@@ -1,4 +1,4 @@
-# ADR: WebTransport for Video Stream Delivery (with WebSocket Fallback)
+# ADR: WebTransport for Video Stream Delivery
 
 **Status:** Accepted  
 **Date:** 2026-02-26  
@@ -8,21 +8,16 @@
 
 The VMS browser prototype bridges RTSP H.264 camera streams to browser clients for real-time viewing. The original implementation used WebSocket (TCP) to deliver all video streams over a single connection per client. As the system scaled to 4–16 simultaneous camera feeds, TCP's head-of-line blocking became a bottleneck: a single lost packet on one video stream stalled delivery of all other streams sharing the same connection.
 
-We needed a transport that could multiplex independent video feeds without cross-stream interference, while staying within the browser's native API surface (no plugins, no WASM networking shims). At the same time, WebTransport is only available in Chromium-based browsers — Safari and Firefox do not support it as of early 2026. A WebSocket fallback is required for cross-browser compatibility.
+We needed a transport that could multiplex independent video feeds without cross-stream interference, while staying within the browser's native API surface (no plugins, no WASM networking shims).
 
 ## Decision
 
-Use **WebTransport (HTTP/3 over QUIC)** as the primary transport with an automatic **WebSocket fallback** for browsers that lack WebTransport support:
+Use **WebTransport (HTTP/3 over QUIC)** as the exclusive transport:
 
-**Primary transport (WebTransport):**
 - **One bidirectional QUIC stream** for the control channel (subscribe/unsubscribe JSON messages, length-prefixed)
 - **One server→client unidirectional QUIC stream** shared across all video subscriptions for H.264 data (multiplexed via the binary protocol's streamId header)
 
-**Fallback transport (WebSocket):**
-- **One WebSocket connection** on `ws://<host>:9000/ws` for both control (JSON text) and video data (binary frames)
-- Same 12-byte binary frame header as WebTransport, but without length-prefix framing (WebSocket provides native message boundaries)
-
-The server uses `@fails-components/webtransport` (Node.js HTTP/3 via libquiche) for QUIC and `ws` for the WebSocket fallback. The client detects `typeof WebTransport !== 'undefined'` at startup and selects the appropriate receiver.
+The server uses `@fails-components/webtransport` (Node.js HTTP/3 via libquiche) for QUIC.
 
 ## Architecture
 
@@ -30,32 +25,25 @@ The server uses `@fails-components/webtransport` (Node.js HTTP/3 via libquiche) 
 ┌──────────────────────────────────────────────────────────┐
 │                    Browser Client                        │
 │                                                          │
-│  Transport auto-detection:                               │
-│  ┌─ WebTransport (Chrome 114+) ─────────────────────┐   │
-│  │  QUIC session                                     │   │
+│  WebTransport (Chrome/Edge 114+)                         │
+│  ┌─ QUIC session ───────────────────────────────────┐   │
 │  │  ├─ BiDi stream #0 (control) ← JSON sub/unsub    │   │
 │  │  └─ UniDi stream (video)     ← H.264 binary      │   │
 │  └───────────────────────────────────────────────────┘   │
-│  ┌─ WebSocket fallback (Safari, Firefox) ────────────┐   │
-│  │  ws://<host>:9000/ws                              │   │
-│  │  ├─ Text messages (control)  ← JSON sub/unsub    │   │
-│  │  └─ Binary messages (video)  ← H.264 binary      │   │
-│  └───────────────────────────────────────────────────┘   │
 │                                                          │
-│  StreamReceiver interface ──► StreamPipeline ──► Decode   │
+│  WTReceiver ──► StreamPipeline ──► Decode                │
 │                                                          │
 └──────────┬───────────────────────────────────────────────┘
-           │ QUIC (UDP) or WebSocket (TCP)
+           │ QUIC (UDP)
            ▼
 ┌──────────────────────────────────────────────────────────┐
 │                    Bridge Server                         │
 │                                                          │
 │  HTTP/3 (port 9001, 0.0.0.0)    WebTransport sessions   │
-│  HTTP/1.1 (port 9000, 0.0.0.0)  REST API + WebSocket    │
+│  HTTP/1.1 (port 9000, 0.0.0.0)  REST API                │
 │                                                          │
-│  StreamManager (transport-agnostic)                      │
+│  StreamManager                                           │
 │  ├─ WTClient (WebTransport sessions)                     │
-│  ├─ WSClient (WebSocket connections)                     │
 │  │                                                       │
 │  ├─ RTSP Client (FFmpeg) ───────► stream 1               │
 │  ├─ RTSP Client (FFmpeg) ───────► stream 2               │
@@ -65,7 +53,7 @@ The server uses `@fails-components/webtransport` (Node.js HTTP/3 via libquiche) 
 
 ### Wire Protocol
 
-Both transports use the same 12-byte binary video frame header:
+WebTransport uses a 12-byte binary video frame header:
 
 ```
 +─────────+──────────+───────────+────────+─────────────+
@@ -74,30 +62,27 @@ Both transports use the same 12-byte binary video frame header:
 +─────────+──────────+───────────+────────+─────────────+
 ```
 
-**Framing differences by transport:**
-
-- **WebTransport:** QUIC streams are byte-oriented (no message boundaries), so all messages use 4-byte big-endian length-prefix framing. Control messages (JSON) and video frames both get this prefix.
-- **WebSocket:** Native message boundaries, so frames are sent raw without length-prefix. Control messages are JSON text; video data is binary.
+QUIC streams are byte-oriented (no message boundaries), so all messages use 4-byte big-endian length-prefix framing. Both control messages (JSON) and video frames carry this prefix.
 
 ```
-WebTransport framing:       WebSocket framing:
-+──────────+───────────+    +───────────+
-│ Length   │ Payload   │    │ Payload   │
-│ 4 bytes  │ N bytes   │    │ N bytes   │
-│ uint32BE │           │    │ (binary)  │
-+──────────+───────────+    +───────────+
+WebTransport framing:
++──────────+───────────+
+│ Length   │ Payload   │
+│ 4 bytes  │ N bytes   │
+│ uint32BE │           │
++──────────+───────────+
 ```
 
 ### TLS Certificate Management
 
 WebTransport requires TLS. The bridge server generates a self-signed ECDSA P-256 certificate at startup (≤14 days validity, Chrome's maximum for pinned certs). The certificate's SAN entries automatically include `localhost`, `127.0.0.1`, and **all local network IPv4 addresses** (discovered via `os.networkInterfaces()`), enabling access from other devices on the LAN. Additional SANs can be added via the `BRIDGE_SAN` environment variable.
 
-The SHA-256 fingerprint is exposed via `GET /cert-hash` on the REST API. The browser client fetches this hash and passes it to `new WebTransport(url, { serverCertificateHashes })` for certificate pinning — no CA trust chain needed for local development. The WebSocket fallback does not require certificate pinning since it uses plain HTTP.
+The SHA-256 fingerprint is exposed via `GET /cert-hash` on the REST API. The browser client fetches this hash and passes it to `new WebTransport(url, { serverCertificateHashes })` for certificate pinning — no CA trust chain needed for local development.
 
 ### Network Accessibility
 
 All servers bind to `0.0.0.0` (not localhost) so they are reachable from other devices on the network:
-- HTTP REST API + WebSocket on port 9000
+- HTTP REST API on port 9000
 - WebTransport (HTTP/3 QUIC) on port 9001
 - The Vite dev server also binds to `0.0.0.0` on port 5173
 
@@ -142,27 +127,25 @@ QUIC supports 0-RTT session resumption. After the initial connection, reconnects
 
 ### Browser Compatibility
 
-WebTransport requires Chrome 114+ (or Edge 114+). Firefox and Safari do not yet support it as of early 2026. Rather than restricting to Chrome-only, the system now auto-detects WebTransport availability and falls back to WebSocket for unsupported browsers. This means:
+WebTransport requires Chrome/Edge 114+. Firefox and Safari do not support WebTransport as of early 2026. This system uses WebTransport exclusively:
 
-- **Chrome/Edge 114+**: WebTransport (QUIC) — full benefits of per-stream flow control and no head-of-line blocking
-- **Safari 17+, Firefox**: WebSocket (TCP) — head-of-line blocking applies, but video decoding (WebCodecs) and rendering (Canvas2D) still work
-- **Older browsers**: Unsupported (requires WebCodecs `VideoDecoder`)
+- **Chrome/Edge 114+**: Full benefits of per-stream flow control and no head-of-line blocking
+- **Safari, Firefox**: Currently unsupported (requires WebTransport)
+- **Older browsers**: Unsupported (requires both WebTransport and WebCodecs `VideoDecoder`)
 
-The WebGPU `importExternalTexture` rendering path remains Chrome-only; Safari and Firefox use the Canvas2D fallback renderer.
+The WebGPU `importExternalTexture` rendering path is also Chrome/Edge-only.
 
 ### Server Complexity
 
-The bridge server now carries two transport dependencies: `@fails-components/webtransport` (libquiche native addon for HTTP/3) and `ws` (pure JavaScript WebSocket). The `StreamManager` uses a transport-agnostic `VideoSubscription` interface with `send()` and `isBackpressured()` callbacks, keeping the RTSP→client distribution logic unified regardless of transport.
+The bridge server carries one transport dependency: `@fails-components/webtransport` (libquiche native addon for HTTP/3). The `StreamManager` uses a `VideoSubscription` interface with `send()` and `isBackpressured()` callbacks, keeping the RTSP→client distribution logic clean regardless of future transport changes.
 
 ### TLS Certificate Management
 
-WebTransport mandates TLS. For local development, we generate a self-signed ECDSA P-256 certificate at every server startup and expose its hash for client pinning. The certificate now automatically includes all local IPv4 addresses in its SAN entries, supporting LAN access without manual configuration. Additional SANs can be added via `BRIDGE_SAN` env var. In production, a proper CA-signed certificate would replace this.
-
-The WebSocket fallback uses plain HTTP (no TLS), which avoids certificate complexity for browsers that don't support WebTransport.
+WebTransport mandates TLS. For local development, we generate a self-signed ECDSA P-256 certificate at every server startup and expose its hash for client pinning. The certificate automatically includes all local IPv4 addresses in its SAN entries, supporting LAN access without manual configuration. Additional SANs can be added via `BRIDGE_SAN` env var. In production, a proper CA-signed certificate would replace this.
 
 ### Length-Prefix Framing Overhead
 
-WebSocket provides message boundaries natively; QUIC streams do not. WebTransport messages get a 4-byte length prefix; WebSocket messages do not. For video frames averaging 10–50 KB, this is negligible overhead (<0.04%). For the JSON control messages, it is proportionally larger but these are infrequent.
+QUIC streams are byte-oriented, so WebTransport messages get a 4-byte length prefix. For video frames averaging 10–50 KB, this is negligible overhead (<0.04%). For the JSON control messages, it is proportionally larger but these are infrequent.
 
 ## Alternatives Considered
 
@@ -187,20 +170,18 @@ Not possible within browser security constraints. Browsers cannot open raw UDP s
 | Component | File | Role |
 |-----------|------|------|
 | Certificate generation | `bridge-server/src/cert-utils.ts` | ECDSA P-256 cert + SHA-256 hash, auto-discovers local IPs for SAN |
-| Length-prefix framing | `bridge-server/src/framing.ts` | 4-byte framing for QUIC byte streams (not used by WebSocket path) |
-| WebSocket handler | `bridge-server/src/ws-handler.ts` | Attaches WebSocket server at `/ws` on the HTTP server |
-| Server entry point | `bridge-server/src/index.ts` | Http3Server + REST API + WebSocket setup |
-| Stream manager | `bridge-server/src/stream-manager.ts` | Transport-agnostic client/subscription management (WTClient + WSClient) |
+| Length-prefix framing | `bridge-server/src/framing.ts` | 4-byte framing for QUIC byte streams |
+| Server entry point | `bridge-server/src/index.ts` | Http3Server + REST API setup |
+| Stream manager | `bridge-server/src/stream-manager.ts` | Client/subscription management (WTClient) |
 | WebTransport receiver | `client/src/stream/wt-receiver.ts` | WebTransport session, cert pinning, stream demux |
-| WebSocket receiver | `client/src/stream/ws-receiver.ts` | WebSocket connection, binary frame parsing, reconnection |
-| Decode pipeline | `client/src/stream/stream-pipeline.ts` | Transport-agnostic `StreamReceiver` interface |
-| App entry point | `client/src/main.ts` | Transport auto-detection, WebTransport → WebSocket fallback |
+| Decode pipeline | `client/src/stream/stream-pipeline.ts` | `StreamReceiver` interface + decode chain |
+| App entry point | `client/src/main.ts` | Worker init, stream management |
 
 ### Port Allocation
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 9000 | HTTP/1.1 + WebSocket | REST API (stream list, cert hash, health) + WS fallback at `/ws` |
+| 9000 | HTTP/1.1 | REST API (stream list, cert hash, health) |
 | 9001 | HTTP/3 (QUIC) | WebTransport sessions |
 | 5173 | HTTP/1.1 | Vite dev server (client) |
 
@@ -208,11 +189,10 @@ All servers bind to `0.0.0.0` for LAN accessibility.
 
 ## Consequences
 
-- All existing tests (41) continue to pass — the H.264 parser and grid layout tests are transport-agnostic
-- The binary video frame protocol (12-byte header) is unchanged; only the delivery mechanism varies by transport
-- The client's `StreamPipeline` accepts a `StreamReceiver` interface, making it fully transport-agnostic
-- The `StreamManager` uses a `BridgeClient` discriminated union (`WTClient | WSClient`) and transport-agnostic `VideoSubscription` callbacks — RTSP distribution logic is shared
+- All existing tests continue to pass — the H.264 parser and grid layout tests are transport-agnostic
+- The binary video frame protocol (12-byte header) is unchanged; only the delivery mechanism differs
+- The client's `StreamPipeline` accepts a `StreamReceiver` interface, keeping transport concerns isolated
+- The `StreamManager` uses a `VideoSubscription` callback interface — RTSP distribution logic is independent of the transport
 - Server startup takes ~100ms longer due to TLS certificate generation
-- Both `ws` and `@fails-components/webtransport` are runtime dependencies of the bridge server
-- Safari 17+ and Firefox users get functional video streaming via WebSocket (TCP), with the caveat of head-of-line blocking under packet loss
-- Chrome/Edge users automatically get the superior WebTransport (QUIC) path with no configuration
+- `@fails-components/webtransport` is the only transport runtime dependency of the bridge server
+- Chrome/Edge 114+ is required; Safari and Firefox are not supported

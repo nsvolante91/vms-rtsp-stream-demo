@@ -12,12 +12,10 @@
   },
   "dependencies": {
     "@fails-components/webtransport": "^1.5.3",
-    "@fails-components/webtransport-transport-http3-quiche": "^1.5.3",
-    "ws": "^8.19.0"
+    "@fails-components/webtransport-transport-http3-quiche": "^1.5.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "@types/ws": "^8.18.1",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3",
     "vitest": "^1.2.0"

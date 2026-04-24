@@ -31,7 +31,6 @@ import { Http3Server } from '@fails-components/webtransport';
 import { StreamManager } from './stream-manager.js';
 import { probeLocalFile } from './local-file-source.js';
 import { generateCertificate, type CertMaterial } from './cert-utils.js';
-import { attachWebSocketServer } from './ws-handler.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = pathResolve(__dirname, '..', '..');
@@ -327,9 +326,6 @@ async function main(): Promise<void> {
 
   // Register the /streams path for WebTransport sessions
   const sessionStream = wtServer.sessionStream('/streams');
-
-  // Attach WebSocket fallback server on the HTTP server at /ws
-  attachWebSocketServer(httpServer, streamManager);
 
   // Start servers
   httpServer.listen(HTTP_PORT, () => {
