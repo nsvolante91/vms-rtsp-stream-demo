@@ -15,6 +15,8 @@ import type { ReceivedFrame } from './wt-receiver';
 export interface StreamReceiver {
   subscribe(streamId: number, callback: (frame: ReceivedFrame) => void): void;
   unsubscribe(streamId: number): void;
+  /** Register a per-stream callback for VideoDecoderConfig from the control channel */
+  onStreamConfig(streamId: number, callback: (config: VideoDecoderConfig) => void): void;
 }
 
 /**
@@ -77,6 +79,14 @@ export class StreamPipeline {
       }
     );
 
+    // Wire config from the control channel → demuxer + decoder
+    this.receiver.onStreamConfig(this.streamId, (config: VideoDecoderConfig) => {
+      this.demuxer.configure(config);
+      if (this.decoder) {
+        this.decoder.configure(config);
+      }
+    });
+
     this.receiver.subscribe(this.streamId, (frame: ReceivedFrame) => {
       this.handleReceivedFrame(frame);
     });
@@ -130,19 +140,10 @@ export class StreamPipeline {
   /**
    * Handle a frame received from the transport.
    *
-   * Config frames (SPS/PPS) are processed by the demuxer to extract
-   * decoder configuration. Video frames are demuxed into EncodedVideoChunks
-   * and fed to the decoder.
+   * Config is now delivered via the control channel (not as video frames),
+   * so all frames here are AVCC-format video data ready for the decoder.
    */
   private handleReceivedFrame(frame: ReceivedFrame): void {
-    if (frame.isConfig) {
-      const config = this.demuxer.processConfig(frame.data);
-      if (config && this.decoder) {
-        this.decoder.configure(config);
-      }
-      return;
-    }
-
     if (!this.demuxer.isConfigured || !this.decoder) {
       return;
     }

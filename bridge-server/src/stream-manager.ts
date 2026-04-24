@@ -19,6 +19,7 @@ import {
   isConfigNAL,
   isVCLNAL,
   isFirstSliceInPicture,
+  buildAvcC,
   type SPSInfo,
 } from './h264-parser.js';
 
@@ -27,9 +28,6 @@ const PROTOCOL_VERSION = 0x01;
 
 /** Flag bit indicating the payload contains a keyframe */
 const FLAG_KEYFRAME = 0x01;
-
-/** Flag bit indicating the payload contains SPS/PPS configuration */
-const FLAG_CONFIG = 0x02;
 
 /** Public information about a managed stream */
 export interface StreamInfo {
@@ -54,9 +52,9 @@ export interface StreamInfo {
   rtspUrl: string;
 }
 
-/** A pending access unit being accumulated from VCL NAL units */
+/** A pending access unit being accumulated from VCL NAL units in AVCC format */
 interface PendingAccessUnit {
-  /** Concatenated NAL unit data with Annex B start codes */
+  /** Concatenated NAL unit data with 4-byte AVCC length prefixes */
   payload: Buffer;
   /** Timestamp for this access unit */
   timestamp: bigint;
@@ -105,10 +103,12 @@ interface ManagedStream {
   sourceType: 'rtsp' | 'file';
   client: FFmpegSource;
   spsInfo: SPSInfo | null;
-  /** Stored SPS NAL unit for sending to new subscribers */
+  /** Stored SPS NAL unit (no start code) for building avcC on new subscribers */
   spsNALU: Uint8Array | null;
-  /** Stored PPS NAL unit for sending to new subscribers */
+  /** Stored PPS NAL unit (no start code) for building avcC on new subscribers */
   ppsNALU: Uint8Array | null;
+  /** Precomputed avcC descriptor, rebuilt whenever SPS or PPS changes */
+  avcCDescriptor: Uint8Array | null;
   /** Map of clientId → video subscription for this stream */
   subscribers: Map<number, VideoSubscription>;
   /** Pending access unit accumulator for VCL NAL units */
@@ -126,17 +126,20 @@ interface ClientMessage {
  *
  * Wire format:
  * ```
- * +---------+----------+-----------+----------+-------------+
- * | Version | StreamID | Timestamp | Flags    | Payload     |
- * | 1 byte  | 2 bytes  | 8 bytes   | 1 byte   | Variable    |
- * | (0x01)  | uint16BE | uint64BE  |          | H.264 NALUs |
- * +---------+----------+-----------+----------+-------------+
+ * +---------+----------+-----------+----------+------------------+
+ * | Version | StreamID | Timestamp | Flags    | Payload          |
+ * | 1 byte  | 2 bytes  | 8 bytes   | 1 byte   | Variable         |
+ * | (0x01)  | uint16BE | uint64BE  |          | H.264 AVCC NALUs |
+ * +---------+----------+-----------+----------+------------------+
  * ```
+ *
+ * Payload is AVCC-formatted: each NAL unit prefixed with a 4-byte
+ * big-endian length field. No Annex B start codes.
  *
  * @param streamId - Stream identifier
  * @param timestamp - Timestamp in microseconds
- * @param flags - Bitfield (bit 0 = keyframe, bit 1 = config)
- * @param payload - H.264 NAL unit data
+ * @param flags - Bitfield (bit 0 = keyframe)
+ * @param payload - H.264 AVCC data
  * @returns Binary frame as Buffer
  */
 function buildFrame(
@@ -208,6 +211,7 @@ export class StreamManager {
       spsInfo: null,
       spsNALU: null,
       ppsNALU: null,
+      avcCDescriptor: null,
       subscribers: new Map(),
       pendingAU: null,
     };
@@ -222,11 +226,6 @@ export class StreamManager {
     });
 
     client.on('nalu', (event: NALUEvent) => {
-      if (event.type === 7) {
-        managed.spsNALU = new Uint8Array(event.nalUnit);
-      } else if (event.type === 8) {
-        managed.ppsNALU = new Uint8Array(event.nalUnit);
-      }
       this.handleNALU(managed, event);
     });
 
@@ -502,7 +501,11 @@ export class StreamManager {
         stream: this.getStreamInfo(managed),
       });
 
-      this.sendConfigToSubscriber(subscription, managed);
+      // Send codec config immediately if SPS+PPS are already available;
+      // otherwise the client will receive it when the next SPS/PPS arrive.
+      if (managed.avcCDescriptor && managed.spsInfo) {
+        await this.sendStreamConfig(client.id, managed);
+      }
     } catch (err) {
       console.error(
         `[WT] Failed to subscribe client ${client.id} to stream ${streamId}:`,
@@ -512,30 +515,32 @@ export class StreamManager {
   }
 
   /**
-   * Send cached SPS and PPS NAL units to a subscriber.
+   * Send a JSON config control message to a client with codec parameters.
    *
-   * @param sub - Target video subscription
-   * @param managed - Stream with cached config data
+   * Delivers the avcC descriptor, codec string, and video dimensions so
+   * the client can configure VideoDecoder without parsing any NAL units.
+   *
+   * @param clientId - Target client identifier
+   * @param managed - Stream with computed avcC and SPS info
    */
-  private sendConfigToSubscriber(
-    sub: VideoSubscription,
+  private async sendStreamConfig(
+    clientId: number,
     managed: ManagedStream
-  ): void {
-    if (!managed.spsNALU || !managed.ppsNALU) return;
+  ): Promise<void> {
+    if (!managed.avcCDescriptor || !managed.spsInfo) return;
 
-    // Send SPS and PPS as separate CONFIG frames (matching handleNALU behavior).
-    // Combining them into one Annex B frame with start codes causes re-parsing
-    // ambiguity: the client's 3-byte start code scanner would absorb a trailing
-    // zero from the SPS into the next start code boundary.
-    const startCode = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
+    const client = this.clients.get(clientId);
+    if (!client || !client.connected) return;
 
-    const spsPayload = Buffer.concat([startCode, managed.spsNALU]);
-    const spsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, spsPayload);
-    sub.send(spsFrame);
-
-    const ppsPayload = Buffer.concat([startCode, managed.ppsNALU]);
-    const ppsFrame = buildFrame(managed.id, 0n, FLAG_CONFIG, ppsPayload);
-    sub.send(ppsFrame);
+    const avcC = Buffer.from(managed.avcCDescriptor).toString('base64');
+    await this.sendControlMessage(client, {
+      type: 'config',
+      streamId: managed.id,
+      codec: managed.spsInfo.codecString,
+      codedWidth: managed.spsInfo.width,
+      codedHeight: managed.spsInfo.height,
+      avcC,
+    });
   }
 
   /**
@@ -612,24 +617,42 @@ export class StreamManager {
   /**
    * Route a NAL unit to the appropriate handler.
    *
+   * Config NALs (SPS/PPS) update the stored parameters and broadcast
+   * an updated JSON config message to all current subscribers via the
+   * control channel. VCL NALs are accumulated into AVCC-format access units.
+   *
    * @param managed - Source stream
    * @param event - NAL unit event to handle
    */
   private handleNALU(managed: ManagedStream, event: NALUEvent): void {
     if (isConfigNAL(event.type)) {
-      if (managed.subscribers.size === 0) return;
+      if (event.type === 7) {
+        managed.spsNALU = new Uint8Array(event.nalUnit);
+      } else {
+        managed.ppsNALU = new Uint8Array(event.nalUnit);
+      }
 
-      const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-      const payload = Buffer.concat([startCode, event.nalUnit]);
-      const frame = buildFrame(managed.id, event.timestamp, FLAG_CONFIG, payload);
-      this.sendToSubscribers(managed, frame, false);
+      // Recompute avcC whenever both SPS and PPS are available
+      if (managed.spsNALU && managed.ppsNALU && managed.spsInfo) {
+        managed.avcCDescriptor = buildAvcC(
+          managed.spsNALU,
+          managed.ppsNALU,
+          managed.spsInfo
+        );
+        // Broadcast updated config to existing subscribers
+        for (const [clientId] of managed.subscribers) {
+          this.sendStreamConfig(clientId, managed).catch(() => {});
+        }
+      }
       return;
     }
 
     if (!isVCLNAL(event.type)) return;
 
-    const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
-    const naluBuf = Buffer.concat([startCode, event.nalUnit]);
+    // Build AVCC: 4-byte big-endian length prefix followed by raw NALU bytes
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(event.nalUnit.length, 0);
+    const naluBuf = Buffer.concat([lenBuf, event.nalUnit]);
 
     if (isFirstSliceInPicture(event.nalUnit)) {
       this.flushAccessUnit(managed);
@@ -651,6 +674,9 @@ export class StreamManager {
 
   /**
    * Flush the pending access unit to all subscribers.
+   *
+   * The payload is already in AVCC format (4-byte length-prefixed NALUs),
+   * assembled incrementally in handleNALU.
    *
    * @param managed - Stream with pending access unit to flush
    */

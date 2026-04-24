@@ -30,6 +30,12 @@ export interface SPSInfo {
   height: number;
   /** Codec string in "avc1.XXYYZZ" format */
   codecString: string;
+  /** chroma_format_idc (1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4) */
+  chromaFormatIdc: number;
+  /** bit_depth_luma_minus8 (0 = 8-bit luma) */
+  bitDepthLumaMinus8: number;
+  /** bit_depth_chroma_minus8 (0 = 8-bit chroma) */
+  bitDepthChromaMinus8: number;
 }
 
 /**
@@ -254,6 +260,8 @@ export function parseSPS(sps: Uint8Array): SPSInfo {
 
   // High profile and above have additional parameters
   let chromaFormatIdc = 1; // default for non-High profiles
+  let bitDepthLumaMinus8 = 0;
+  let bitDepthChromaMinus8 = 0;
   if (
     profileIdc === 100 ||
     profileIdc === 110 ||
@@ -278,10 +286,10 @@ export function parseSPS(sps: Uint8Array): SPSInfo {
     }
 
     // bit_depth_luma_minus8: ue(v)
-    reader.readUE();
+    bitDepthLumaMinus8 = reader.readUE();
 
     // bit_depth_chroma_minus8: ue(v)
-    reader.readUE();
+    bitDepthChromaMinus8 = reader.readUE();
 
     // qpprime_y_zero_transform_bypass_flag: u(1)
     reader.readBit();
@@ -403,6 +411,9 @@ export function parseSPS(sps: Uint8Array): SPSInfo {
     width,
     height,
     codecString,
+    chromaFormatIdc,
+    bitDepthLumaMinus8,
+    bitDepthChromaMinus8,
   };
 }
 
@@ -471,7 +482,59 @@ export function isVCLNAL(naluType: number): boolean {
 }
 
 /**
- * Check if a VCL NAL unit is the first slice in a picture.
+ * Build an AVC Decoder Configuration Record (avcC) from SPS and PPS NAL units.
+ *
+ * Required as the `description` field in VideoDecoderConfig for hardware-
+ * accelerated H.264 decoding. High Profile and above include extension bytes
+ * for chroma format and bit depth per ISO/IEC 14496-15.
+ *
+ * @param sps - Raw SPS NAL unit (including NAL header byte, no start code)
+ * @param pps - Raw PPS NAL unit (including NAL header byte, no start code)
+ * @param info - Parsed SPS info supplying chroma/bit-depth extension fields
+ * @returns avcC box as Uint8Array
+ */
+export function buildAvcC(
+  sps: Uint8Array,
+  pps: Uint8Array,
+  info: SPSInfo
+): Uint8Array {
+  const needsExtension =
+    info.profileIdc === 100 ||
+    info.profileIdc === 110 ||
+    info.profileIdc === 122 ||
+    info.profileIdc === 144;
+  const extSize = needsExtension ? 4 : 0;
+
+  const size = 6 + 2 + sps.length + 1 + 2 + pps.length + extSize;
+  const buf = new Uint8Array(size);
+  const view = new DataView(buf.buffer);
+  let offset = 0;
+
+  buf[offset++] = 1;           // configurationVersion
+  buf[offset++] = sps[1];      // AVCProfileIndication
+  buf[offset++] = sps[2];      // profile_compatibility
+  buf[offset++] = sps[3];      // AVCLevelIndication
+  buf[offset++] = 0xff;        // lengthSizeMinusOne = 3 → 4-byte NALU lengths
+  buf[offset++] = 0xe1;        // numOfSequenceParameterSets = 1
+
+  view.setUint16(offset, sps.length, false); offset += 2;
+  buf.set(sps, offset); offset += sps.length;
+
+  buf[offset++] = 1;           // numOfPictureParameterSets
+  view.setUint16(offset, pps.length, false); offset += 2;
+  buf.set(pps, offset); offset += pps.length;
+
+  if (needsExtension) {
+    buf[offset++] = 0xfc | (info.chromaFormatIdc & 0x03);
+    buf[offset++] = 0xf8 | (info.bitDepthLumaMinus8 & 0x07);
+    buf[offset++] = 0xf8 | (info.bitDepthChromaMinus8 & 0x07);
+    buf[offset++] = 0; // numOfSequenceParameterSetExt
+  }
+
+  return buf;
+}
+
+/**
  *
  * Reads the first_mb_in_slice field, which is the first exp-golomb coded
  * value in the slice header (immediately after the NAL header byte).
