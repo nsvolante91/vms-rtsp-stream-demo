@@ -9,8 +9,8 @@ A browser-based Video Management System prototype demonstrating maximum video st
 Three main components:
 
 1. **Video Sources**: Either local MP4 files (FFmpeg demux, no re-encoding) or RTSP streams from IP cameras. Controlled via `SOURCE_MODE` env var (`local`, `rtsp`, or `auto`).
-2. **Bridge Server** (Node.js/TypeScript): Reads video sources via FFmpeg (`FFmpegSource` base class with `RTSPClient` and `LocalFileSource` subclasses), extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) or WebSocket with a binary protocol. Generates a self-signed TLS certificate at startup (ECDSA P-256, ≤14 days). REST API runs on plain HTTP (port 9000); WebTransport on HTTPS/QUIC (port 9001).
-3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebTransport (Chrome/Edge) or WebSocket fallback (Safari/Firefox), decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics. All REST and WebSocket traffic is proxied through the Vite HTTPS server, so only one certificate trust prompt is needed.
+2. **Bridge Server** (Node.js/TypeScript): Reads video sources via FFmpeg (`FFmpegSource` base class with `RTSPClient` and `LocalFileSource` subclasses), extracts H.264 NAL units, serves them over WebTransport (HTTP/3 QUIC) with a binary protocol. Generates a self-signed TLS certificate at startup (ECDSA P-256, ≤14 days). REST API runs on plain HTTP (port 9000); WebTransport on HTTPS/QUIC (port 9001).
+3. **Browser Client** (TypeScript/Vite): Receives H.264 over WebTransport, decodes via WebCodecs (`VideoDecoder` with hardware acceleration), renders via WebGPU (`importExternalTexture` for zero-copy GPU rendering), displays in a configurable grid layout with real-time performance metrics. REST API traffic is proxied through the Vite HTTPS server.
 
 ## Key Technical Constraints
 
@@ -21,7 +21,7 @@ Three main components:
 - **WebTransport framing** — QUIC streams are byte-oriented; all messages use 4-byte big-endian length prefix
 - **Self-signed certs** — WebTransport requires TLS; bridge server generates ECDSA P-256 cert at startup (≤14 days validity); client pins via `serverCertificateHashes`. Vite reads the same cert from `.certs/`.
 - **HOST env var** — set to the server's IP/hostname for remote access; included in the cert SAN so WebTransport certificate hash pinning works. Vite also binds to `0.0.0.0` when HOST is set.
-- **Transport fallback** — `stream-worker.ts` detects `typeof WebTransport`; uses `WSReceiver` (WebSocket via Vite proxy) for Safari/Firefox automatically.
+- **Transport** — WebTransport (HTTP/3 QUIC) exclusively. Requires Chrome/Edge 114+.
 
 ## Build & Run
 

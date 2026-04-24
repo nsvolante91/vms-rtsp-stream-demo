@@ -31,14 +31,6 @@ const API_URL = '/api';
  */
 const WT_URL = `https://${window.location.hostname}:9001/streams`;
 
-/**
- * WebSocket URL for Safari/Firefox fallback.
- * Routes through the Vite dev server proxy (/ws → ws://bridge:9000/ws),
- * so TLS is handled by Vite and no additional cert trust is needed.
- */
-const WS_PROTO = window.location.protocol === 'https:' ? 'wss' : 'ws';
-const WS_URL = `${WS_PROTO}://${window.location.host}/ws`;
-
 /** REST endpoint for certificate hash (for WebTransport pinning) */
 const CERT_HASH_URL = `${API_URL}/cert-hash`;
 
@@ -188,7 +180,7 @@ class VMSApp {
       reject = (e) => { initDone(); origReject(e); };
 
       // Send init message to worker
-      this.postWorker({ type: 'init', wtUrl: WT_URL, certHashUrl: CERT_HASH_URL, wsUrl: WS_URL });
+      this.postWorker({ type: 'init', wtUrl: WT_URL, certHashUrl: CERT_HASH_URL });
     });
   }
 

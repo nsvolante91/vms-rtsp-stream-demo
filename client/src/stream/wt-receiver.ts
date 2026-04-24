@@ -24,9 +24,7 @@ export interface ReceivedFrame {
   timestamp: bigint;
   /** Whether this frame is an IDR keyframe */
   isKeyframe: boolean;
-  /** Whether this frame carries SPS/PPS configuration data */
-  isConfig: boolean;
-  /** Raw H.264 Annex B payload data */
+  /** Raw H.264 AVCC payload data (4-byte length-prefixed NALUs, no start codes) */
   data: Uint8Array;
 }
 
@@ -39,8 +37,8 @@ export type FrameCallback = (frame: ReceivedFrame) => void;
  * - Version:   1 byte  (0x01)
  * - StreamID:  2 bytes (uint16 big-endian)
  * - Timestamp: 8 bytes (uint64 big-endian, microseconds)
- * - Flags:     1 byte  (bit 0 = keyframe, bit 1 = config/SPS+PPS)
- * - Payload:   remaining bytes (H.264 Annex B)
+ * - Flags:     1 byte  (bit 0 = keyframe)
+ * - Payload:   remaining bytes (H.264 AVCC — 4-byte length-prefixed NALUs)
  */
 const HEADER_SIZE = 12;
 const PROTOCOL_VERSION = 0x01;
@@ -207,6 +205,7 @@ export class WTReceiver {
   private transport: WebTransport | null = null;
   private controlWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private readonly callbacks: Map<number, FrameCallback> = new Map();
+  private readonly configCallbacks: Map<number, (config: VideoDecoderConfig) => void> = new Map();
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
   private _bytesReceived = 0;
@@ -220,7 +219,6 @@ export class WTReceiver {
     streamId: 0,
     timestamp: 0n,
     isKeyframe: false,
-    isConfig: false,
     data: new Uint8Array(0),
   };
 
@@ -369,6 +367,22 @@ export class WTReceiver {
   }
 
   /**
+   * Register a callback to receive VideoDecoderConfig for a stream.
+   *
+   * Called by the pipeline when a `config` control message arrives for the
+   * given stream. Replaces any previously registered callback for that stream.
+   *
+   * @param streamId - Stream to watch for configuration
+   * @param callback - Invoked with a ready-to-use VideoDecoderConfig
+   */
+  onStreamConfig(
+    streamId: number,
+    callback: (config: VideoDecoderConfig) => void
+  ): void {
+    this.configCallbacks.set(streamId, callback);
+  }
+
+  /**
    * Close the connection and stop all reconnection attempts.
    */
   close(): void {
@@ -494,7 +508,6 @@ export class WTReceiver {
 
     const flags = b[off + 11];
     const isKeyframe = (flags & 0x01) !== 0;
-    const isConfig = (flags & 0x02) !== 0;
     const data = buffer.subarray(HEADER_SIZE);
 
     const callback = this.callbacks.get(streamId);
@@ -504,7 +517,6 @@ export class WTReceiver {
       this._pooledFrame.streamId = streamId;
       this._pooledFrame.timestamp = timestamp;
       this._pooledFrame.isKeyframe = isKeyframe;
-      this._pooledFrame.isConfig = isConfig;
       this._pooledFrame.data = data;
       callback(this._pooledFrame);
     }
@@ -513,17 +525,58 @@ export class WTReceiver {
   /**
    * Read JSON control messages from the server.
    *
+   * Handles `config` messages by dispatching VideoDecoderConfig to the
+   * registered per-stream callback. Other message types are logged.
+   *
    * @param readable - Readable side of the control bidirectional stream
    */
   private async readControlMessages(readable: ReadableStream<Uint8Array>): Promise<void> {
     for await (const msgBytes of readLengthPrefixed(readable)) {
       try {
         const text = new TextDecoder().decode(msgBytes);
-        const msg = JSON.parse(text);
+        const msg = JSON.parse(text) as Record<string, unknown>;
         this.log.info(`Control message: ${msg.type}`);
+
+        if (msg.type === 'config') {
+          this.handleConfigMessage(msg);
+        }
       } catch {
         this.log.warn('Invalid control message from server');
       }
+    }
+  }
+
+  /**
+   * Decode a `config` control message and dispatch VideoDecoderConfig.
+   *
+   * Decodes the base64 avcC field and constructs a VideoDecoderConfig
+   * ready for VideoDecoder.configure().
+   */
+  private handleConfigMessage(msg: Record<string, unknown>): void {
+    const streamId = msg.streamId as number;
+    const codec = msg.codec as string;
+    const codedWidth = msg.codedWidth as number;
+    const codedHeight = msg.codedHeight as number;
+    const avcCBase64 = msg.avcC as string;
+
+    if (!streamId || !codec || !codedWidth || !codedHeight || !avcCBase64) {
+      this.log.warn('Malformed config message');
+      return;
+    }
+
+    const avcCBytes = Uint8Array.from(atob(avcCBase64), (c) => c.charCodeAt(0));
+    const config: VideoDecoderConfig = {
+      codec,
+      codedWidth,
+      codedHeight,
+      description: avcCBytes,
+      hardwareAcceleration: 'prefer-hardware',
+      optimizeForLatency: true,
+    };
+
+    const cb = this.configCallbacks.get(streamId);
+    if (cb) {
+      cb(config);
     }
   }
 
