@@ -11,12 +11,10 @@
 /** Initialize the transport connection in the worker */
 export interface InitMessage {
   type: 'init';
-  /** WebTransport URL (Chrome/Edge only) — e.g. https://hostname:9001/streams */
+  /** WebTransport URL — e.g. https://hostname:9001/streams */
   wtUrl: string;
   /** REST endpoint to fetch the TLS certificate hash for WebTransport pinning */
   certHashUrl: string;
-  /** WebSocket URL for Safari/Firefox fallback — e.g. wss://hostname:5173/ws */
-  wsUrl: string;
 }
 
 /** Add a stream: transfer an OffscreenCanvas and start decode+render */

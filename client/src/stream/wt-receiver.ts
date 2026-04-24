@@ -285,8 +285,7 @@ export class WTReceiver {
       this.log.info('WebTransport session established');
       this.reconnectAttempt = 0;
 
-      // Monitor session close — these happen after initial connect,
-      // so they still schedule reconnects (no fallback at this stage)
+      // Monitor session close
       this.transport.closed
         .then(() => {
           this.log.warn('WebTransport session closed');
@@ -305,21 +304,20 @@ export class WTReceiver {
           }
         });
 
-      // Open the control bidirectional stream
-      const controlStream = await this.transport.createBidirectionalStream();
-      this.controlWriter = controlStream.writable.getWriter();
-
-      // Read control messages from server (stream list, subscription confirmations)
-      this.readControlMessages(controlStream.readable).catch((err) => {
-        this.log.error('Control channel read error', err);
+      // The server auto-subscribes all clients to all streams on connect,
+      // so we don't need to open a control stream at all. This is the only
+      // approach that works on Safari, which does not grant QUIC stream credits
+      // for client-initiated streams (neither bidi nor unidirectional).
+      //
+      // Attempt to open a control stream in the background for subscribe/
+      // unsubscribe support on Chrome/Edge. Safari will never resolve this
+      // and that is fine — the server already auto-subscribed us.
+      this.setupControlStream().catch(() => {
+        // Expected on Safari — control stream is optional
       });
 
-      // Re-subscribe to any previously registered streams
-      for (const streamId of this.callbacks.keys()) {
-        await this.sendSubscribe(streamId);
-      }
-
-      // Start accepting incoming unidirectional streams (video data)
+      // Start accepting incoming unidirectional streams (video data).
+      // The server pushes these immediately after session.ready.
       this.acceptVideoStreams().catch((err) => {
         if (!this.closing) {
           this.log.error('Video stream acceptor error', err);
@@ -507,6 +505,31 @@ export class WTReceiver {
       this._pooledFrame.isConfig = isConfig;
       this._pooledFrame.data = data;
       callback(this._pooledFrame);
+    }
+  }
+
+  /**
+   * Open a unidirectional client→server control stream and re-subscribe any
+   * queued streams.
+   *
+   * Uses a unidirectional stream (client→server only) instead of a
+   * bidirectional stream. Safari's WebTransport hangs on
+   * createBidirectionalStream() due to QUIC bidirectional stream credit
+   * constraints; unidirectional streams are not affected. Server→client
+   * control messages (stream list) are dropped — clients use the REST API
+   * to discover available streams instead.
+   */
+  private async setupControlStream(): Promise<void> {
+    if (!this.transport) return;
+
+    const controlStream = await this.transport.createUnidirectionalStream();
+    this.controlWriter = controlStream.getWriter();
+    this.log.info('Control stream established');
+
+    // Send subscriptions for any streams that registered before the control
+    // writer was ready
+    for (const streamId of this.callbacks.keys()) {
+      await this.sendSubscribe(streamId);
     }
   }
 
