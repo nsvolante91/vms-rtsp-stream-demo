@@ -1,7 +1,7 @@
 /**
  * Stream pipeline orchestrating the full decode chain for a single stream.
  *
- * Connects the WebSocket receiver, H.264 demuxer, and WebCodecs decoder
+ * Connects the WebTransport receiver, H.264 demuxer, and WebCodecs decoder
  * into a unified pipeline. Decoded frames are forwarded directly to the
  * onFrame callback (which draws to a per-stream canvas and closes the frame).
  */
@@ -20,7 +20,7 @@ export interface StreamReceiver {
 /**
  * Full decode pipeline for a single video stream.
  *
- * Subscribes to the shared WSReceiver for its stream, demuxes incoming
+ * Subscribes to the shared WTReceiver for its stream, demuxes incoming
  * H.264 Annex B data, decodes via WebCodecs, and forwards each decoded
  * VideoFrame to the onFrame callback for immediate rendering.
  *
@@ -37,7 +37,7 @@ export class StreamPipeline {
   /**
    * Create a new StreamPipeline.
    * @param streamId - Numeric stream identifier
-   * @param receiver - Shared stream receiver instance (WebTransport or WebSocket)
+   * @param receiver - Shared stream receiver instance (WebTransport)
    * @param onFrame - Callback invoked with each decoded frame. MUST call frame.close().
    * @param onError - Optional error callback for this stream
    */
@@ -54,8 +54,8 @@ export class StreamPipeline {
   /**
    * Start the decode pipeline.
    *
-   * Creates the decoder, subscribes to the WebSocket receiver for this
-   * stream's data, and begins processing incoming frames through the
+   * Creates the decoder, subscribes to the receiver for this stream's
+   * data, and begins processing incoming frames through the
    * demux/decode chain.
    */
   start(): void {
@@ -87,7 +87,7 @@ export class StreamPipeline {
   /**
    * Stop the decode pipeline.
    *
-   * Unsubscribes from the WebSocket receiver and closes the decoder.
+   * Unsubscribes from the receiver and closes the decoder.
    */
   stop(): void {
     if (!this._started) {
@@ -128,7 +128,7 @@ export class StreamPipeline {
   }
 
   /**
-   * Handle a frame received from the WebSocket.
+   * Handle a frame received from the transport.
    *
    * Config frames (SPS/PPS) are processed by the demuxer to extract
    * decoder configuration. Video frames are demuxed into EncodedVideoChunks

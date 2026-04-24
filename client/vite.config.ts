@@ -55,13 +55,6 @@ export default defineConfig({
         changeOrigin: false,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
-      // WebSocket: proxy /ws → ws://bridge:9000/ws.
-      // Clients connect via WSS (Vite's TLS), Vite forwards plain WS to bridge.
-      // Used by Safari/Firefox that lack WebTransport support.
-      '/ws': {
-        target: `ws://127.0.0.1:${BRIDGE_PORT}`,
-        ws: true,
-      },
     },
   },
   build: {
