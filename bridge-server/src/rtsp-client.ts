@@ -43,17 +43,30 @@ export class RTSPClient extends FFmpegSource {
   }
 
   /** @inheritdoc */
-  protected buildFFmpegArgs(): string[] {
-    return [
-      '-rtsp_transport', 'tcp',
-      '-i', this.proxiedUrl,
-      '-c:v', 'copy',
-      '-an',
-      '-f', 'h264',
-      '-loglevel', 'warning',
-      'pipe:1',
-    ];
-  }
+    protected buildFFmpegArgs(): string[] {
+      return [
+        '-rtsp_transport', 'tcp',
+        '-fflags', 'nobuffer',
+        '-flags', 'low_delay',
+        '-i', this.proxiedUrl,
+        '-an',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-tune', 'zerolatency',
+        '-profile:v', 'baseline',
+        '-level', '3.1',
+        '-pix_fmt', 'yuv420p',
+        '-bf', '0',
+        '-r', '30',
+        '-g', '30',
+        '-keyint_min', '30',
+        '-sc_threshold', '0',
+        '-x264-params', 'repeat-headers=1',
+        '-f', 'h264',
+        '-loglevel', 'warning',
+        'pipe:1',
+      ];
+    }
 
   /** @inheritdoc */
   protected async onBeforeSpawn(): Promise<void> {
